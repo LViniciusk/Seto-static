@@ -20,6 +20,8 @@ void psp_recomp_register(void);   /* generated tagforce_register.c */
 void psp_umd_register(void);
 void psp_umd_set_iso(const char *path);
 void psp_fpl_register(void);
+int  psp_font_image_load(const char *path);
+void font_psp_recomp_register(void);   /* relocated PRX corpus */
 
 /* The EBOOT's single PT_LOAD has memsz 0x631A80; .bss runs to there. */
 #define MODULE_SPAN 0x00640000u
@@ -84,6 +86,7 @@ static void on_entry(uint32_t addr) {
 int main(int argc, char **argv) {
     const char *elf = argc > 1 ? argv[1] : "private/ULUS10136_EBOOT.elf";
     const char *iso = argc > 2 ? argv[2] : "private/TF1.iso";
+    const char *font = argc > 3 ? argv[3] : NULL;
 
     if (psp_mem_init() != 0) { fprintf(stderr, "memory init failed\n"); return 1; }
 
@@ -99,6 +102,18 @@ int main(int argc, char **argv) {
     psp_fpl_register();
     psp_recomp_register();
 
+    /* Optional S5 relocation check: a pre-relocated PRX image plus its
+     * namespaced corpus. Not ModuleMgr: the image is placed and registered,
+     * never called. */
+    if (font) {
+        if (psp_font_image_load(font) != 0) return 1;
+        font_psp_recomp_register();
+        if (!psp_lookup(0x08900000u)) {
+            fprintf(stderr, "font PRX: dispatch entry at 0x08900000 is missing\n");
+            return 1;
+        }
+    }
+
     /* This EBOOT has no .ctors section. The upstream heuristic scans the last
      * 64 KB of the image for a run of pointers into that same window and here
      * matches eight .data words (first target 0x000EA0D8), which are not code.
@@ -108,6 +123,7 @@ int main(int argc, char **argv) {
 
     printf("module  \"%s\"\n", elf);
     printf("disc    \"%s\"\n", iso);
+    if (font) printf("font    \"%s\"\n", font);
     printf("image   0x%08X..0x%08X  entry 0x%08X  gp 0x%08X  ctors %d\n",
            m.base, m.image_end, m.entry, m.gp, m.nctors);
     printf("dispatch %u functions/labels registered\n", psp_dispatch_count());

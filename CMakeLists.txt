@@ -18,5 +18,14 @@ target_include_directories(tagforce PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/build/tag
 target_compile_definitions(tagforce PUBLIC PSPRECOMP_TRACE)
 target_link_libraries(tagforce PUBLIC psprecomp)
 
-add_executable(Seto-static host.c umd.c fpl.c)
+# S5: the offline-relocated sceFont_Library corpus. Generated, not committed;
+# see README. The namespace keeps its symbols separate from the EBOOT.
+file(GLOB FONT_SOURCES CONFIGURE_DEPENDS
+     ${CMAKE_CURRENT_SOURCE_DIR}/build/s5-font-reloc/*.c)
+add_library(fontprx OBJECT ${FONT_SOURCES})
+target_compile_definitions(fontprx PRIVATE PSPRECOMP_NAMESPACE=font_)
+target_include_directories(fontprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s5-font-reloc)
+target_link_libraries(fontprx PRIVATE psprecomp)
+
+add_executable(Seto-static host.c umd.c fpl.c font_prx.c $<TARGET_OBJECTS:fontprx>)
 target_link_libraries(Seto-static PRIVATE tagforce)

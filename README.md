@@ -23,6 +23,13 @@ threads skipped the CPU baton. `_Thread_local` fixes it: the boot thread and
 `user_main` now alternate on separate host threads without the `psp_ra_is_jump`
 crash, and the game reaches `sceKernelLoadModule` (see [S4 results](#s4-results)).
 
+**S5 — sceFont_Library relocation: PASS (subtask).** The 44,052-byte PRX is
+rebased to `0x08900000` and all 933 PSP relocations are applied offline; the
+namespaced 541-function corpus is emitted from that image, linked with the EBOOT,
+placed in guest RAM, and registered at its final addresses. S5 end-to-end is
+still blocked on ModuleMgr and the seven `sceLibFont` NID bindings (see
+[S5 results](#s5-results--scefont_library-relocation)).
+
 ## Input
 
 Decrypted `EBOOT.BIN` (plain `ELF32 MIPS LE`, PRX), kept out of Git in `private/`:
@@ -51,6 +58,7 @@ git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-vfim-float.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-umd-raw.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-real-threads.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-namespace.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-reloc-seeds.patch
 
 cmake -S build/psprecomp -B build/psprecomp-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build/psprecomp-build -j 8
@@ -66,12 +74,16 @@ New-Item -ItemType Directory -Force build/tagforce
 
 `emit` is deterministic: a second run reports `0 of 81 files changed`.
 
-### 2. Native host (S2/S3)
+### 2. Native host (S2–S5)
 
 ```powershell
-cmake -S . -B build/s2-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
-cmake --build build/s2-build -j 8
-.\build\s2-build\Seto-static.exe private\ULUS10136_EBOOT.elf private\TF1.iso
+cmake -S . -B build/s5-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+cmake --build build/s5-build -j 8
+# EBOOT only (S2–S4 behaviour):
+.\build\s5-build\Seto-static.exe private\ULUS10136_EBOOT.elf private\TF1.iso
+# S5 relocation check: optional third argument adds the PRX image and corpus:
+.\build\s5-build\Seto-static.exe private\ULUS10136_EBOOT.elf private\TF1.iso `
+    build\s5-font-reloc.elf
 
 # names every guest file open/raw sector read and its mapped host path
 $env:PSPRECOMP_TRACE_IO = '1'
@@ -183,97 +195,94 @@ created but not started until this module loads, so the run stops on the dispatc
 budget. `ModuleMgrForUser` (load/relocate/start the PRX, module UIDs) is the next
 subsystem; it is not scheduler work.
 
-## Limitations
-
-### S5 investigation — blocked on multi-module integration
+## S5 results — sceFont_Library relocation
 
 The requested ISO range (LBN `0x52C0`, length `0x5BA0`, SHA-256
 `ca621cb2212763ad85611e67e08d3e0296ce514b6ec731d7f05997c8d917c25a`)
 is `sceFont_Library`, wrapped in `~SCE` and encrypted `~PSP` (tag
-`0x457B05F0`). The EBOOT imports seven `sceLibFont` functions; the upstream
-runtime provides no corresponding HLE. Returning a module UID without providing
-the library would not be a valid load.
+`0x457B05F0`). After stripping the 64-byte `~SCE` wrapper, the GPL `pspdecrypt`
+tool at `c156627db7634d395c380c0a9589130f603307fc` decrypted the inner module;
+its gzip output decompressed to a 44,052-byte ELF. No decryptor, game binary or
+generated source is distributed here.
 
-The existing `allegrexrecomp decrypt` only inspected the header. An isolated
-GPL-licensed `pspdecrypt` checkout at `c156627db7634d395c380c0a9589130f603307fc`
-successfully decrypted the inner `~PSP` after removing its 64-byte `~SCE`
-wrapper; its gzip output decompressed to a 44,052-byte ELF. No decryptor code,
-game binary, or generated source is distributed here. The ELF contains two
-PT_LOAD segments, 28 function exports, 11 imports (`sceReg` and
-`IoFileMgrForUser`), PSP-specific relocations, and entry `0xFFFFFFFF`.
-`allegrexrecomp funcs` found 543 functions and 7,821 instructions; `emit`
-generated 11 C translation units, all compiled with GCC 15.2.0. This does not
-prove the module can execute.
+**Relocation.** `scripts/relocate_prx.py` applies the 933 PSP relocations
+offline and rebases the ELF to `0x08900000` — RAM below the runtime heap
+(`0x08C00000`), clear of the EBOOT module mapping and the boot TCB. It loads
+segment 0 at `0x08900000` (`0x8750` bytes) and segment 1 at `0x08908750`
+(`0x238` bytes, ending at `0x08908988`). The records are 274 `R_MIPS_32`,
+529 `R_MIPS_26`, 59 `HI16` and 71 `LO16`.
 
-Integration is incomplete: both modules are linked at address zero. The emitter
-patch adds optional `PSPRECOMP_NAMESPACE` for generated external symbols; compiling
-the font corpus with `-DPSPRECOMP_NAMESPACE=font_` isolates its functions, import
-thunks, labels and registration without changing EBOOT names. All 11 font units
-compiled, and a Windows executable linked them with the EBOOT and runtime. This
-is a link check only: it does not register or execute the PRX.
-The upstream loader only copies the first PT_LOAD and does not relocate a
-second module. Correct integration requires isolated generated symbols,
-rebasing/relocation, import/export binding, and handling module startup;
-none is replaced with fabricated success. The S4 host was rerun with the real
-EBOOT and ISO: it still reaches the dispatch budget while retrying
-`sceKernelLoadModule` (`0x977DE386`), with 0 dispatch misses, 0 bad memory
-accesses and 96,256 ISO bytes read. No PRX was loaded or started.
+The relocation table is not ordered by instruction address, so the usual
+"next LO16 in the table" pairing is wrong for this module: three pairs form a
+cycle, and one `lui` pairs with a `lbu` 476 bytes away. The script pairs each
+`lui rt` with the LO16 whose instruction uses `rt` as its base, requires a
+unique nearest match, and adjusts the HI16 high half for the sign-extended
+LO16 carry. Every record is checked by re-reading the written word and
+recomputing the expected value; `R_MIPS_26` targets are checked to land in the
+image. The sample `lui v1,0` / `lbu a2,0` pair at `0x0`/`0x4` becomes
+`lui v1,0x891` / `lbu a2,0x8750`, whose signed effective address is exactly
+`0x08908750`.
 
-The PRX's PSP relocation segment contains 274 type 2, 529 type 4, 59 type 5,
-and 71 type 6 records (the MIPS 32, 26, HI16 and LO16 encodings). None has yet
-been applied. Guest image relocation alone is insufficient: emitted C also
-contains link-time addresses. In particular the EBOOT and PRX cannot safely
-share the current dispatch table at address zero. No font NIDs have been bound.
+The emitter needed two small patches: optional `PSPRECOMP_NAMESPACE` keeps
+the PRX's generated symbols (`font_psp_func_08900000`, `font_recomp_register`)
+separate from the EBOOT's, and `psp_collect_pointer_seeds` now reads each
+relocation from the segment named in `r_info` instead of assuming segment 0.
+The C corpus is emitted from the already-relocated ELF, so every direct call,
+label and data address in it is the final guest address. The PRX corpus contains
+no `$gp`-relative access; the module-info gp field follows its own `R_MIPS_32`
+relocation to `0x089108C0`, consistent with the image and unused by this code.
 
-Static inspection of the generated EBOOT identifies the seven font imports:
+**Loading and dispatch.** `font_prx.c` validates the two `PT_LOAD` segments,
+places them in guest RAM, zeroes `.bss`, rejects overlaps and read-back
+mismatches, and is exercised with the relocated ELF as the host's third
+argument. The namespaced corpus registers 541 functions and 657 labels
+(dispatch grows from 16,389 to 17,587 entries); `psp_lookup(0x08900000)` hits
+`font_psp_func_08900000`. This is an image and address check, not ModuleMgr:
+nothing calls the PRX yet.
 
-| NID | Function | EBOOT call site |
-|---|---|---|
-| `67F17ED7` | `sceFontNewLib` | `0x41C18` |
-| `099EF33C` | `sceFontFindOptimumFont` | `0x41C68` |
-| `A834319D` | `sceFontOpen` | `0x41C88`, `0x41CE8` |
-| `0DA7535E` | `sceFontGetFontInfo` | `0x41D08` |
-| `EE232411` | `sceFontSetAltCharacterCode` | `0x41D58` |
-| `DCC80C2F` | `sceFontGetCharInfo` | `0x42C44` |
-| `980F4895` | `sceFontGetCharGlyphImage` | `0x42CC4` |
+**EBOOT integrity.** With and without the font image, the EBOOT reaches the
+same `sceKernelLoadModule` retry, with 0 dispatch misses, 0 bad accesses,
+0 traps and 96,256 ISO bytes read. The upstream test suite passes 21/21
+after the seed fix.
 
-These are static call sites, not observed executions: `0x41BB8` retries module
-loading at `0x41BD0`, then calls `sceKernelStartModule` at `0x41BF0`, before
-reaching the font calls. A font HLE therefore needs guest allocation callbacks,
-valid font handles and actual PGF metrics and glyphs, not just a module UID.
-Local PPSSPP font assets exist, but their provenance and compatibility have not
-been established. The PRX alternative still needs relocation and symbol/import
-binding; neither alternative has yet been implemented or validated.
+**Still blocked.** `sceKernelLoadModule` (`0x977DE386`) is not implemented,
+so the seven `sceLibFont` NIDs are not bound and no font code executes. That
+is ModuleMgr and import/export binding, not relocation.
 
-Reproduction of the analysis, using the existing S1 tool build and a local ISO:
+Reproduction from the decrypted ELF (the extraction/decryption steps are the
+same as in the earlier investigation):
 
 ```powershell
-python -c "from pathlib import Path; f=open(r'private/TF1.iso','rb'); f.seek(0x52c0*2048); d=f.read(0x5ba0); Path('build/s5-font.psp').write_bytes(d[64:])"
-# Build pspdecrypt separately under WSL from the revision above; see its GPL license.
-wsl build/pspdecrypt/pspdecrypt -o build/s5-font.gz build/s5-font.psp
-python -c "import gzip; from pathlib import Path; Path('build/s5-font.elf').write_bytes(gzip.decompress(Path('build/s5-font.gz').read_bytes()))"
-& $tool info build/s5-font.elf
-& $tool funcs build/s5-font.elf
-New-Item -ItemType Directory -Force build/s5-font
-& $tool emit build/s5-font.elf build/s5-font font
-# Compile each generated PRX unit with its own namespace; EBOOT stays unchanged.
-Get-ChildItem build/s5-font/*.c | ForEach-Object {
+python scripts\relocate_prx.py build\s5-font.elf build\s5-font-reloc.elf
+& $tool info  build\s5-font-reloc.elf
+& $tool funcs build\s5-font-reloc.elf
+New-Item -ItemType Directory -Force build/s5-font-reloc
+& $tool emit build\s5-font-reloc.elf build\s5-font-reloc font
+Get-ChildItem build/s5-font-reloc/*.c | ForEach-Object {
     & gcc -std=c11 -O2 -DPSPRECOMP_NAMESPACE=font_ -I build/psprecomp/include `
-        -c $_.FullName -o "build/s5-font/$($_.BaseName).o"
+        -c $_.FullName -o "build/s5-font-reloc/$($_.BaseName).o"
     if ($LASTEXITCODE -ne 0) { throw "Compilation failed: $($_.Name)" }
 }
+cmake -S . -B build/s5-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+cmake --build build/s5-build -j 8
+.\build\s5-build\Seto-static.exe private\ULUS10136_EBOOT.elf private\TF1.iso `
+    build\s5-font-reloc.elf
 ```
 
-- `sceKernelLoadModule` / `sceKernelStartModule` are not implemented; the game
-  retries the `~SCE` module at LBN `0x52C0`.
+## Limitations
+
+- `sceKernelLoadModule` / `sceKernelStartModule` and the seven `sceLibFont`
+  NID bindings are not implemented; the game retries the `~SCE` module at LBN
+  `0x52C0`. S5 is complete for relocation, not end to end.
 - `sceGe` command stream, renderer, audio and controls are not implemented.
 - 276 VFPU + 16 `vcmov` instructions remain traps; none were reached by this run.
 - 2,889 functions without `jr $ra` and 176 `scattered` functions remain discovery
-  caveats; they did not affect S4 execution.
+  caveats; they did not affect the EBOOT run.
 - No window, renderer, audio or controls; the goal is the real code path, not play.
 
 ## Repo contents
 
-Tracked: this README, `.gitignore`, `host.c`, `umd.c`, `fpl.c`, `CMakeLists.txt`, and
-three small patches against the pinned psprecomp. `build/` (tool clone, generated C,
-objects, executable) and `private/` (decrypted EBOOT, ISO) are ignored.
+Tracked: this README, `.gitignore`, `host.c`, `umd.c`, `fpl.c`, `font_prx.c`,
+`scripts/relocate_prx.py`, `CMakeLists.txt`, and five small patches against the
+pinned psprecomp. `build/` (tool clone, generated C, relocated ELF, objects,
+executable) and `private/` (decrypted EBOOT, ISO) are ignored.
