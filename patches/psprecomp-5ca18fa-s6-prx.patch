@@ -1,0 +1,240 @@
+diff --git a/include/psprecomp/mem.h b/include/psprecomp/mem.h
+index 5375bb3..1e7a10e 100644
+--- a/include/psprecomp/mem.h
++++ b/include/psprecomp/mem.h
+@@ -58,6 +58,10 @@ void psp_mem_free(void);
+  * Call once, before loading segments. Returns 0 on success. */
+ int psp_mem_map_module(uint32_t base, uint32_t size);
+ 
++/* Map a second module image outside the RAM window. The EBOOT keeps the low
++ * mapping (base 0); a large PRX such as libtitle.prx uses this one. */
++int psp_mem_map_extra(uint32_t base, uint32_t size);
++
+ /* Resolve a guest address to a host pointer, or NULL if unmapped.
+  * `size` is the access width; a read straddling the end of a region is
+  * rejected rather than silently truncated. */
+diff --git a/include/psprecomp/module.h b/include/psprecomp/module.h
+index a9ed2eb..8e2c9de 100644
+--- a/include/psprecomp/module.h
++++ b/include/psprecomp/module.h
+@@ -14,6 +14,7 @@ typedef struct {
+     uint32_t image_end;     /* end of the file-backed part; .bss follows */
+     uint32_t entry;         /* module_start */
+     uint32_t gp;            /* from the module info */
++    uint32_t info;          /* guest address of the module info */
+     uint32_t ctors;         /* constructor table, 0 if none was found */
+     int      nctors;
+ } psp_module;
+diff --git a/include/psprecomp/vfpu.h b/include/psprecomp/vfpu.h
+index f419054..9ed6d54 100644
+--- a/include/psprecomp/vfpu.h
++++ b/include/psprecomp/vfpu.h
+@@ -75,6 +75,8 @@ void psp_vhdp(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+ void psp_vcrs(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+ void psp_vcrsp(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+ void psp_vdet(uint32_t vd, uint32_t vs, uint32_t vt, int size);
++/* vbfy1: pair-wise sum/difference (rs0+rs1, rs0-rs1, ...). */
++void psp_vbfy1(uint32_t vd, uint32_t vs, int size);
+ 
+ /* One row of a rotation matrix; `imm` is the instruction's bits 20..16. */
+ void psp_vrot(uint32_t vd, uint32_t vs, uint32_t imm, int size);
+diff --git a/src/hle/iofilemgr.c b/src/hle/iofilemgr.c
+index 2711ad1..1d0e6fa 100644
+--- a/src/hle/iofilemgr.c
++++ b/src/hle/iofilemgr.c
+@@ -32,7 +32,7 @@
+ #define PSP_O_CREAT  0x0200
+ #define PSP_O_TRUNC  0x0400
+ 
+-typedef struct { FILE *f; int used; int raw; } io_file;
++typedef struct { FILE *f; int used; int raw; uint64_t end; } io_file;
+ 
+ typedef struct {
+     int used;
+@@ -95,6 +95,27 @@ static void map_path(const char *guest, char *out, size_t cap) {
+     snprintf(out, cap, "%s/%s/%s", g_root, sub, p);
+ }
+ 
++/* disc0:/sce_lbn0x<lbn>_size0x<size> names a byte range of the UMD image. Open
++ * the image at that sector and remember the extent so a read cannot wander
++ * into the next file. Offsets stay below 2 GB (the disc image does), which is
++ * what a 32-bit host fseek can address. */
++static FILE *open_lbn(const char *guest, uint64_t *start, uint64_t *end) {
++    unsigned long lbn, size;
++    if (sscanf(guest, "disc0:/sce_lbn0x%lx_size0x%lx", &lbn, &size) != 2)
++        return NULL;
++    if (!g_umd[0]) return NULL;
++    FILE *f = fopen(g_umd, "rb");
++    if (!f) return NULL;
++    uint64_t off = (uint64_t)lbn * 2048u;
++    if (off > 0x7FFFFFFFull || fseek(f, (long)off, SEEK_SET) != 0) {
++        fclose(f);
++        return NULL;
++    }
++    *start = off;
++    *end = off + (uint64_t)size;
++    return f;
++}
++
+ static void hle_Open(void) {
+     char guest[512], host[1024];
+     psp_str(psp_arg(0), guest, sizeof guest);
+@@ -102,7 +123,12 @@ static void hle_Open(void) {
+ 
+     const int raw = !strcmp(guest, "umd0:") || !strcmp(guest, "umd1:");
+     FILE *f = NULL;
+-    if (raw) {
++    uint64_t lbn_start = 0, lbn_end = 0;
++    if (!strncmp(guest, "disc0:/sce_lbn0x", 16)) {
++        f = open_lbn(guest, &lbn_start, &lbn_end);
++        snprintf(host, sizeof host, "%s @ %llu", g_umd[0] ? g_umd : "(no disc image set)",
++                 (unsigned long long)lbn_start);
++    } else if (raw) {
+         if (g_umd[0]) f = fopen(g_umd, "rb");
+         snprintf(host, sizeof host, "%s", g_umd[0] ? g_umd : "(no disc image set)");
+     } else {
+@@ -135,6 +161,7 @@ static void hle_Open(void) {
+         g_file[i].f = f;
+         g_file[i].used = 1;
+         g_file[i].raw = raw;
++        g_file[i].end = lbn_end;
+         psp_ret((uint32_t)(i + 3));   /* 0-2 are reserved for the std streams */
+         return;
+     }
+@@ -155,6 +182,7 @@ static void hle_Close(void) {
+     h->f = NULL;
+     h->used = 0;
+     h->raw = 0;
++    h->end = 0;
+     psp_ret(0);
+ }
+ 
+@@ -166,7 +194,13 @@ static void hle_Read(void) {
+ 
+     /* A block device counts the size in 2048-byte sectors, and reports what it
+      * read back in the same unit. */
+-    const size_t bytes = (size_t)size * (h->raw ? 2048u : 1u);
++    size_t bytes = (size_t)size * (h->raw ? 2048u : 1u);
++    if (h->end && !h->raw) {
++        long pos = ftell(h->f);
++        uint64_t left = (pos >= 0 && (uint64_t)pos < h->end)
++                        ? h->end - (uint64_t)pos : 0;
++        if ((uint64_t)bytes > left) bytes = (size_t)left;
++    }
+     if (h->raw && getenv("PSPRECOMP_TRACE_IO"))
+         fprintf(stderr, "io: raw read %u sector(s) at sector %ld\n",
+                 size, ftell(h->f) / 2048);
+diff --git a/src/mem.c b/src/mem.c
+index 99da3ec..20a9a1d 100644
+--- a/src/mem.c
++++ b/src/mem.c
+@@ -108,6 +108,20 @@ int psp_mem_map_module(uint32_t base, uint32_t size) {
+     return 0;
+ }
+ 
++/* A second module image: the EBOOT occupies the low mapping and a large PRX
++ * (modtitle reserves 12.7 MB) cannot fit in the RAM window or share it. */
++static uint8_t *g_extra;
++static uint32_t g_extra_base, g_extra_size;
++
++int psp_mem_map_extra(uint32_t base, uint32_t size) {
++    free(g_extra);
++    g_extra = (uint8_t *)calloc(1, size ? size : 1);
++    if (!g_extra) { g_extra_size = 0; return -1; }
++    g_extra_base = base;
++    g_extra_size = size;
++    return 0;
++}
++
+ void *psp_mem_ptr(uint32_t addr, uint32_t size) {
+     /* Collapse the three cache-behaviour mirrors onto one backing store. */
+     const uint32_t a = addr & PSP_ADDR_MASK;
+@@ -119,6 +133,11 @@ void *psp_mem_ptr(uint32_t addr, uint32_t size) {
+         if (off + size > g_module_size) return NULL;
+         return g_module + off;
+     }
++    if (g_extra_size && a >= g_extra_base && a < g_extra_base + g_extra_size) {
++        uint32_t off = a - g_extra_base;
++        if (off + size > g_extra_size) return NULL;
++        return g_extra + off;
++    }
+ 
+     if (a >= PSP_RAM_BASE && a < PSP_RAM_BASE + PSP_RAM_SIZE) {
+         uint32_t off = a - PSP_RAM_BASE;
+diff --git a/src/module.c b/src/module.c
+index 7e4aff8..5092b53 100644
+--- a/src/module.c
++++ b/src/module.c
+@@ -53,6 +53,7 @@ int psp_module_load(const char *path, uint32_t span, psp_module *m) {
+     m->entry = rd32(b + 24);
+     /* SceModuleInfo: u16 attr, u16 version, char name[28], then gp. */
+     const uint32_t info = (paddr & 0x7FFFFFFFu) - off + vaddr;
++    m->info = info;
+     m->gp = psp_read32(info + 32);
+     free(b);
+ 
+diff --git a/src/vfpu.c b/src/vfpu.c
+index c6fdd8b..077f80b 100644
+--- a/src/vfpu.c
++++ b/src/vfpu.c
+@@ -311,6 +311,22 @@ void psp_vdet(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+     end_op();
+ }
+ 
++/* VFPU9 butterfly: each input pair becomes (sum, difference). Used by the
++ * game's colour conversion; the four-lane form handles both pairs. */
++void psp_vbfy1(uint32_t vd, uint32_t vs, int size) {
++    float s[4], out[4];
++    int n = size == 4 ? 4 : 2;
++    read_src(0, vs, n, s);
++    out[0] = s[0] + s[1];
++    out[1] = s[0] - s[1];
++    if (n == 4) {
++        out[2] = s[2] + s[3];
++        out[3] = s[2] - s[3];
++    }
++    write_dst(vd, n, out);
++    end_op();
++}
++
+ /* ---- unary element-wise ops (VFPU4) -------------------------------------- */
+ 
+ /* Round half to even, without depending on the host's rounding mode. */
+diff --git a/tools/allegrexrecomp/decode.c b/tools/allegrexrecomp/decode.c
+index dabffb9..41cabe3 100644
+--- a/tools/allegrexrecomp/decode.c
++++ b/tools/allegrexrecomp/decode.c
+@@ -671,6 +671,7 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
+             break;
+         case 0x02:                                  /* VFPU9 */
+             switch (RT_F(word)) {
++            case 0x02: op = A_VBFY1; break;
+             case 0x04: op = A_VOCP; break;
+             case 0x0A: op = A_VSGN; break;
+             default:   op = A_VFPU_UNKNOWN; break;
+diff --git a/tools/allegrexrecomp/decode.h b/tools/allegrexrecomp/decode.h
+index 54e0e8a..aaecf9b 100644
+--- a/tools/allegrexrecomp/decode.h
++++ b/tools/allegrexrecomp/decode.h
+@@ -80,6 +80,7 @@ typedef enum {
+     A_LV_S, A_LV_Q, A_SV_S, A_SV_Q, A_LVL_Q, A_LVR_Q, A_SVL_Q, A_SVR_Q,
+     /* VFPU — arithmetic (the families we decode today; see docs/VFPU.md) */
+     A_VADD, A_VSUB, A_VDIV, A_VMUL, A_VDOT, A_VSCL, A_VHDP, A_VCRS, A_VDET,
++    A_VBFY1,
+     A_VCMP, A_VMIN, A_VMAX, A_VSCMP, A_VSGE, A_VSLT,
+     A_VMOV, A_VABS, A_VNEG, A_VZERO, A_VONE, A_VRCP, A_VRSQ, A_VSQRT,
+     A_VSIN, A_VCOS, A_VEXP2, A_VLOG2, A_VI2F, A_VF2I,
+diff --git a/tools/allegrexrecomp/emit.c b/tools/allegrexrecomp/emit.c
+index 1969dd5..ab6dd64 100644
+--- a/tools/allegrexrecomp/emit.c
++++ b/tools/allegrexrecomp/emit.c
+@@ -428,6 +428,9 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+         fprintf(f, "%spsp_vscl(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
+     case A_VCMP:
+         fprintf(f, "%spsp_vcmp(%u, %u, %u, %u);\n", ind, in->vd & 0xF, in->vs, in->vt, in->vsize); return;
++    case A_VBFY1:
++        fprintf(f, "%spsp_vbfy1(%u, %u, %u);\n", ind, in->vd, in->vs, in->vsize);
++        return;
+     case A_VSGE: case A_VSLT: case A_VSCMP: case A_VHDP: case A_VCRS: case A_VCRSP: case A_VDET: {
+         const char *fn = in->op == A_VSGE ? "vsge" : in->op == A_VSLT ? "vslt" :
+                          in->op == A_VSCMP ? "vscmp" : in->op == A_VHDP ? "vhdp" :

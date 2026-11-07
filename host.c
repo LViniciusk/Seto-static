@@ -25,6 +25,9 @@ int  psp_font_bind(void);
 #ifdef HAVE_FONT_CORPUS
 void font_psp_recomp_register(void);   /* relocated PRX corpus */
 #endif
+#ifdef HAVE_TITLE_CORPUS
+int  psp_title_image_load(const char *path, uint32_t eboot_info);
+#endif
 
 /* The EBOOT's single PT_LOAD has memsz 0x631A80; .bss runs to there. */
 #define MODULE_SPAN 0x00640000u
@@ -74,6 +77,7 @@ static void report(const char *why) {
     } else {
         fprintf(stderr, "  capture:  no framebuffer\n");
     }
+
 }
 
 static void on_miss(uint32_t addr) {
@@ -114,6 +118,7 @@ int main(int argc, char **argv) {
     const char *elf = argc > 1 ? argv[1] : "private/ULUS10136_EBOOT.elf";
     const char *iso = argc > 2 ? argv[2] : "private/TF1.iso";
     const char *font = argc > 3 ? argv[3] : NULL;
+    const char *title = argc > 4 ? argv[4] : NULL;
 
     if (psp_mem_init() != 0) { fprintf(stderr, "memory init failed\n"); return 1; }
 
@@ -150,6 +155,17 @@ int main(int argc, char **argv) {
     }
 #endif
 
+    /* S6: modtitle, relocated after the EBOOT. Its 197 libehsys imports are
+     * forwarded to the real exports parsed from the EBOOT's own tables. */
+#ifdef HAVE_TITLE_CORPUS
+    if (title && psp_title_image_load(title, m.info) != 0) return 1;
+#else
+    if (title) {
+        fprintf(stderr, "title PRX: this build has no title corpus (build/s6-title-reloc)\n");
+        return 1;
+    }
+#endif
+
     /* This EBOOT has no .ctors section. The upstream heuristic scans the last
      * 64 KB of the image for a run of pointers into that same window and here
      * matches eight .data words (first target 0x000EA0D8), which are not code.
@@ -160,6 +176,7 @@ int main(int argc, char **argv) {
     printf("module  \"%s\"\n", elf);
     printf("disc    \"%s\"\n", iso);
     if (font) printf("font    \"%s\"\n", font);
+    if (title) printf("title   \"%s\"\n", title);
     printf("image   0x%08X..0x%08X  entry 0x%08X  gp 0x%08X  ctors %d\n",
            m.base, m.image_end, m.entry, m.gp, m.nctors);
     printf("dispatch %u functions/labels registered\n", psp_dispatch_count());

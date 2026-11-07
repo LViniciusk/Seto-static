@@ -30,11 +30,34 @@ if(FONT_SOURCES)
     target_link_libraries(fontprx PRIVATE psprecomp)
 endif()
 
-add_executable(Seto-static host.c umd.c fpl.c font_prx.c)
+# S6: the relocated modtitle corpus. Its imports are not firmware NIDs but
+# EBOOT exports, so every stub is routed through title_import_forward().
+file(GLOB TITLE_SOURCES CONFIGURE_DEPENDS
+     ${CMAKE_CURRENT_SOURCE_DIR}/build/s6-title-reloc/*.c)
+if(TITLE_SOURCES)
+    add_library(titleprx OBJECT ${TITLE_SOURCES})
+    target_compile_definitions(titleprx PRIVATE
+        PSPRECOMP_NAMESPACE=title_ PSPRECOMP_TRACE
+        psp_hle_call=title_import_forward)
+    target_include_directories(titleprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s6-title-reloc)
+    target_link_libraries(titleprx PRIVATE psprecomp)
+endif()
+
+set(SETO_SOURCES host.c umd.c fpl.c font_prx.c)
+if(TITLE_SOURCES)
+    list(APPEND SETO_SOURCES title_prx.c)
+endif()
+add_executable(Seto-static ${SETO_SOURCES})
 if(FONT_SOURCES)
     target_sources(Seto-static PRIVATE $<TARGET_OBJECTS:fontprx>)
     target_compile_definitions(Seto-static PRIVATE HAVE_FONT_CORPUS)
 else()
     message(STATUS "S5 font corpus not found under build/s5-font-reloc; building the EBOOT-only host")
+endif()
+if(TITLE_SOURCES)
+    target_sources(Seto-static PRIVATE $<TARGET_OBJECTS:titleprx>)
+    target_compile_definitions(Seto-static PRIVATE HAVE_TITLE_CORPUS)
+else()
+    message(STATUS "S6 title corpus not found under build/s6-title-reloc; building without modtitle")
 endif()
 target_link_libraries(Seto-static PRIVATE tagforce)

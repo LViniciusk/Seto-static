@@ -20,6 +20,11 @@
 #define FONT_UID        0x00070001u
 #define FONT_LBN_PATH   "disc0:/sce_lbn0x52c0_size0x5ba0"
 
+#ifdef HAVE_TITLE_CORPUS
+int psp_title_load_uid(const char *path, uint32_t *uid);
+int psp_title_start(uint32_t uid, uint32_t status_ptr);
+#endif
+
 static uint16_t rd16(const uint8_t *p) {
     return (uint16_t)(p[0] | (p[1] << 8));
 }
@@ -231,6 +236,13 @@ static void font_char_glyph(void)   { font_call(0x980F4895u); }
 static void hle_LoadModule(void) {
     char path[128];
     psp_str(psp_arg(0), path, sizeof path);
+#ifdef HAVE_TITLE_CORPUS
+    uint32_t tuid;
+    if (psp_title_load_uid(path, &tuid)) {
+        psp_ret(tuid);
+        return;
+    }
+#endif
     if (!g_font_loaded || strcmp(path, FONT_LBN_PATH) != 0) {
         psp_ret(0x80010002u);          /* ENOENT */
         return;
@@ -240,6 +252,9 @@ static void hle_LoadModule(void) {
 }
 
 static void hle_StartModule(void) {
+#ifdef HAVE_TITLE_CORPUS
+    if (psp_title_start(psp_arg(0), psp_arg(3))) return;
+#endif
     if (psp_arg(0) != g_font_uid) {
         psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID);
         return;

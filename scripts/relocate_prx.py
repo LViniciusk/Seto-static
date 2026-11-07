@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Relocate the decrypted sceFont_Library PRX for Seto-static S5.
+"""Relocate a decrypted PSP PRX for Seto-static.
 
-Only the PSP relocation types this module uses are implemented, with the
+Only the PSP relocation types these modules use are implemented, with the
 semantics PPSSPP's ELF loader applies: r_info bits 8..15 name the segment the
 word lives in, bits 16..23 the segment whose load address is added to the
 value. The output is an ELF whose PT_LOAD vaddrs and section addresses are
 rebased, so the existing C emitter can translate it as a normal image.
+
+Modules linked as two PT_LOAD segments carry their relocations in PT_PSPREL;
+modules linked as one segment keep them in the `.rel.*` sections. Both are
+handled.
 
 Usage: relocate_prx.py <in.elf> <out.elf> [--base 0x08900000]
 """
@@ -18,6 +22,8 @@ SHF_ALLOC = 2
 RAM_LO, RAM_HI = 0x08000000, 0x0A000000
 HEAP_LO = 0x08C00000
 EBOOT_END = 0x00640000
+VRAM_LO = 0x04000000
+SHT_PSPREL = 0x700000A0
 
 
 def u32(d, o):
@@ -67,10 +73,8 @@ def main(argv):
             })
         elif p_type == PT_PSPREL:
             rel_ph = p
-    if len(segs) != 2:
-        fail("expected two PT_LOAD segments, found %d" % len(segs))
-    if not rel_ph:
-        fail("no PT_PSPREL relocation segment")
+    if len(segs) not in (1, 2):
+        fail("expected one or two PT_LOAD segments, found %d" % len(segs))
 
     for i, s in enumerate(segs):
         if s["filesz"] > s["memsz"]:
@@ -87,18 +91,31 @@ def main(argv):
     if base & 3:
         fail("base is not word-aligned")
     end = max(base + s["vaddr"] + s["memsz"] for s in segs)
-    if base < RAM_LO or end > HEAP_LO:
-        fail("relocated image [0x%08X,0x%08X) leaves the reserved RAM window"
-             % (base, end))
     if base < EBOOT_END:
         fail("relocated image overlaps the EBOOT module mapping")
-    if segs[0]["memsz"] > segs[1]["vaddr"]:
+    # Two validated windows: the PSP RAM window used by sceFont_Library, and
+    # the low window between the EBOOT mapping and VRAM for a module too large
+    # for RAM. Neither may touch VRAM (0x04000000) or the runtime heap.
+    if RAM_LO <= base and end <= HEAP_LO:
+        pass
+    elif end <= VRAM_LO:
+        pass
+    else:
+        fail("relocated image [0x%08X,0x%08X) leaves the free windows"
+             % (base, end))
+    if len(segs) == 2 and segs[0]["memsz"] > segs[1]["vaddr"]:
         fail("the two segments overlap")
     old_vaddr = [s["vaddr"] for s in segs]
     for s in segs:
         s["vaddr"] += base
     for s in segs:
         pu32(data, s["ph"] + 8, s["vaddr"])
+
+    # The ELF entry is an image offset like any other code address. A library
+    # with no initializer uses 0xFFFFFFFF and keeps it.
+    entry = u32(data, 24)
+    if entry < 0x80000000:
+        pu32(data, 24, entry + base)
 
     # Section addresses feed the emitter's .text/module-info discovery.
     for i in range(shnum):
@@ -111,15 +128,38 @@ def main(argv):
             pu32(data, sh + 12, addr + base)
 
     # ---- relocation table -------------------------------------------------
-    rel_off = u32(data, rel_ph + 4)
-    rel_size = u32(data, rel_ph + 16)
-    if rel_off + rel_size > len(data) or rel_size % 8:
-        fail("bad relocation segment")
-    n = rel_size // 8
+    pairs = []
+    if rel_ph:
+        rel_off = u32(data, rel_ph + 4)
+        rel_size = u32(data, rel_ph + 16)
+        if rel_off + rel_size > len(data) or rel_size % 8:
+            fail("bad relocation segment")
+        for i in range(rel_size // 8):
+            pairs.append((u32(data, rel_off + i * 8),
+                          u32(data, rel_off + i * 8 + 4)))
+    else:
+        # One-segment modules keep the same records in `.rel.*` sections.
+        for i in range(shnum):
+            sh = shoff + i * shentsize
+            if sh + 40 > len(data):
+                break
+            if u32(data, sh + 4) != SHT_PSPREL:
+                continue
+            off = u32(data, sh + 16)
+            size = u32(data, sh + 20)
+            if size == 0:
+                continue
+            if off + size > len(data) or size % 8:
+                fail("bad relocation section %d" % i)
+            for j in range(size // 8):
+                pairs.append((u32(data, off + j * 8),
+                              u32(data, off + j * 8 + 4)))
+    n = len(pairs)
+    if n == 0:
+        fail("no relocation entries")
     entries = []
     for i in range(n):
-        r_offset = u32(data, rel_off + i * 8)
-        r_info = u32(data, rel_off + i * 8 + 4)
+        r_offset, r_info = pairs[i]
         typ = r_info & 0xF
         rw = (r_info >> 8) & 0xFF
         rel = (r_info >> 16) & 0xFF
@@ -130,44 +170,29 @@ def main(argv):
         if r_offset + 4 > segs[rw]["filesz"]:
             fail("relocation %d targets non-file-backed memory" % i)
         entries.append({"off": r_offset, "type": typ, "rw": rw, "rel": rel})
-    if n != 933:
-        fail("expected 933 relocations, found %d" % n)
 
     # Snapshot every word before writing: a HI16 needs its LO16's original
     # immediate even if the LO16 is applied first.
     orig = [u32(data, segs[e["rw"]]["off"] + e["off"]) for e in entries]
 
-    # Pair each HI16 with the LO16 that uses its base register. The linker
-    # groups relocations by target rather than by instruction address, so
-    # "the next LO16 in the table" pairs the wrong instructions on this
-    # module (three pairs form a cycle). The instruction itself is the
-    # evidence: a lui rt must be followed in code by an LO16 whose base is rt.
-    lo_entries = [(i, e, orig[i]) for i, e in enumerate(entries)
-                  if e["type"] == R_MIPS_LO16]
+    # Pair each HI16 with the next unused LO16 in the relocation table. The
+    # linker emits the pair adjacently in the stream even when the two
+    # instructions are far apart in the code; code order is not the pairing
+    # (branches can reach a lui's low half from another path).
+    hi_entries = [(i, e, orig[i]) for i, e in enumerate(entries)
+                  if e["type"] == R_MIPS_HI16]
     pair = {}
     used_lo = set()
-    for i, e in enumerate(entries):
-        if e["type"] != R_MIPS_HI16:
-            continue
-        w = orig[i]
+    for i, e, w in hi_entries:
         if (w >> 26) != 0x0F:
             fail("HI16 at entry %d is not a lui" % i)
-        rt = (w >> 16) & 31
-        candidates = []
-        for j, le, lw in lo_entries:
-            if le["rw"] != e["rw"] or le["rel"] != e["rel"]:
-                continue
-            if ((lw >> 21) & 31) != rt:
-                continue
-            candidates.append((abs(le["off"] - e["off"]), j))
-        if not candidates:
-            fail("HI16 at entry %d has no LO16 using r%d" % (i, rt))
-        candidates.sort()
-        if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
-            fail("HI16 at entry %d has an ambiguous LO16 pair" % i)
-        j = candidates[0][1]
-        if j in used_lo:
-            fail("LO16 entry %d is claimed by two HI16s" % j)
+        j = None
+        for k in range(i + 1, len(entries)):
+            if entries[k]["type"] == R_MIPS_LO16 and k not in used_lo:
+                j = k
+                break
+        if j is None:
+            fail("HI16 at entry %d has no LO16 after it in the table" % i)
         used_lo.add(j)
         pair[i] = j
 
