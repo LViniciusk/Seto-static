@@ -23,12 +23,14 @@ threads skipped the CPU baton. `_Thread_local` fixes it: the boot thread and
 `user_main` now alternate on separate host threads without the `psp_ra_is_jump`
 crash, and the game reaches `sceKernelLoadModule` (see [S4 results](#s4-results)).
 
-**S5 — sceFont_Library relocation: PASS (subtask).** The 44,052-byte PRX is
-rebased to `0x08900000` and all 933 PSP relocations are applied offline; the
-namespaced 541-function corpus is emitted from that image, linked with the EBOOT,
-placed in guest RAM, and registered at its final addresses. S5 end-to-end is
-still blocked on ModuleMgr and the seven `sceLibFont` NID bindings (see
-[S5 results](#s5-results--scefont_library-relocation)).
+**S5 — sceFont_Library integration: PASS.** The 44,052-byte PRX is rebased to
+`0x08900000`, all 933 PSP relocations are applied offline, and the namespaced
+541-function corpus is linked with the EBOOT. Minimal ModuleMgr serves the real
+LBN path (`sceKernelLoadModule` UID `0x00070001`, `sceKernelStartModule` without
+an initializer), the seven `sceLibFont` NIDs are bound to real exports, and five
+of them executed: `NewLib`, `FindOptimumFont`, `Open`, `GetFontInfo` and
+`SetAltCharacterCode`. The next dependency is `sceReg` (see
+[S5 results](#s5-results--scefont_library-integration)).
 
 ## Input
 
@@ -81,7 +83,7 @@ cmake -S . -B build/s5-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build/s5-build -j 8
 # EBOOT only (S2–S4 behaviour):
 .\build\s5-build\Seto-static.exe private\ULUS10136_EBOOT.elf private\TF1.iso
-# S5 relocation check: optional third argument adds the PRX image and corpus:
+# S5: load the relocated PRX, register its corpus and bind the seven NIDs:
 .\build\s5-build\Seto-static.exe private\ULUS10136_EBOOT.elf private\TF1.iso `
     build\s5-font-reloc.elf
 
@@ -195,7 +197,7 @@ created but not started until this module loads, so the run stops on the dispatc
 budget. `ModuleMgrForUser` (load/relocate/start the PRX, module UIDs) is the next
 subsystem; it is not scheduler work.
 
-## S5 results — sceFont_Library relocation
+## S5 results — sceFont_Library integration
 
 The requested ISO range (LBN `0x52C0`, length `0x5BA0`, SHA-256
 `ca621cb2212763ad85611e67e08d3e0296ce514b6ec731d7f05997c8d917c25a`)
@@ -234,20 +236,48 @@ relocation to `0x089108C0`, consistent with the image and unused by this code.
 
 **Loading and dispatch.** `font_prx.c` validates the two `PT_LOAD` segments,
 places them in guest RAM, zeroes `.bss`, rejects overlaps and read-back
-mismatches, and is exercised with the relocated ELF as the host's third
-argument. The namespaced corpus registers 541 functions and 657 labels
-(dispatch grows from 16,389 to 17,587 entries); `psp_lookup(0x08900000)` hits
-`font_psp_func_08900000`. This is an image and address check, not ModuleMgr:
-nothing calls the PRX yet.
+mismatches, then parses the module info and export table from the placed image.
+The namespaced corpus registers 541 functions and 657 labels (dispatch grows from
+16,389 to 17,587 entries); `psp_lookup(0x08900000)` hits
+`font_psp_func_08900000`.
 
-**EBOOT integrity.** With and without the font image, the EBOOT reaches the
-same `sceKernelLoadModule` retry, with 0 dispatch misses, 0 bad accesses,
-0 traps and 96,256 ISO bytes read. The upstream test suite passes 21/21
-after the seed fix.
+**ModuleMgr and NID binding.** `sceKernelLoadModule` (`0x977DE386`) recognizes
+`disc0:/sce_lbn0x52c0_size0x5ba0`, checks the loaded image and returns the stable
+UID `0x00070001`. `sceKernelStartModule` (`0x50F0C1EC`) accepts only that UID,
+writes status 0 and does not run an initializer: the ELF entry is `0xFFFFFFFF`
+and the export table has no `module_start`. The seven EBOOT imports are bound to
+the real exports:
 
-**Still blocked.** `sceKernelLoadModule` (`0x977DE386`) is not implemented,
-so the seven `sceLibFont` NIDs are not bound and no font code executes. That
-is ModuleMgr and import/export binding, not relocation.
+| NID | Export | Guest address |
+|---|---|---|
+| `0x67F17ED7` | `sceFontNewLib` | `0x08900000` |
+| `0x099EF33C` | `sceFontFindOptimumFont` | `0x089004E0` |
+| `0xA834319D` | `sceFontOpen` | `0x08900CD0` |
+| `0x0DA7535E` | `sceFontGetFontInfo` | `0x08900EB4` |
+| `0xEE232411` | `sceFontSetAltCharacterCode` | `0x089065E4` |
+| `0xDCC80C2F` | `sceFontGetCharInfo` | `0x089011B0` |
+| `0x980F4895` | `sceFontGetCharGlyphImage` | `0x089015B4` |
+
+Each adapter calls `psp_call_from_host(export)`. It preserves the caller's
+`$gp`: the PRX corpus has no `$gp`-relative access, and callbacks into the EBOOT
+need the EBOOT's globals. `$sp`, `$ra`, the frame chain and the return value are
+the generated code's normal path; no CPU state is copied.
+
+**Execution.** After the load/start, the EBOOT reaches the font sequence and the
+five handlers above are each called once. `entered PRX function 0x08900000`
+(`sceFontNewLib`) was observed directly; 0 dispatch misses confirm the other
+four transfers. The font library calls its own `sceReg` imports, which are not
+implemented: `OpenRegistry` (`0x92E41280`, 3), `OpenCategory` (`0x1D8A762E`,
+13), `CloseCategory` (`0x0CAE832B`, 13), `GetKeyInfo` (`0xD4475AA8`, 154) and
+`GetKeyValue` (`0x28A8E98A`, 154); they return 0 and the library proceeds with
+defaults. `GetCharInfo`/`GetCharGlyphImage` are not reached yet.
+
+**EBOOT integrity.** With the PRX the `sceKernelLoadModule` retry is gone, the
+game creates `snd_thread_main`, `snd_thread_seq` and `ehscript`, and the run ends
+at the 8 s cap in the `ehscript` loop `0x391D8`; 13 context switches, 9 parks,
+0 dispatch misses, 0 bad accesses, 0 traps, 96,256 ISO bytes. Without the third
+argument the previous behaviour is unchanged. The upstream test suite passes
+21/21.
 
 Reproduction from the decrypted ELF (the extraction/decryption steps are the
 same as in the earlier investigation):
@@ -271,10 +301,11 @@ cmake --build build/s5-build -j 8
 
 ## Limitations
 
-- `sceKernelLoadModule` / `sceKernelStartModule` and the seven `sceLibFont`
-  NID bindings are not implemented; the game retries the `~SCE` module at LBN
-  `0x52C0`. S5 is complete for relocation, not end to end.
-- `sceGe` command stream, renderer, audio and controls are not implemented.
+- `sceReg` is not implemented: the font library's registry reads return 0 and
+  it uses defaults. `GetCharInfo`/`GetCharGlyphImage` and text rendering are not
+  reached yet.
+- `sceGe` command stream, renderer, audio and controls are not implemented; the
+  game reaches its audio/script threads and idles at the 8 s cap.
 - 276 VFPU + 16 `vcmov` instructions remain traps; none were reached by this run.
 - 2,889 functions without `jr $ra` and 176 `scattered` functions remain discovery
   caveats; they did not affect the EBOOT run.

@@ -21,6 +21,7 @@ void psp_umd_register(void);
 void psp_umd_set_iso(const char *path);
 void psp_fpl_register(void);
 int  psp_font_image_load(const char *path);
+int  psp_font_bind(void);
 void font_psp_recomp_register(void);   /* relocated PRX corpus */
 
 /* The EBOOT's single PT_LOAD has memsz 0x631A80; .bss runs to there. */
@@ -53,7 +54,7 @@ static void report(const char *why) {
             (unsigned long long)psp_hle_unimplemented_calls(),
             (unsigned long long)psp_hle_zero_calls());
     psp_hle_dump_recent(stderr);
-    psp_hle_dump_counts(stderr, 12);
+    psp_hle_dump_counts(stderr, 20);
 }
 
 static void on_miss(uint32_t addr) {
@@ -79,8 +80,15 @@ static DWORD WINAPI bringup_cap(LPVOID unused) {
 }
 
 /* Entry reached: the first thing the run has to prove. */
+static uint32_t g_font_entry;
+
+static void on_font_entry(uint32_t addr) {
+    fprintf(stderr, "entered PRX function 0x%08X\n", addr);
+}
+
 static void on_entry(uint32_t addr) {
     fprintf(stderr, "reached translated entry 0x%08X\n", addr);
+    if (g_font_entry) psp_trace_watch(g_font_entry, on_font_entry);
 }
 
 int main(int argc, char **argv) {
@@ -112,6 +120,8 @@ int main(int argc, char **argv) {
             fprintf(stderr, "font PRX: dispatch entry at 0x08900000 is missing\n");
             return 1;
         }
+        if (psp_font_bind() != 0) return 1;
+        g_font_entry = 0x08900000u;   /* sceFontNewLib, the first expected call */
     }
 
     /* This EBOOT has no .ctors section. The upstream heuristic scans the last

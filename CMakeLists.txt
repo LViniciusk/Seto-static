@@ -23,7 +23,7 @@ target_link_libraries(tagforce PUBLIC psprecomp)
 file(GLOB FONT_SOURCES CONFIGURE_DEPENDS
      ${CMAKE_CURRENT_SOURCE_DIR}/build/s5-font-reloc/*.c)
 add_library(fontprx OBJECT ${FONT_SOURCES})
-target_compile_definitions(fontprx PRIVATE PSPRECOMP_NAMESPACE=font_)
+target_compile_definitions(fontprx PRIVATE PSPRECOMP_NAMESPACE=font_ PSPRECOMP_TRACE)
 target_include_directories(fontprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s5-font-reloc)
 target_link_libraries(fontprx PRIVATE psprecomp)
 
