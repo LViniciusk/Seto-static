@@ -50,6 +50,7 @@ git -C build/psprecomp checkout 5ca18fac1691a4a7b40ae683dabdf72a5703d2b8
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-vfim-float.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-umd-raw.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-real-threads.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-namespace.patch
 
 cmake -S build/psprecomp -B build/psprecomp-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build/psprecomp-build -j 8
@@ -204,8 +205,12 @@ PT_LOAD segments, 28 function exports, 11 imports (`sceReg` and
 generated 11 C translation units, all compiled with GCC 15.2.0. This does not
 prove the module can execute.
 
-Integration is blocked: both modules are linked at address zero, and both
-generated corpora define `psp_func_00000000` and `psp_recomp_register`.
+Integration is incomplete: both modules are linked at address zero. The emitter
+patch adds optional `PSPRECOMP_NAMESPACE` for generated external symbols; compiling
+the font corpus with `-DPSPRECOMP_NAMESPACE=font_` isolates its functions, import
+thunks, labels and registration without changing EBOOT names. All 11 font units
+compiled, and a Windows executable linked them with the EBOOT and runtime. This
+is a link check only: it does not register or execute the PRX.
 The upstream loader only copies the first PT_LOAD and does not relocate a
 second module. Correct integration requires isolated generated symbols,
 rebasing/relocation, import/export binding, and handling module startup;
@@ -213,6 +218,12 @@ none is replaced with fabricated success. The S4 host was rerun with the real
 EBOOT and ISO: it still reaches the dispatch budget while retrying
 `sceKernelLoadModule` (`0x977DE386`), with 0 dispatch misses, 0 bad memory
 accesses and 96,256 ISO bytes read. No PRX was loaded or started.
+
+The PRX's PSP relocation segment contains 274 type 2, 529 type 4, 59 type 5,
+and 71 type 6 records (the MIPS 32, 26, HI16 and LO16 encodings). None has yet
+been applied. Guest image relocation alone is insufficient: emitted C also
+contains link-time addresses. In particular the EBOOT and PRX cannot safely
+share the current dispatch table at address zero. No font NIDs have been bound.
 
 Static inspection of the generated EBOOT identifies the seven font imports:
 
@@ -245,6 +256,12 @@ python -c "import gzip; from pathlib import Path; Path('build/s5-font.elf').writ
 & $tool funcs build/s5-font.elf
 New-Item -ItemType Directory -Force build/s5-font
 & $tool emit build/s5-font.elf build/s5-font font
+# Compile each generated PRX unit with its own namespace; EBOOT stays unchanged.
+Get-ChildItem build/s5-font/*.c | ForEach-Object {
+    & gcc -std=c11 -O2 -DPSPRECOMP_NAMESPACE=font_ -I build/psprecomp/include `
+        -c $_.FullName -o "build/s5-font/$($_.BaseName).o"
+    if ($LASTEXITCODE -ne 0) { throw "Compilation failed: $($_.Name)" }
+}
 ```
 
 - `sceKernelLoadModule` / `sceKernelStartModule` are not implemented; the game
