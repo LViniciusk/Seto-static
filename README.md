@@ -94,7 +94,7 @@ being translated:
 |---|---|---|
 | `vfpu?` | 276 | VFPU opcodes recognised by the decoder, not yet named/implemented by the emitter |
 | `vcmov` | 16 | VFPU conditional move, emitter has no translation |
-| `?` | 42 | Words the decoder cannot name; inside discovered code these are almost certainly data misread as code |
+| `?` | 42 | `.word` values the decoder cannot name — confirmed data misread as code: module info/GP (`0x000F4CB0` at `0x6B83C`) and ASCII strings |
 | `break` | 27 | `break` instructions |
 | others | 34 | Emitter falls through to a trap for some instructions whose destination is `$zero` (12 `lb`, 6 `sll`, 3 `sra`, 2 `add`, …), plus one `floor.w.s`, one `ceil.w.s`, and 5 branch/likely slots |
 
