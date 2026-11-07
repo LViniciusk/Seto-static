@@ -1,0 +1,22 @@
+﻿diff --git a/tools/allegrexrecomp/emit.c b/tools/allegrexrecomp/emit.c
+index 9aa568b..f344a52 100644
+--- a/tools/allegrexrecomp/emit.c
++++ b/tools/allegrexrecomp/emit.c
+@@ -524,8 +524,15 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+         if (isnan(v))      fprintf(f, "%spsp_vimm(%u, NAN);\n", ind, in->vd);
+         else if (isinf(v)) fprintf(f, "%spsp_vimm(%u, %sINFINITY);\n",
+                                    ind, in->vd, v < 0 ? "-" : "");
+-        else               fprintf(f, "%spsp_vimm(%u, %.9gf);\n",
+-                                   ind, in->vd, (double)v);
++        else {
++            /* %.9g drops the ".0" on integral values, gluing the literal
++             * `f` onto an integer constant -- `1f` does not compile. Keep a
++             * decimal point (or an exponent) before the suffix. */
++            char buf[64];
++            snprintf(buf, sizeof buf, "%.9g", (double)v);
++            fprintf(f, "%spsp_vimm(%u, %s%s);\n", ind, in->vd, buf,
++                    strpbrk(buf, ".eE") ? "f" : ".0f");
++        }
+         return;
+     }
+ 
