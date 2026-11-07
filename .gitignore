@@ -1,0 +1,5 @@
+# Build output: psprecomp clone, emitted C, objects
+/build/
+
+# Proprietary game data (decrypted EBOOT, ISO, PRX)
+/private/
