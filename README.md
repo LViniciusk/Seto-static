@@ -214,6 +214,26 @@ EBOOT and ISO: it still reaches the dispatch budget while retrying
 `sceKernelLoadModule` (`0x977DE386`), with 0 dispatch misses, 0 bad memory
 accesses and 96,256 ISO bytes read. No PRX was loaded or started.
 
+Static inspection of the generated EBOOT identifies the seven font imports:
+
+| NID | Function | EBOOT call site |
+|---|---|---|
+| `67F17ED7` | `sceFontNewLib` | `0x41C18` |
+| `099EF33C` | `sceFontFindOptimumFont` | `0x41C68` |
+| `A834319D` | `sceFontOpen` | `0x41C88`, `0x41CE8` |
+| `0DA7535E` | `sceFontGetFontInfo` | `0x41D08` |
+| `EE232411` | `sceFontSetAltCharacterCode` | `0x41D58` |
+| `DCC80C2F` | `sceFontGetCharInfo` | `0x42C44` |
+| `980F4895` | `sceFontGetCharGlyphImage` | `0x42CC4` |
+
+These are static call sites, not observed executions: `0x41BB8` retries module
+loading at `0x41BD0`, then calls `sceKernelStartModule` at `0x41BF0`, before
+reaching the font calls. A font HLE therefore needs guest allocation callbacks,
+valid font handles and actual PGF metrics and glyphs, not just a module UID.
+Local PPSSPP font assets exist, but their provenance and compatibility have not
+been established. The PRX alternative still needs relocation and symbol/import
+binding; neither alternative has yet been implemented or validated.
+
 Reproduction of the analysis, using the existing S1 tool build and a local ISO:
 
 ```powershell
