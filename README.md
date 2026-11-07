@@ -184,6 +184,49 @@ subsystem; it is not scheduler work.
 
 ## Limitations
 
+### S5 investigation — blocked on multi-module integration
+
+The requested ISO range (LBN `0x52C0`, length `0x5BA0`, SHA-256
+`ca621cb2212763ad85611e67e08d3e0296ce514b6ec731d7f05997c8d917c25a`)
+is `sceFont_Library`, wrapped in `~SCE` and encrypted `~PSP` (tag
+`0x457B05F0`). The EBOOT imports seven `sceLibFont` functions; the upstream
+runtime provides no corresponding HLE. Returning a module UID without providing
+the library would not be a valid load.
+
+The existing `allegrexrecomp decrypt` only inspected the header. An isolated
+GPL-licensed `pspdecrypt` checkout at `c156627db7634d395c380c0a9589130f603307fc`
+successfully decrypted the inner `~PSP` after removing its 64-byte `~SCE`
+wrapper; its gzip output decompressed to a 44,052-byte ELF. No decryptor code,
+game binary, or generated source is distributed here. The ELF contains two
+PT_LOAD segments, 28 function exports, 11 imports (`sceReg` and
+`IoFileMgrForUser`), PSP-specific relocations, and entry `0xFFFFFFFF`.
+`allegrexrecomp funcs` found 543 functions and 7,821 instructions; `emit`
+generated 11 C translation units, all compiled with GCC 15.2.0. This does not
+prove the module can execute.
+
+Integration is blocked: both modules are linked at address zero, and both
+generated corpora define `psp_func_00000000` and `psp_recomp_register`.
+The upstream loader only copies the first PT_LOAD and does not relocate a
+second module. Correct integration requires isolated generated symbols,
+rebasing/relocation, import/export binding, and handling module startup;
+none is replaced with fabricated success. The S4 host was rerun with the real
+EBOOT and ISO: it still reaches the dispatch budget while retrying
+`sceKernelLoadModule` (`0x977DE386`), with 0 dispatch misses, 0 bad memory
+accesses and 96,256 ISO bytes read. No PRX was loaded or started.
+
+Reproduction of the analysis, using the existing S1 tool build and a local ISO:
+
+```powershell
+python -c "from pathlib import Path; f=open(r'private/TF1.iso','rb'); f.seek(0x52c0*2048); d=f.read(0x5ba0); Path('build/s5-font.psp').write_bytes(d[64:])"
+# Build pspdecrypt separately under WSL from the revision above; see its GPL license.
+wsl build/pspdecrypt/pspdecrypt -o build/s5-font.gz build/s5-font.psp
+python -c "import gzip; from pathlib import Path; Path('build/s5-font.elf').write_bytes(gzip.decompress(Path('build/s5-font.gz').read_bytes()))"
+& $tool info build/s5-font.elf
+& $tool funcs build/s5-font.elf
+New-Item -ItemType Directory -Force build/s5-font
+& $tool emit build/s5-font.elf build/s5-font font
+```
+
 - `sceKernelLoadModule` / `sceKernelStartModule` are not implemented; the game
   retries the `~SCE` module at LBN `0x52C0`.
 - `sceGe` command stream, renderer, audio and controls are not implemented.
