@@ -42,6 +42,15 @@ static void report(const char *why) {
             (unsigned long long)psp_mem_bad_access);
     fprintf(stderr, "  iso:      %llu bytes read\n",
             (unsigned long long)psp_io_bytes_read());
+    fprintf(stderr, "  display:  fb 0x%08X, %llu vblanks\n",
+            psp_display_framebuffer(),
+            (unsigned long long)psp_display_vblanks());
+    fprintf(stderr, "  ge:       %llu commands, %llu vertices, %llu pixels\n",
+            (unsigned long long)psp_ge_command_count(),
+            (unsigned long long)psp_ge_vertex_count(),
+            (unsigned long long)psp_ge_pixels());
+    psp_ge_dump_stats(stderr);
+    psp_threadman_dump(stderr);
     fprintf(stderr, "  traps:    %llu unimplemented, %llu syscalls\n",
             (unsigned long long)psp_unimplemented_total(),
             (unsigned long long)psp_syscall_total());
@@ -57,6 +66,14 @@ static void report(const char *why) {
             (unsigned long long)psp_hle_zero_calls());
     psp_hle_dump_recent(stderr);
     psp_hle_dump_counts(stderr, 20);
+    if (psp_display_framebuffer()) {
+        if (psp_display_capture("build/s6-frame.ppm") == 0)
+            fprintf(stderr, "  capture:  build/s6-frame.ppm\n");
+        else
+            fprintf(stderr, "  capture:  failed\n");
+    } else {
+        fprintf(stderr, "  capture:  no framebuffer\n");
+    }
 }
 
 static void on_miss(uint32_t addr) {

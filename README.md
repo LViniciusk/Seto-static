@@ -302,17 +302,73 @@ cmake --build build/s5-build -j 8
     build\s5-font-reloc.elf
 ```
 
+## S6 results — module-loader loop
+
+**Loop `0x391D8`.** The loop is the body of the `ehscript` thread (`0x391CC`),
+the EBOOT's asynchronous module loader. Its state word is `0x00101710`; state 2
+waits for the module UID at `0x00101708` (`s0+0x50`) and only then calls
+`sceKernelStartModule`. State 1 enqueues a load request on the `ehfile_queue`
+ring (`0x000FF410`, semas `ehfile_sema` `0x40003` and `ehfile_queue`
+`0x40004`) with callback `0x00039320`, then wakes the caller thread and polls.
+The caller wakes, calls `sceKernelSuspendThread` on the loader and returns from
+the request.
+
+At the snapshot the request was `libtitle.prx` (`s0+4`), the ring held one
+pending `type=1 state=1` slot and the UID was still 0: the file worker had not
+run. The loop was a busy poll, not a legitimate wait.
+
+**Three runtime gaps, each reproduced before the fix.**
+
+1. `sceKernelWakeupThread` only counted the wakeup. On one core, waking a
+   higher-priority sleeper must run it before the waker; the loader's only yield
+   is that wake (priority 33 to 32). Without it the loader spun in state 2 and
+   the caller never ran. The runtime now yields one tick after waking a
+   higher-priority thread.
+2. `sceKernelSuspendThread` only stored `TH_SUSPENDED`; the loader kept
+   executing. A parked thread now checks the state at baton reacquisition, and
+   `ResumeThread` broadcasts.
+3. Event-flag wait mode `0x10` (`WAITCLEARALL`) was ignored. `snd_thread_seq`
+   waits on `SndSeqEvt` (`0x4000A`) with mode `0x11`; the pattern stayed set and
+   it repolled 12.7 million times, starving every other thread. Both
+   `WaitEventFlag` and `PollEventFlag` now clear the whole pattern on a match.
+
+**Effect.** The loader enqueues the request, wakes `user_main`, and `user_main`
+suspends the loader. The file worker `0x2B2C8` dequeues it and calls
+`sceKernelLoadModule` 293,843 times for the game's first real module,
+`PSP_GAME/USRDIR/gmodule/libtitle.prx`. `ModuleMgrForUser` still serves only the
+S5 font image, so it returns `ENOENT` and the loader retries.
+
+**Next blocker (outside this round).** `libtitle.prx` is a plain ELF
+(`modtitle`, 232,210 bytes, 1,361 functions) but it exports nothing and imports
+197 `libehsys` NIDs plus `libcharalist`, `libtutoriallist`, `libselect_card`,
+`libcardalbum`, `librecipe_viewer`, `libduelrecord`, `libdeck_tutorial` and
+`liblimitlist`. Running it needs the EBOOT's export table and the rest of the
+game's PRX graph, not a framebuffer change.
+
+**GE/display.** `psp_display_capture()` wrote `build/s6-frame.ppm` (480x272):
+one colour, 130,560 black pixels. Display front `0x04000000`, 2 vblanks; GE
+6 lists, 757 commands, 2 vertices, 1 sprite (the full-screen clear), 130,560
+pixels; GE target `0x04088000` (VRAM+0x88000), stride 512, vertex type
+`0x80011C`. The game never presents a drawn buffer, so the capture is empty.
+
+**Integrity.** 17,587 dispatch entries, 0 misses, 0 bad accesses, 0 traps,
+5 threads created and started; 18 switches, 13 parks; 96,256 ISO bytes; the S5
+font path is unchanged (`entered PRX function 0x08900000`). The run stops by the
+5,000,000-call dispatch budget. Upstream tests 21/21.
+
 ## Limitations
 
 - `sceReg` is not implemented: the font library's registry reads return 0 and
   it uses defaults. `GetCharInfo`/`GetCharGlyphImage` and text rendering are not
   reached yet.
-- `sceGe` command stream, renderer, audio and controls are not implemented; the
-  game reaches its audio/script threads and idles at the 8 s cap.
+- The game's own PRXs are not recompiled. The S6 run stops retrying
+  `libtitle.prx`; without the rest of the PRX graph no gameplay frame is
+  reachable.
+- Audio is paced by the runtime but not played; controls are not implemented.
 - 276 VFPU + 16 `vcmov` instructions remain traps; none were reached by this run.
 - 2,889 functions without `jr $ra` and 176 `scattered` functions remain discovery
   caveats; they did not affect the EBOOT run.
-- No window, renderer, audio or controls; the goal is the real code path, not play.
+- No window; the goal is the real code path, not play.
 
 ## Repo contents
 
