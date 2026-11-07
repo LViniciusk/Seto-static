@@ -12,6 +12,11 @@ generated C units compiled.
 allocations, `user_main` thread created and started) and stops in the boot loop at
 `0x0002B9F4`, blocked on unimplemented `sceUmdUser` (see [S2 results](#s2-results)).
 
+**S3 — UMD boot unblock: PASS.** A minimal `sceUmdUser`, the raw `umd1:` block
+device backed by the retail ISO, and the FPL calls the boot uses take the game past
+`0x2B9F4`: 47 real sector reads (96,256 bytes), ISO9660 mount, file worker thread,
+and the display/GE initialization calls (see [S3 results](#s3-results)).
+
 ## Input
 
 Decrypted `EBOOT.BIN` (plain `ELF32 MIPS LE`, PRX), kept out of Git in `private/`:
@@ -37,6 +42,7 @@ MSYS2 UCRT64 GCC 15.2.0 on Windows 11. Run from the repo root.
 git clone https://github.com/sp00nznet/psprecomp build/psprecomp
 git -C build/psprecomp checkout 5ca18fac1691a4a7b40ae683dabdf72a5703d2b8
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-vfim-float.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-umd-raw.patch
 
 cmake -S build/psprecomp -B build/psprecomp-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build/psprecomp-build -j 8
@@ -52,14 +58,14 @@ New-Item -ItemType Directory -Force build/tagforce
 
 `emit` is deterministic: a second run reports `0 of 81 files changed`.
 
-### 2. Native host (S2)
+### 2. Native host (S2/S3)
 
 ```powershell
 cmake -S . -B build/s2-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build/s2-build -j 8
-.\build\s2-build\Seto-static.exe private\ULUS10136_EBOOT.elf
+.\build\s2-build\Seto-static.exe private\ULUS10136_EBOOT.elf private\TF1.iso
 
-# names every guest file open and its mapped host path
+# names every guest file open/raw sector read and its mapped host path
 $env:PSPRECOMP_TRACE_IO = '1'
 ```
 
@@ -94,7 +100,7 @@ eight `.data` pointers (first target `0x000EA0D8`) that would be dispatched as c
 | Integrity | 0 dispatch misses, 0 bad memory accesses, 0 translated-instruction traps |
 | HLE | 11 unimplemented calls, 19 calls returning zero |
 
-### First blocker
+### S2 first blocker
 
 The boot path calls the helper at **`0x0002B9F4`**, which retries forever:
 
@@ -107,24 +113,45 @@ sceIoOpen("umd1:", 1)                   -> 0x80010002 (ENOENT, no ./disc tree)
 The helper loops until one of a fixed set of errors appears; `ENOENT` is not one of
 them, so it spins. `sceUmdActivate` (`0xC6183D47`) is also unimplemented, and the
 `ThreadManForUser` fixed-pool calls `sceKernelCreateFpl` (`0xC07BB470`) /
-`sceKernelAllocateFpl` (`0xD979E9BF`) return 0. The host stops after four UMD status
-polls (`exit 4`) so the run reports its blocker instead of hanging.
+`sceKernelAllocateFpl` (`0xD979E9BF`) return 0.
 
-The stop is a probe, not a fix: `host.c` watches the `sceUmdGetDriveStat` import thunk
-and prints the last translated function, last loop back-edge (`0x0002B9F4`, 95 hits),
-HLE counters and the busiest firmware calls.
+## S3 results
+
+`sceUmdUser` is registered from `umd.c` only after a real ISO was validated
+(ISO9660 PVD `CD001` at sector 16). The raw `umd1:`/`umd0:` block device maps to
+that file in `iofilemgr.c`: lseek offsets and read counts are in 2048-byte sectors,
+exactly as the game uses them. `fpl.c` adds `sceKernelCreateFpl`,
+`sceKernelAllocateFpl` and `sceKernelDeleteFpl` for the boot's internal heap.
+
+| Check | Result |
+|---|---|
+| UMD | `sceUmdActivate`, `Deactivate`, `GetDriveStat`, `WaitDriveStat`, `WaitDriveStatCB`; `umd1:` opened read-only against `TF1.iso` |
+| Real disc reads | **47 sector reads / 96,256 bytes**: sector 16 (PVD), 18 (L path table), 22+ (directory records) |
+| Boot loop | `0x2B9F4` passed; ISO9660 mount `0x2B774` completed; 48 `sceUmdGetDriveStat`, 98 `sceIoLseek`, 47 `sceIoRead` |
+| Later stage | file worker `0x2B2C8` created; `sceDisplaySetMode`/`SetFrameBuf`, `sceGeListEnQueue`, `sceGeDrawSync`, `sceGeListSync`, `sceGeSetCallback`, `sceGeListUpdateStallAddr` |
+| Integrity | 0 dispatch misses, 0 bad accesses, 0 instruction traps; 1 unimplemented call (`sceGeEdramSetAddrTranslation`, returns 0) |
+
+The run ends at the host's 8 s bring-up cap, in the worker loop at `0x2B3B0`, while
+it waits on `sceKernelWaitSema("ehfile_queue")`. Under the default inline scheduler
+`sceKernelStartThread` runs that worker inline, so its creator never returns its
+frame. The experimental `PSPRECOMP_REAL_THREADS=ON` path gets further (pthreads and
+more services) but crashes in `psp_ra_is_jump` once several pthreads have run: the
+host-stack frame chain is not preserved across context switches. That scheduler work
+is the next stage, not a UMD issue.
 
 ## Limitations
 
-- No `sceUmdUser` HLE and no disc/ISO mounted: the boot loop cannot pass `umd1:`.
-- 276 VFPU + 16 `vcmov` instructions are still traps; none were reached by this run.
+- The inline scheduler cannot run the file worker to completion; see the next
+  blocker above. `PSPRECOMP_REAL_THREADS` is not stable enough yet.
+- `sceKernelLoadModule` (`0x977DE386`) and the `sceGe` command stream are not
+  implemented; the game reaches GE setup but no rendering exists.
+- 276 VFPU + 16 `vcmov` instructions remain traps; none were reached by this run.
 - 2,889 functions without `jr $ra` and 176 `scattered` functions remain discovery
-  caveats; they did not affect S2 execution.
-- No window, renderer, audio or controls; linking a runnable host was the goal, not
-  playing the game.
+  caveats; they did not affect S3 execution.
+- No window, renderer, audio or controls; the goal is the real code path, not play.
 
 ## Repo contents
 
-Tracked: this README, `.gitignore`, `host.c`, `CMakeLists.txt`, and the one emitter
-patch. `build/` (tool clone, generated C, objects, executable) and `private/`
-(decrypted EBOOT) are ignored.
+Tracked: this README, `.gitignore`, `host.c`, `umd.c`, `fpl.c`, `CMakeLists.txt`, and
+two small patches against the pinned psprecomp. `build/` (tool clone, generated C,
+objects, executable) and `private/` (decrypted EBOOT, ISO) are ignored.

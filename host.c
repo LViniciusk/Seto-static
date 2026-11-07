@@ -1,6 +1,6 @@
-/* SETO-static S2: load the decrypted Tag Force EBOOT and start its module.
+/* SETO-static: load the decrypted Tag Force EBOOT and start its module.
  *
- *   Seto-static.exe [path\to\ULUS10136_EBOOT.elf]
+ *   Seto-static.exe [path\to\ULUS10136_EBOOT.elf] [path\to\TF1.iso]
  *
  * Console host only. The generated code is the game's own translated code;
  * nothing here fakes a function or a firmware call.
@@ -14,15 +14,16 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <windows.h>
 
 void psp_recomp_register(void);   /* generated tagforce_register.c */
+void psp_umd_register(void);
+void psp_umd_set_iso(const char *path);
+void psp_fpl_register(void);
 
 /* The EBOOT's single PT_LOAD has memsz 0x631A80; .bss runs to there. */
 #define MODULE_SPAN 0x00640000u
 #define DISPATCH_BUDGET 5000000u
-
-/* Import thunk of sceUmdGetDriveStat, the call the bring-up loop spins on. */
-#define UMD_GET_DRIVE_STAT 0x0006B4E4u
 
 static void report(const char *why) {
     fprintf(stderr, "%s\n", why);
@@ -34,6 +35,8 @@ static void report(const char *why) {
             (unsigned long long)psp_dispatch_misses());
     fprintf(stderr, "  memory:   %llu bad accesses\n",
             (unsigned long long)psp_mem_bad_access);
+    fprintf(stderr, "  iso:      %llu bytes read\n",
+            (unsigned long long)psp_io_bytes_read());
     fprintf(stderr, "  traps:    %llu unimplemented, %llu syscalls\n",
             (unsigned long long)psp_unimplemented_total(),
             (unsigned long long)psp_syscall_total());
@@ -58,38 +61,38 @@ static void on_budget(void) {
     exit(3);
 }
 
-static void on_umd(uint32_t addr);
-
-/* Entry reached: switch the single trace watch to the first blocker. */
-static void on_entry(uint32_t addr) {
-    fprintf(stderr, "reached translated entry 0x%08X\n", addr);
-    psp_trace_watch(UMD_GET_DRIVE_STAT, on_umd);
+/* A guest loop that never parks cannot reach the host's run loop, and the
+ * dispatcher budget does not see direct calls. Report from a host thread
+ * instead, so a hung first stage still names itself. */
+static DWORD WINAPI bringup_cap(LPVOID unused) {
+    (void)unused;
+    Sleep(8000);
+    report("stopped by the 8 s bring-up cap");
+    fflush(stderr);
+    _Exit(5);
 }
 
-/* shortcut: no sceUmdUser in the HLE, so this poll never sees a ready drive.
- * Stop after four polls so the run reports the blocker instead of spinning;
- * remove once the UMD/file service exists. */
-static int umd_polls;
-
-static void on_umd(uint32_t addr) {
-    (void)addr;
-    if (++umd_polls < 4) return;
-    report("stopped polling UMD drive status (sceUmdUser has no implementation)");
-    exit(4);
+/* Entry reached: the first thing the run has to prove. */
+static void on_entry(uint32_t addr) {
+    fprintf(stderr, "reached translated entry 0x%08X\n", addr);
 }
 
 int main(int argc, char **argv) {
     const char *elf = argc > 1 ? argv[1] : "private/ULUS10136_EBOOT.elf";
+    const char *iso = argc > 2 ? argv[2] : "private/TF1.iso";
 
     if (psp_mem_init() != 0) { fprintf(stderr, "memory init failed\n"); return 1; }
 
     psp_module m;
     if (psp_module_load(elf, MODULE_SPAN, &m) != 0) {
-        fprintf(stderr, "usage: %s [decrypted EBOOT .elf]\n", argv[0]);
+        fprintf(stderr, "usage: %s [decrypted EBOOT .elf] [disc image .iso]\n", argv[0]);
         return 1;
     }
     psp_cpu_reset();
     psp_hle_init();
+    psp_umd_set_iso(iso);
+    psp_umd_register();
+    psp_fpl_register();
     psp_recomp_register();
 
     /* This EBOOT has no .ctors section. The upstream heuristic scans the last
@@ -100,6 +103,7 @@ int main(int argc, char **argv) {
     m.nctors = 0;
 
     printf("module  \"%s\"\n", elf);
+    printf("disc    \"%s\"\n", iso);
     printf("image   0x%08X..0x%08X  entry 0x%08X  gp 0x%08X  ctors %d\n",
            m.base, m.image_end, m.entry, m.gp, m.nctors);
     printf("dispatch %u functions/labels registered\n", psp_dispatch_count());
@@ -108,9 +112,17 @@ int main(int argc, char **argv) {
     psp_set_miss_handler(on_miss);
     psp_dispatch_set_budget(DISPATCH_BUDGET, on_budget);
     psp_trace_watch(m.entry, on_entry);
+    CreateThread(NULL, 0, bringup_cap, NULL, 0, NULL);
 
     uint32_t r = psp_module_start(&m);
     printf("module_start returned 0x%08X\n", r);
-    report("completed");
+
+    /* If module_start returns, keep the scheduler turning for a bounded slice
+     * of real time before reporting. */
+    for (int i = 0; i < 5000 && !psp_exit_requested(); i++) {
+        psp_threadman_yield();
+        Sleep(1);
+    }
+    report("run ended");
     return 0;
 }

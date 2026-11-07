@@ -1,0 +1,143 @@
+﻿diff --git a/include/psprecomp/hle.h b/include/psprecomp/hle.h
+index 59cb28d..f84763b 100644
+--- a/include/psprecomp/hle.h
++++ b/include/psprecomp/hle.h
+@@ -163,6 +163,9 @@ void psp_io_init(void);
+ void psp_io_register(void);
+ void psp_io_reset(void);
+ void psp_io_set_root(const char *root);
++/* Back the raw UMD block device ("umd0:"/"umd1:") with this disc image.
++ * lseek offsets and read counts are in 2048-byte sectors. */
++void psp_io_set_umd(const char *path);
+ uint64_t psp_io_bytes_read(void);
+ 
+ void psp_misc_init(void);
+diff --git a/src/hle/iofilemgr.c b/src/hle/iofilemgr.c
+index 6d0afc6..2711ad1 100644
+--- a/src/hle/iofilemgr.c
++++ b/src/hle/iofilemgr.c
+@@ -32,7 +32,7 @@
+ #define PSP_O_CREAT  0x0200
+ #define PSP_O_TRUNC  0x0400
+ 
+-typedef struct { FILE *f; int used; } io_file;
++typedef struct { FILE *f; int used; int raw; } io_file;
+ 
+ typedef struct {
+     int used;
+@@ -49,12 +49,20 @@ typedef struct {
+ static io_file g_file[MAX_FILES];
+ static io_dir  g_dir[MAX_DIRS];
+ static char    g_root[512];
++static char    g_umd[1024];
+ static uint64_t g_bytes_read;
+ 
+ void psp_io_set_root(const char *root) {
+     snprintf(g_root, sizeof g_root, "%s", root ? root : ".");
+ }
+ 
++/* The raw UMD device ("umd0:"/"umd1:") is the disc image itself: lseek takes a
++ * 2048-byte sector number and a read count is in sectors, matching the block
++ * device PSP exposes. */
++void psp_io_set_umd(const char *path) {
++    snprintf(g_umd, sizeof g_umd, "%s", path ? path : "");
++}
++
+ void psp_io_reset(void) {
+     for (int i = 0; i < MAX_FILES; i++) {
+         if (g_file[i].used && g_file[i].f) fclose(g_file[i].f);
+@@ -91,16 +99,24 @@ static void hle_Open(void) {
+     char guest[512], host[1024];
+     psp_str(psp_arg(0), guest, sizeof guest);
+     uint32_t flags = psp_arg(1);
+-    map_path(guest, host, sizeof host);
+ 
+-    const char *mode = "rb";
+-    if (flags & PSP_O_TRUNC)                  mode = (flags & PSP_O_RDWR) == PSP_O_RDWR ? "w+b" : "wb";
+-    else if (flags & PSP_O_APPEND)            mode = "ab";
+-    else if ((flags & PSP_O_RDWR) == PSP_O_RDWR) mode = "r+b";
+-    else if (flags & PSP_O_WRONLY)            mode = (flags & PSP_O_CREAT) ? "wb" : "r+b";
++    const int raw = !strcmp(guest, "umd0:") || !strcmp(guest, "umd1:");
++    FILE *f = NULL;
++    if (raw) {
++        if (g_umd[0]) f = fopen(g_umd, "rb");
++        snprintf(host, sizeof host, "%s", g_umd[0] ? g_umd : "(no disc image set)");
++    } else {
++        map_path(guest, host, sizeof host);
+ 
+-    FILE *f = fopen(host, mode);
+-    if (!f && (flags & PSP_O_CREAT)) f = fopen(host, "w+b");
++        const char *mode = "rb";
++        if (flags & PSP_O_TRUNC)                  mode = (flags & PSP_O_RDWR) == PSP_O_RDWR ? "w+b" : "wb";
++        else if (flags & PSP_O_APPEND)            mode = "ab";
++        else if ((flags & PSP_O_RDWR) == PSP_O_RDWR) mode = "r+b";
++        else if (flags & PSP_O_WRONLY)            mode = (flags & PSP_O_CREAT) ? "wb" : "r+b";
++
++        f = fopen(host, mode);
++        if (!f && (flags & PSP_O_CREAT)) f = fopen(host, "w+b");
++    }
+     /* PSPRECOMP_TRACE_IO=1 names every open and whether it worked. A game
+      * that cannot find its assets usually does not crash; it waits. */
+     if (getenv("PSPRECOMP_TRACE_IO"))
+@@ -118,6 +134,7 @@ static void hle_Open(void) {
+         if (g_file[i].used) continue;
+         g_file[i].f = f;
+         g_file[i].used = 1;
++        g_file[i].raw = raw;
+         psp_ret((uint32_t)(i + 3));   /* 0-2 are reserved for the std streams */
+         return;
+     }
+@@ -137,6 +154,7 @@ static void hle_Close(void) {
+     fclose(h->f);
+     h->f = NULL;
+     h->used = 0;
++    h->raw = 0;
+     psp_ret(0);
+ }
+ 
+@@ -146,13 +164,20 @@ static void hle_Read(void) {
+     if (!h) { psp_ret(0x80020323); return; }
+     if (!size) { psp_ret(0); return; }
+ 
++    /* A block device counts the size in 2048-byte sectors, and reports what it
++     * read back in the same unit. */
++    const size_t bytes = (size_t)size * (h->raw ? 2048u : 1u);
++    if (h->raw && getenv("PSPRECOMP_TRACE_IO"))
++        fprintf(stderr, "io: raw read %u sector(s) at sector %ld\n",
++                size, ftell(h->f) / 2048);
++
+     /* Read through a host buffer and then place it, so a read that straddles
+      * the end of a guest region is rejected by the memory layer rather than
+      * writing past it. */
+-    uint8_t *tmp = (uint8_t *)malloc(size);
++    uint8_t *tmp = (uint8_t *)malloc(bytes);
+     if (!tmp) { psp_ret(0x80020190); return; }
+ 
+-    size_t got = fread(tmp, 1, size, h->f);
++    size_t got = fread(tmp, 1, bytes, h->f);
+     if (got && psp_mem_write_block(dst, tmp, (uint32_t)got) != 0) {
+         /* Fall back to byte-at-a-time so a partially mapped destination still
+          * gets what fits, and the bad-access counter records the rest. */
+@@ -160,7 +185,7 @@ static void hle_Read(void) {
+     }
+     free(tmp);
+     g_bytes_read += got;
+-    psp_ret((uint32_t)got);
++    psp_ret(h->raw ? (uint32_t)(got / 2048) : (uint32_t)got);
+ }
+ 
+ static void hle_Write(void) {
+@@ -194,11 +219,12 @@ static void hle_Lseek(void) {
+     uint32_t whence = psp_arg(4);
+     if (!h) { psp_ret(0x80020323); return; }
+ 
++    if (h->raw) off *= 2048;
+     int w = (whence == 1) ? SEEK_CUR : (whence == 2) ? SEEK_END : SEEK_SET;
+     if (fseek(h->f, (long)(int64_t)off, w) != 0) { psp_ret(0xFFFFFFFFu); return; }
+ 
+     long pos = ftell(h->f);
+-    psp_cpu.r[PSP_REG_V0] = (uint32_t)pos;
++    psp_cpu.r[PSP_REG_V0] = h->raw ? (uint32_t)(pos / 2048) : (uint32_t)pos;
+     psp_cpu.r[PSP_REG_V1] = 0;
+ }
+ 
