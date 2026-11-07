@@ -159,7 +159,7 @@ ignored"). `g_tls_me` and `g_tls_depth` were therefore globals:
 The fix is `HOST_TLS _Thread_local` (same compiler, honoured), plus copying the
 creator's `$k0` into started threads so newlib finds its reent
 (`patches/psprecomp-5ca18fa-real-threads.patch`). With it, the same run no longer
-crashes: the boot thread parks at `0x0C0`, `user_main` starts on its own host
+crashes: the boot thread parks on a delay, `user_main` starts on its own host
 thread, the UMD mount and reads are unchanged, and the next call is
 `sceKernelLoadModule`.
 
