@@ -1,3 +1,18 @@
+diff --git a/include/psprecomp/dispatch.h b/include/psprecomp/dispatch.h
+index 331a13f..ee29f49 100644
+--- a/include/psprecomp/dispatch.h
++++ b/include/psprecomp/dispatch.h
+@@ -42,6 +42,10 @@ void psp_dispatch(uint32_t addr);
+  * is a return whatever $ra holds, and no unwind crosses it. */
+ void psp_call_from_host(uint32_t addr);
+ 
++/* Cross-module $gp: a call dispatched into [lo, hi) runs with `gp`, and the
++ * caller's $gp is restored when it returns. One range covers one PRX. */
++void psp_dispatch_module_gp(uint32_t lo, uint32_t hi, uint32_t gp);
++
+ /* What a `jr $ra` to `ra` is. On the hardware it is just a jump; recompiled,
+  * calls are C calls, so it is one of three things:
+  *  - a return, when `ra` is the current call's return site (or the call was
 diff --git a/include/psprecomp/mem.h b/include/psprecomp/mem.h
 index 5375bb3..1e7a10e 100644
 --- a/include/psprecomp/mem.h
@@ -38,6 +53,47 @@ index f419054..9ed6d54 100644
  
  /* One row of a rotation matrix; `imm` is the instruction's bits 20..16. */
  void psp_vrot(uint32_t vd, uint32_t vs, uint32_t imm, int size);
+diff --git a/src/dispatch.c b/src/dispatch.c
+index a2510f5..0655a94 100644
+--- a/src/dispatch.c
++++ b/src/dispatch.c
+@@ -198,7 +198,15 @@ int psp_ra_is_jump(uint32_t ra) {
+     return 1;
+ }
+ 
+-void psp_dispatch(uint32_t addr) {
++static uint32_t g_mod_lo, g_mod_hi, g_mod_gp;
++
++void psp_dispatch_module_gp(uint32_t lo, uint32_t hi, uint32_t gp) {
++    g_mod_lo = lo;
++    g_mod_hi = hi;
++    g_mod_gp = gp;
++}
++
++static void psp_dispatch_body(uint32_t addr) {
+     if (g_budget && ++g_calls >= g_budget) {
+         g_budget = 0;                 /* fire once */
+         if (g_over) g_over();
+@@ -227,6 +235,19 @@ void psp_dispatch(uint32_t addr) {
+     (g_miss ? g_miss : default_miss)(addr);
+ }
+ 
++void psp_dispatch(uint32_t addr) {
++    uint32_t saved_gp = 0;
++    int switched = 0;
++    if (g_mod_hi && addr >= g_mod_lo && addr < g_mod_hi &&
++        psp_cpu.r[PSP_REG_GP] != g_mod_gp) {
++        saved_gp = psp_cpu.r[PSP_REG_GP];
++        psp_cpu.r[PSP_REG_GP] = g_mod_gp;
++        switched = 1;
++    }
++    psp_dispatch_body(addr);
++    if (switched) psp_cpu.r[PSP_REG_GP] = saved_gp;
++}
++
+ uint32_t psp_dispatch_count(void)  { return g_count; }
+ uint64_t psp_dispatch_misses(void) { return g_misses; }
+ 
 diff --git a/src/hle/iofilemgr.c b/src/hle/iofilemgr.c
 index 2711ad1..1d0e6fa 100644
 --- a/src/hle/iofilemgr.c

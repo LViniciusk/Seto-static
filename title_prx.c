@@ -41,7 +41,7 @@ static uint32_t rd32(const uint8_t *p) {
 void title_psp_recomp_register(void);
 
 static int g_title_loaded;
-static uint32_t g_title_gp;
+static uint32_t g_title_gp, g_eboot_gp;
 static struct { uint32_t nid, addr; } g_exports[TITLE_MAX_EXP];
 static int g_nexports;
 
@@ -58,6 +58,11 @@ static int build_exports(uint32_t info) {
     name[28] = 0;
     if (strcmp(name, "modehsys") != 0) {
         fprintf(stderr, "title PRX: EBOOT module is '%s', expected modehsys\n", name);
+        return -1;
+    }
+    g_eboot_gp = psp_read32(info + 0x20);
+    if (!g_eboot_gp) {
+        fprintf(stderr, "title PRX: EBOOT module info has no $gp\n");
         return -1;
     }
     uint32_t ent = psp_read32(info + 0x24);
@@ -130,7 +135,12 @@ void title_import_forward(uint32_t nid) {
         psp_ret(0x80020001u);
         return;
     }
+    /* A cross-module call must run the callee with its own globals base. The
+     * title code has no $gp-relative access, but the EBOOT does. */
+    uint32_t caller_gp = psp_cpu.r[PSP_REG_GP];
+    psp_cpu.r[PSP_REG_GP] = g_eboot_gp;
     psp_call_from_host(addr);
+    psp_cpu.r[PSP_REG_GP] = caller_gp;
 }
 
 static void title_entered(uint32_t addr) {
@@ -237,12 +247,15 @@ int psp_title_image_load(const char *path, uint32_t eboot_info) {
         free(d);
         return -1;
     }
+    /* Every dispatch into the module image runs with its $gp; the caller's is
+     * restored on return. Imports switch to the EBOOT's in the forwarder. */
+    psp_dispatch_module_gp(TITLE_BASE, TITLE_BASE + memsz, g_title_gp);
     g_title_loaded = 1;
     free(d);
     fprintf(stderr,
-            "title PRX 0x%08X..0x%08X (one segment, %u bytes .bss), gp 0x%08X, "
-            "%d libehsys exports, %d imports bound\n",
-            vaddr, vaddr + memsz, memsz - filesz, g_title_gp,
+            "title PRX 0x%08X..0x%08X (one segment, %u bytes .bss), gp 0x%08X "
+            "(EBOOT 0x%08X), %d libehsys exports, %d imports bound\n",
+            vaddr, vaddr + memsz, memsz - filesz, g_title_gp, g_eboot_gp,
             g_nexports, 197);
     return 0;
 }

@@ -327,15 +327,24 @@ places `modtitle` at `0x00640000`, one PT_LOAD (filesz `0x2C6E0`, memsz
 `0xC2FE90`), with 6,095 relocations (1,030 `R_MIPS_32`, 2,683 `R_MIPS_26`,
 1,191 HI16, 1,191 LO16). The 12.7 MB image does not fit the RAM window, so
 `mem.c` gained a second module mapping. The relocated corpus has 1,361
-functions.
+functions. The table-order HI16/LO16 pairing is byte-identical on
+`sceFont_Library` (SHA-256
+`69211A8399A37742EBA6161A373C35E7BC884DF640B81906D04CED2C3284DFA5`):
+its three differing pair choices (the `0x2354`/`0x2418`/`0x238C` cycle) emit
+the same high halves. The old register/nearest pairing cannot pair `modtitle`;
+table order pairs the branch-delay `lui` at `0x12208` with its `addiu` at
+`0x122A4`.
 
 **Imports and ModuleMgr.** All 197 `libehsys` imports resolve from the EBOOT's
 own `modehsys` export table (1,245 functions) to real guest addresses; none are
 missing. The title corpus is compiled with
 `-Dpsp_hle_call=title_import_forward`, so every import stub calls the real EBOOT
 function through `psp_call_from_host()`, leaving `$a0-$a3`, stack arguments,
-`$sp/$ra` and the frame chain on the generated path. The imports from the eight
-other game libraries are unresolved and are not reached at init.
+`$sp/$ra` and the frame chain on the generated path. `module_start` and
+dispatched callbacks run with the module's `$gp` (`0x006746C0`); each import
+switches to the EBOOT's (`0x000F4CB0`) and restores the caller's. The title
+corpus has no `$gp`-relative access. The imports from the eight other game
+libraries are unresolved and are not reached at init.
 `sceKernelLoadModule` accepts the LBN extent as UID `0x00070002`;
 `sceKernelStartModule` calls `module_start` at `0x00640000`, and the EBOOT
 loader later calls the first registered callback at `0x00640034`.
@@ -357,7 +366,8 @@ vertex type `0x000102`.
 implemented as a pair-wise VFPU op; the instruction traps went from 384 to 0.
 That fix is what changed the frame from a single colour to the sprite. 19 bad
 accesses remain in EBOOT code reached after StartModule (first read at
-`0x8662CE15` from `0x00059FE0`); they are the next fidelity issue, not a
+`0x8662CE15` from `0x00059FE0`); the `$gp` transition work leaves them
+unchanged, so they have another cause. They are the next fidelity issue, not a
 blocker for the captured frame.
 
 **Integrity.** 23,499 dispatch entries (EBOOT + font + modtitle), 0 misses,
