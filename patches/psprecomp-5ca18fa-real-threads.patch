@@ -1,0 +1,50 @@
+﻿diff --git a/src/hle/host_thread.h b/src/hle/host_thread.h
+index 419b8d2..2c594f1 100644
+--- a/src/hle/host_thread.h
++++ b/src/hle/host_thread.h
+@@ -20,7 +20,12 @@ static void host_thread_error(void) {
+ #include <process.h>
+ #include <mmsystem.h>
+ 
+-#define HOST_TLS __declspec(thread)
++/* GCC on MinGW ignores __declspec(thread) ("thread attribute directive
++ * ignored"), which turns the scheduler's per-thread state into globals: every
++ * guest thread inherits the boot thread's baton depth and skips
++ * baton_acquire(), running concurrently on the shared psp_cpu. _Thread_local
++ * is honoured by the same compiler. */
++#define HOST_TLS _Thread_local
+ typedef HANDLE host_thread;
+ typedef SRWLOCK host_mutex;
+ typedef CONDITION_VARIABLE host_cond;
+diff --git a/src/hle/threadman.c b/src/hle/threadman.c
+index ba2ae51..6ff5a31 100644
+--- a/src/hle/threadman.c
++++ b/src/hle/threadman.c
+@@ -118,6 +118,7 @@ typedef struct {
+     uint32_t arglen;       /* sceKernelStartThread arguments, held for the host */
+     uint32_t argp;
+     uint32_t gp;           /* the creator's $gp, which the thread starts with */
++    uint32_t k0;           /* the creator's $k0 (thread pointer), for libc reent */
+     int      state;
+     uint32_t exit_status;
+     int      used;
+@@ -791,6 +792,11 @@ static void *guest_thread_main(void *arg) {
+      * set, everything else starts at zero. */
+     psp_cpu_reset();
+     psp_cpu.r[PSP_REG_GP] = t->gp;          /* as the kernel does: globals are $gp-relative */
++    /* $k0 is the thread pointer: the module's libc reaches its per-thread reent
++     * through *(k0+4). The boot thread gets one from psp_module_start; a started
++     * thread must inherit its creator's, or newlib reports "no reent structure"
++     * and the C library state is garbage. */
++    psp_cpu.r[PSP_REG_K0] = t->k0;
+     psp_cpu.r[PSP_REG_A0] = t->arglen;
+     psp_cpu.r[PSP_REG_A1] = t->argp;
+     /* Stack pointer starts at the top of the allocation, 16-byte aligned, with
+@@ -881,6 +887,7 @@ static void hle_CreateThread(void) {
+     t->stack_size = psp_arg(3);
+     t->attr       = psp_arg(4);
+     t->gp         = psp_cpu.r[PSP_REG_GP];
++    t->k0         = psp_cpu.r[PSP_REG_K0];
+ 
+     if (t->stack_size < 0x1000) t->stack_size = 0x1000;
+     /* Stacks grow down, so allocate from the top of the heap: a stack that

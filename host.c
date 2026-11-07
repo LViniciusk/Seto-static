@@ -43,6 +43,10 @@ static void report(const char *why) {
     fprintf(stderr, "  threads:  %llu created, %llu started\n",
             (unsigned long long)psp_threadman_created(),
             (unsigned long long)psp_threadman_started());
+    fprintf(stderr, "  sched:    %llu switches, %llu parks, %llu handovers\n",
+            (unsigned long long)psp_threadman_switches(),
+            (unsigned long long)psp_threadman_parks(),
+            (unsigned long long)psp_threadman_handovers());
     fprintf(stderr, "  hle:      %llu unimplemented calls, %llu zero returns\n",
             (unsigned long long)psp_hle_unimplemented_calls(),
             (unsigned long long)psp_hle_zero_calls());
