@@ -1,4 +1,4 @@
-﻿diff --git a/src/hle/host_thread.h b/src/hle/host_thread.h
+diff --git a/src/hle/host_thread.h b/src/hle/host_thread.h
 index 419b8d2..2c594f1 100644
 --- a/src/hle/host_thread.h
 +++ b/src/hle/host_thread.h
@@ -17,7 +17,7 @@ index 419b8d2..2c594f1 100644
  typedef SRWLOCK host_mutex;
  typedef CONDITION_VARIABLE host_cond;
 diff --git a/src/hle/threadman.c b/src/hle/threadman.c
-index ba2ae51..6ff5a31 100644
+index ba2ae51..4178541 100644
 --- a/src/hle/threadman.c
 +++ b/src/hle/threadman.c
 @@ -118,6 +118,7 @@ typedef struct {
@@ -28,7 +28,20 @@ index ba2ae51..6ff5a31 100644
      int      state;
      uint32_t exit_status;
      int      used;
-@@ -791,6 +792,11 @@ static void *guest_thread_main(void *arg) {
+@@ -425,7 +426,11 @@ static int park_us(uint64_t timeout_us) {
+         int handed = (g_baton_takes != takes0);   /* someone ran while we were parked */
+         int expired = 0;
+         if (cpu_wanted_locked()) { expired = handover_wait_locked(); handed = 1; }
+-        while (g_baton_owned) host_cond_wait(&g_baton_cv, &g_baton_m);
++        /* A suspended thread stays off the CPU until ResumeThread takes the
++         * state back; suspension is checked here because this is where a
++         * parked thread would otherwise resume guest code. */
++        while (g_baton_owned || (t && t->state == TH_SUSPENDED))
++            host_cond_wait(&g_baton_cv, &g_baton_m);
+         g_baton_owned = 1;
+         g_switches++;
+         host_mutex_unlock(&g_baton_m);
+@@ -791,6 +796,11 @@ static void *guest_thread_main(void *arg) {
       * set, everything else starts at zero. */
      psp_cpu_reset();
      psp_cpu.r[PSP_REG_GP] = t->gp;          /* as the kernel does: globals are $gp-relative */
@@ -40,7 +53,7 @@ index ba2ae51..6ff5a31 100644
      psp_cpu.r[PSP_REG_A0] = t->arglen;
      psp_cpu.r[PSP_REG_A1] = t->argp;
      /* Stack pointer starts at the top of the allocation, 16-byte aligned, with
-@@ -881,6 +887,7 @@ static void hle_CreateThread(void) {
+@@ -881,6 +891,7 @@ static void hle_CreateThread(void) {
      t->stack_size = psp_arg(3);
      t->attr       = psp_arg(4);
      t->gp         = psp_cpu.r[PSP_REG_GP];
@@ -48,3 +61,87 @@ index ba2ae51..6ff5a31 100644
  
      if (t->stack_size < 0x1000) t->stack_size = 0x1000;
      /* Stacks grow down, so allocate from the top of the heap: a stack that
+@@ -1070,7 +1081,18 @@ static void hle_WakeupThread(void) {
+     psp_thread *t = find_thread(psp_arg(0));
+     if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
+     t->wakeups++;
++#if PSPRECOMP_REAL_THREADS
++    /* One core: waking a higher-priority sleeper runs it before the waker.
++     * The game's module loader relies on this as its yield -- it wakes the
++     * caller, which then suspends the loader. Without the handover the loader
++     * spins and the caller never runs. */
++    int preempt = g_tls_me && t != g_tls_me && t->priority < g_tls_me->priority
++                  && t->state != TH_SUSPENDED && !t->exited && !t->terminated;
++#endif
+     wake_thread(t);
++#if PSPRECOMP_REAL_THREADS
++    if (preempt) psp_threadman_yield();
++#endif
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ 
+@@ -1118,14 +1140,28 @@ static void hle_GetThreadId(void) { psp_ret(g_current ? g_current->uid : 0); }
+ static void hle_SuspendThread(void) {
+     psp_thread *t = find_thread(psp_arg(0));
+     if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
++#if PSPRECOMP_REAL_THREADS
++    host_mutex_lock(&g_baton_m);
++#endif
+     t->state = TH_SUSPENDED;
++#if PSPRECOMP_REAL_THREADS
++    host_cond_broadcast(&g_baton_cv);
++    host_mutex_unlock(&g_baton_m);
++#endif
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ 
+ static void hle_ResumeThread(void) {
+     psp_thread *t = find_thread(psp_arg(0));
+     if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
+-    t->state = TH_READY;
++#if PSPRECOMP_REAL_THREADS
++    host_mutex_lock(&g_baton_m);
++#endif
++    if (t->state == TH_SUSPENDED) t->state = TH_READY;
++#if PSPRECOMP_REAL_THREADS
++    host_cond_broadcast(&g_baton_cv);
++    host_mutex_unlock(&g_baton_m);
++#endif
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ 
+@@ -1262,9 +1298,10 @@ static void hle_CancelSema(void) {
+ 
+ /* ---- event flags --------------------------------------------------------- */
+ 
+-#define PSP_EVENT_WAITAND   0x00
+-#define PSP_EVENT_WAITOR    0x01
+-#define PSP_EVENT_WAITCLEAR 0x20
++#define PSP_EVENT_WAITAND      0x00
++#define PSP_EVENT_WAITOR       0x01
++#define PSP_EVENT_WAITCLEARALL 0x10   /* clear the whole pattern on match */
++#define PSP_EVENT_WAITCLEAR    0x20   /* clear only the waited bits */
+ 
+ static psp_evflag *find_flag(uint32_t id) {
+     for (int i = 0; i < MAX_FLAGS; i++)
+@@ -1328,8 +1365,10 @@ static uint32_t wait_flag(uint32_t timeout) {
+     uint32_t rc = wait_loop(flag_ready, &c, timeout, W_FLAG,
+                             "sceKernelWaitEventFlag", f->name);
+     if (out) psp_write32(out, f->pattern);
+-    if (rc == SCE_KERNEL_ERROR_OK && (c.mode & PSP_EVENT_WAITCLEAR))
+-        f->pattern &= ~c.bits;
++    if (rc == SCE_KERNEL_ERROR_OK) {
++        if (c.mode & PSP_EVENT_WAITCLEAR) f->pattern &= ~c.bits;
++        if (c.mode & PSP_EVENT_WAITCLEARALL) f->pattern = 0;
++    }
+     return rc;
+ }
+ 
+@@ -1343,6 +1382,7 @@ static void hle_PollEventFlag(void) {
+     if (out) psp_write32(out, f->pattern);
+     if (!flag_ready(&c)) { psp_ret(SCE_KERNEL_ERROR_EVF_COND); return; }
+     if (c.mode & PSP_EVENT_WAITCLEAR) f->pattern &= ~c.bits;
++    if (c.mode & PSP_EVENT_WAITCLEARALL) f->pattern = 0;
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ 

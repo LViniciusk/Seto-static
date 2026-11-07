@@ -61,6 +61,7 @@ git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-umd-raw.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-real-threads.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-namespace.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-reloc-seeds.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s6-prx.patch
 
 cmake -S build/psprecomp -B build/psprecomp-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build/psprecomp-build -j 8
@@ -302,21 +303,111 @@ cmake --build build/s5-build -j 8
     build\s5-font-reloc.elf
 ```
 
+## S6 results — modtitle and the first real frame
+
+**Module-loader loop.** The loop at `0x391D8` is the body of the `ehscript`
+thread (`0x391CC`), the EBOOT's asynchronous module loader. Its state word is
+`0x00101710`; state 2 waits for the module UID at `0x00101708` (`s0+0x50`) and
+only then calls `sceKernelStartModule`. State 1 enqueues a load request on the
+`ehfile_queue` ring (`0x000FF410`, semas `ehfile_sema` `0x40003` and
+`ehfile_queue` `0x40004`) with callback `0x00039320`, then wakes the caller and
+polls; the caller suspends the loader. Three runtime gaps kept that handshake
+from completing, each reproduced before the fix: `sceKernelWakeupThread` did not
+reschedule a higher-priority sleeper (the loader's only yield);
+`SuspendThread` only stored `TH_SUSPENDED`; and event-flag mode `0x10`
+(`WAITCLEARALL`) was ignored, so `snd_thread_seq` repolled `SndSeqEvt` 12.7
+million times. The runtime now yields after the wake, checks suspension at
+baton reacquisition and clears the whole pattern on a match.
+
+**libtitle.prx.** The EBOOT resolves the first module to the ISO extent
+`disc0:/sce_lbn0x5e70_size0x38b12` (byte-identical to
+`PSP_GAME/USRDIR/gmodule/libtitle.prx`, 232,210 bytes). `scripts/relocate_prx.py`
+now reads the `.rel.*` sections of a one-segment PRX and rebases `e_entry`; it
+places `modtitle` at `0x00640000`, one PT_LOAD (filesz `0x2C6E0`, memsz
+`0xC2FE90`), with 6,095 relocations (1,030 `R_MIPS_32`, 2,683 `R_MIPS_26`,
+1,191 HI16, 1,191 LO16). The 12.7 MB image does not fit the RAM window, so
+`mem.c` gained a second module mapping. The relocated corpus has 1,361
+functions. The table-order HI16/LO16 pairing is byte-identical on
+`sceFont_Library` (SHA-256
+`69211A8399A37742EBA6161A373C35E7BC884DF640B81906D04CED2C3284DFA5`):
+its three differing pair choices (the `0x2354`/`0x2418`/`0x238C` cycle) emit
+the same high halves. The old register/nearest pairing cannot pair `modtitle`;
+table order pairs the branch-delay `lui` at `0x12208` with its `addiu` at
+`0x122A4`.
+
+**Imports and ModuleMgr.** All 197 `libehsys` imports resolve from the EBOOT's
+own `modehsys` export table (1,245 functions) to real guest addresses; none are
+missing. The title corpus is compiled with
+`-Dpsp_hle_call=title_import_forward`, so every import stub calls the real EBOOT
+function through `psp_call_from_host()`, leaving `$a0-$a3`, stack arguments,
+`$sp/$ra` and the frame chain on the generated path. `module_start` and
+dispatched callbacks run with the module's `$gp` (`0x006746C0`); each import
+switches to the EBOOT's (`0x000F4CB0`) and restores the caller's. The title
+corpus has no `$gp`-relative access. The imports from the eight other game
+libraries are unresolved and are not reached at init.
+`sceKernelLoadModule` accepts the LBN extent as UID `0x00070002`;
+`sceKernelStartModule` calls `module_start` at `0x00640000`, and the EBOOT
+loader later calls the first registered callback at `0x00640034`.
+
+**Execution and frame.** Both transfers were observed directly:
+`title: entered recompiled function 0x00640000 (module_start)` and
+`title: entered recompiled callback 0x00640034`; the `LoadModule` retry is gone.
+The game advanced to 597 vblanks, 600 GE lists, 150,786 commands, 22,590
+vertices and 43,396,860 pixels. `psp_display_capture()` wrote
+`build/s6-frame.ppm` (480x272, 417 colours, 3,466 non-black pixels): the game's
+golden character sprite on a circular base, bottom right. That is a real,
+visually valid frame produced by the original code; the rest of the screen is
+still black because this is the loading/title transition. Display front
+`0x04088000`; the GE was drawing the next frame into `0x04000000`, stride 512,
+vertex type `0x000102`.
+
+**VFPU.** The EBOOT's colour path executed the previously unknown `vbfy1`
+(butterfly: `rs0+rs1`, `rs0-rs1`, ...) 384 times. It is now decoded and
+implemented as a pair-wise VFPU op; the instruction traps went from 384 to 0.
+That fix is what changed the frame from a single colour to the sprite. 19 bad
+accesses remain in EBOOT code reached after StartModule (first read at
+`0x8662CE15` from `0x00059FE0`); the `$gp` transition work leaves them
+unchanged, so they have another cause. They are the next fidelity issue, not a
+blocker for the captured frame.
+
+**Integrity.** 23,499 dispatch entries (EBOOT + font + modtitle), 0 misses,
+0 traps, 5 threads, 4,382 switches / 4,377 parks, 1,271,680 ISO bytes; the S5
+font path still enters `0x08900000`; upstream tests 21/21.
+
+Reproduction (the S5 font corpus and relocated ELF must already exist):
+
+```powershell
+& $tool extract private/TF1.iso libtitle.prx build/s6-title
+python scripts\relocate_prx.py `
+    build\s6-title\PSP_GAME_USRDIR_gmodule_libtitle.prx `
+    build\s6-title-reloc.elf --base 0x00640000
+& $tool emit build\s6-title-reloc.elf build\s6-title-reloc title
+cmake -S . -B build/s6-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+cmake --build build/s6-build -j 8
+.\build\s6-build\Seto-static.exe private\ULUS10136_EBOOT.elf private\TF1.iso `
+    build\s5-font-reloc.elf build\s6-title-reloc.elf
+```
+
 ## Limitations
 
 - `sceReg` is not implemented: the font library's registry reads return 0 and
   it uses defaults. `GetCharInfo`/`GetCharGlyphImage` and text rendering are not
   reached yet.
-- `sceGe` command stream, renderer, audio and controls are not implemented; the
-  game reaches its audio/script threads and idles at the 8 s cap.
-- 276 VFPU + 16 `vcmov` instructions remain traps; none were reached by this run.
+- Only `libtitle.prx` is integrated; the other game PRXs are not recompiled.
+  The captured frame is the loading/title sprite, not a completed scene.
+- 19 bad accesses remain in EBOOT code reached after StartModule (first at
+  `0x8662CE15`); they do not stop the frame but are the next fidelity issue.
+- Audio is paced by the runtime but not played; controls are not implemented.
+- 272 VFPU + 16 `vcmov` instructions remain traps in the EBOOT corpus; none
+  were reached by this run. The title corpus has 22 VFPU traps, also unreached.
 - 2,889 functions without `jr $ra` and 176 `scattered` functions remain discovery
   caveats; they did not affect the EBOOT run.
-- No window, renderer, audio or controls; the goal is the real code path, not play.
+- No window; the goal is the real code path, not play.
 
 ## Repo contents
 
 Tracked: this README, `.gitignore`, `host.c`, `umd.c`, `fpl.c`, `font_prx.c`,
-`scripts/relocate_prx.py`, `CMakeLists.txt`, and five small patches against the
-pinned psprecomp. `build/` (tool clone, generated C, relocated ELF, objects,
-executable) and `private/` (decrypted EBOOT, ISO) are ignored.
+`title_prx.c`, `scripts/relocate_prx.py`, `CMakeLists.txt`, and six small
+patches against the pinned psprecomp. `build/` (tool clone, generated C,
+relocated ELF, objects, executable) and `private/` (decrypted EBOOT, ISO) are
+ignored.
