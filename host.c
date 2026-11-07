@@ -20,6 +20,11 @@ void psp_recomp_register(void);   /* generated tagforce_register.c */
 void psp_umd_register(void);
 void psp_umd_set_iso(const char *path);
 void psp_fpl_register(void);
+int  psp_font_image_load(const char *path);
+int  psp_font_bind(void);
+#ifdef HAVE_FONT_CORPUS
+void font_psp_recomp_register(void);   /* relocated PRX corpus */
+#endif
 
 /* The EBOOT's single PT_LOAD has memsz 0x631A80; .bss runs to there. */
 #define MODULE_SPAN 0x00640000u
@@ -51,7 +56,7 @@ static void report(const char *why) {
             (unsigned long long)psp_hle_unimplemented_calls(),
             (unsigned long long)psp_hle_zero_calls());
     psp_hle_dump_recent(stderr);
-    psp_hle_dump_counts(stderr, 12);
+    psp_hle_dump_counts(stderr, 20);
 }
 
 static void on_miss(uint32_t addr) {
@@ -77,13 +82,21 @@ static DWORD WINAPI bringup_cap(LPVOID unused) {
 }
 
 /* Entry reached: the first thing the run has to prove. */
+static uint32_t g_font_entry;
+
+static void on_font_entry(uint32_t addr) {
+    fprintf(stderr, "entered PRX function 0x%08X\n", addr);
+}
+
 static void on_entry(uint32_t addr) {
     fprintf(stderr, "reached translated entry 0x%08X\n", addr);
+    if (g_font_entry) psp_trace_watch(g_font_entry, on_font_entry);
 }
 
 int main(int argc, char **argv) {
     const char *elf = argc > 1 ? argv[1] : "private/ULUS10136_EBOOT.elf";
     const char *iso = argc > 2 ? argv[2] : "private/TF1.iso";
+    const char *font = argc > 3 ? argv[3] : NULL;
 
     if (psp_mem_init() != 0) { fprintf(stderr, "memory init failed\n"); return 1; }
 
@@ -99,6 +112,27 @@ int main(int argc, char **argv) {
     psp_fpl_register();
     psp_recomp_register();
 
+    /* S5: the pre-relocated PRX image plus its namespaced corpus. The image is
+     * placed, its exports are bound to the seven NIDs and called from the
+     * EBOOT. Without the corpus this build stays EBOOT-only. */
+#ifdef HAVE_FONT_CORPUS
+    if (font) {
+        if (psp_font_image_load(font) != 0) return 1;
+        font_psp_recomp_register();
+        if (!psp_lookup(0x08900000u)) {
+            fprintf(stderr, "font PRX: dispatch entry at 0x08900000 is missing\n");
+            return 1;
+        }
+        if (psp_font_bind() != 0) return 1;
+        g_font_entry = 0x08900000u;   /* sceFontNewLib, the first expected call */
+    }
+#else
+    if (font) {
+        fprintf(stderr, "font PRX: this build has no font corpus (build/s5-font-reloc)\n");
+        return 1;
+    }
+#endif
+
     /* This EBOOT has no .ctors section. The upstream heuristic scans the last
      * 64 KB of the image for a run of pointers into that same window and here
      * matches eight .data words (first target 0x000EA0D8), which are not code.
@@ -108,6 +142,7 @@ int main(int argc, char **argv) {
 
     printf("module  \"%s\"\n", elf);
     printf("disc    \"%s\"\n", iso);
+    if (font) printf("font    \"%s\"\n", font);
     printf("image   0x%08X..0x%08X  entry 0x%08X  gp 0x%08X  ctors %d\n",
            m.base, m.image_end, m.entry, m.gp, m.nctors);
     printf("dispatch %u functions/labels registered\n", psp_dispatch_count());

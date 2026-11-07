@@ -1,0 +1,30 @@
+diff --git a/tools/allegrexrecomp/emit.c b/tools/allegrexrecomp/emit.c
+--- a/tools/allegrexrecomp/emit.c
++++ b/tools/allegrexrecomp/emit.c
+@@ -1176,6 +1183,26 @@ static void emit_header(FILE *f, const ectx *c, const emit_opts *o) {
+         "/* Register aliases, so the generated code reads like the assembly. */\n",
+         o->module ? o->module : "(unknown)", an->nfuncs, an->nimports);
+ 
++    fprintf(f, "#ifdef PSPRECOMP_NAMESPACE\n"
++               "#define PSP_NS_JOIN_(a,b) a##b\n"
++               "#define PSP_NS_JOIN(a,b) PSP_NS_JOIN_(a,b)\n"
++               "#define psp_recomp_register PSP_NS_JOIN(PSPRECOMP_NAMESPACE,psp_recomp_register)\n");
++    for (int i = 0; i < an->nfuncs; i++)
++        fprintf(f, "#define psp_func_%08X PSP_NS_JOIN(PSPRECOMP_NAMESPACE,psp_func_%08X)\n",
++                an->funcs[i].addr, an->funcs[i].addr);
++    for (int i = 0; i < an->nimports; i++)
++        fprintf(f, "#define psp_import_%08X PSP_NS_JOIN(PSPRECOMP_NAMESPACE,psp_import_%08X)\n",
++                an->imports[i], an->imports[i]);
++    for (int i = 0; i < an->nfuncs; i++) {
++        const a_func *fn = &an->funcs[i];
++        for (uint32_t a = fn->start; a < fn->end; a += 4) {
++            if (!owned_by(an, a, fn->addr) || !c->is_label[widx(an, a)]) continue;
++            if (c->is_slot[widx(an, a)] || a == fn->addr) continue;
++            fprintf(f, "#define psp_at_%08X PSP_NS_JOIN(PSPRECOMP_NAMESPACE,psp_at_%08X)\n", a, a);
++        }
++    }
++    fprintf(f, "#endif\n");
++
+     for (int i = 0; i < 32; i++)
+         fprintf(f, "#define %-7s psp_cpu.r[%d]\n", RN[i], i);
+ 

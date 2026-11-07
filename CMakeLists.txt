@@ -18,5 +18,23 @@ target_include_directories(tagforce PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/build/tag
 target_compile_definitions(tagforce PUBLIC PSPRECOMP_TRACE)
 target_link_libraries(tagforce PUBLIC psprecomp)
 
-add_executable(Seto-static host.c umd.c fpl.c)
+# S5: the offline-relocated sceFont_Library corpus. Generated, not committed;
+# see README. Without it the EBOOT-only host still builds.
+file(GLOB FONT_SOURCES CONFIGURE_DEPENDS
+     ${CMAKE_CURRENT_SOURCE_DIR}/build/s5-font-reloc/*.c)
+
+if(FONT_SOURCES)
+    add_library(fontprx OBJECT ${FONT_SOURCES})
+    target_compile_definitions(fontprx PRIVATE PSPRECOMP_NAMESPACE=font_ PSPRECOMP_TRACE)
+    target_include_directories(fontprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s5-font-reloc)
+    target_link_libraries(fontprx PRIVATE psprecomp)
+endif()
+
+add_executable(Seto-static host.c umd.c fpl.c font_prx.c)
+if(FONT_SOURCES)
+    target_sources(Seto-static PRIVATE $<TARGET_OBJECTS:fontprx>)
+    target_compile_definitions(Seto-static PRIVATE HAVE_FONT_CORPUS)
+else()
+    message(STATUS "S5 font corpus not found under build/s5-font-reloc; building the EBOOT-only host")
+endif()
 target_link_libraries(Seto-static PRIVATE tagforce)
