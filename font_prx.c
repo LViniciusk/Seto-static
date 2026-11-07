@@ -1,8 +1,8 @@
-/* SETO-static S5: place the pre-relocated sceFont_Library image in guest RAM.
+/* SETO-static S5: load the relocated sceFont_Library image and bind its exports.
  *
- * This is not ModuleMgr and does not execute the PRX. It only proves the
- * offline-relocated image can be placed in the reserved RAM window without
- * touching the EBOOT's module mapping, and that .bss is zeroed.
+ * The image is placed in the reserved RAM window; its module info and export
+ * table are parsed from guest memory; the seven sceLibFont NIDs are forwarded
+ * to the recompiled exports through psp_call_from_host().
  */
 #include <psprecomp/mem.h>
 #include <psprecomp/cpu.h>

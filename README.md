@@ -91,6 +91,9 @@ cmake --build build/s5-build -j 8
 $env:PSPRECOMP_TRACE_IO = '1'
 ```
 
+Without `build/s5-font-reloc`, CMake configures the EBOOT-only host and reports
+the missing corpus; passing the third argument then fails with a clear message.
+
 The host uses the upstream runtime as-is, except that the loader's constructor
 heuristic is disabled: this EBOOT has no `.ctors` section, and the heuristic matches
 eight `.data` pointers (first target `0x000EA0D8`) that would be dispatched as code.

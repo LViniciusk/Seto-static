@@ -22,7 +22,9 @@ void psp_umd_set_iso(const char *path);
 void psp_fpl_register(void);
 int  psp_font_image_load(const char *path);
 int  psp_font_bind(void);
+#ifdef HAVE_FONT_CORPUS
 void font_psp_recomp_register(void);   /* relocated PRX corpus */
+#endif
 
 /* The EBOOT's single PT_LOAD has memsz 0x631A80; .bss runs to there. */
 #define MODULE_SPAN 0x00640000u
@@ -110,9 +112,10 @@ int main(int argc, char **argv) {
     psp_fpl_register();
     psp_recomp_register();
 
-    /* Optional S5 relocation check: a pre-relocated PRX image plus its
-     * namespaced corpus. Not ModuleMgr: the image is placed and registered,
-     * never called. */
+    /* S5: the pre-relocated PRX image plus its namespaced corpus. The image is
+     * placed, its exports are bound to the seven NIDs and called from the
+     * EBOOT. Without the corpus this build stays EBOOT-only. */
+#ifdef HAVE_FONT_CORPUS
     if (font) {
         if (psp_font_image_load(font) != 0) return 1;
         font_psp_recomp_register();
@@ -123,6 +126,12 @@ int main(int argc, char **argv) {
         if (psp_font_bind() != 0) return 1;
         g_font_entry = 0x08900000u;   /* sceFontNewLib, the first expected call */
     }
+#else
+    if (font) {
+        fprintf(stderr, "font PRX: this build has no font corpus (build/s5-font-reloc)\n");
+        return 1;
+    }
+#endif
 
     /* This EBOOT has no .ctors section. The upstream heuristic scans the last
      * 64 KB of the image for a run of pointers into that same window and here
