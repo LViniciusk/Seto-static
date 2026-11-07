@@ -5,6 +5,8 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 # psprecomp at 5ca18fac, with the local patches applied (see README).
+# The game's real threads need the opt-in scheduler.
+set(PSPRECOMP_REAL_THREADS ON)
 add_subdirectory(build/psprecomp psprecomp)
 
 # C emitted from the real EBOOT by `allegrexrecomp emit` (see README).

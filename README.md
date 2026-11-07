@@ -17,6 +17,12 @@ device backed by the retail ISO, and the FPL calls the boot uses take the game p
 `0x2B9F4`: 47 real sector reads (96,256 bytes), ISO9660 mount, file worker thread,
 and the display/GE initialization calls (see [S3 results](#s3-results)).
 
+**S4 — real thread scheduling: PASS.** GCC/MinGW silently ignored
+`__declspec(thread)`, so the scheduler's per-thread state was global and started
+threads skipped the CPU baton. `_Thread_local` fixes it: the boot thread and
+`user_main` now alternate on separate host threads without the `psp_ra_is_jump`
+crash, and the game reaches `sceKernelLoadModule` (see [S4 results](#s4-results)).
+
 ## Input
 
 Decrypted `EBOOT.BIN` (plain `ELF32 MIPS LE`, PRX), kept out of Git in `private/`:
@@ -43,6 +49,7 @@ git clone https://github.com/sp00nznet/psprecomp build/psprecomp
 git -C build/psprecomp checkout 5ca18fac1691a4a7b40ae683dabdf72a5703d2b8
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-vfim-float.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-umd-raw.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-real-threads.patch
 
 cmake -S build/psprecomp -B build/psprecomp-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build/psprecomp-build -j 8
@@ -134,24 +141,59 @@ exactly as the game uses them. `fpl.c` adds `sceKernelCreateFpl`,
 The run ends at the host's 8 s bring-up cap, in the worker loop at `0x2B3B0`, while
 it waits on `sceKernelWaitSema("ehfile_queue")`. Under the default inline scheduler
 `sceKernelStartThread` runs that worker inline, so its creator never returns its
-frame. The experimental `PSPRECOMP_REAL_THREADS=ON` path gets further (pthreads and
-more services) but crashes in `psp_ra_is_jump` once several pthreads have run: the
-host-stack frame chain is not preserved across context switches. That scheduler work
-is the next stage, not a UMD issue.
+frame. S4 fixes the `PSPRECOMP_REAL_THREADS=ON` path that was crashing here.
+
+## S4 results
+
+Root cause, reproduced under gdb: on this toolchain `HOST_TLS` was
+`__declspec(thread)`, which GCC/MinGW ignores ("thread attribute directive
+ignored"). `g_tls_me` and `g_tls_depth` were therefore globals:
+- a new guest thread saw the creator's `depth=2` and returned from
+  `baton_acquire()` without waiting;
+- the boot thread and that thread executed guest code concurrently on the shared
+  `psp_cpu`;
+- a `PSP_CALL_BEGIN` captured a `psp_frame` from another host stack
+  (`0xA17B1FFAA0` outside `[0xA179200000,0xA17A200000)`), and
+  `psp_ra_is_jump()` dereferenced it.
+
+The fix is `HOST_TLS _Thread_local` (same compiler, honoured), plus copying the
+creator's `$k0` into started threads so newlib finds its reent
+(`patches/psprecomp-5ca18fa-real-threads.patch`). With it, the same run no longer
+crashes: the boot thread parks at `0x0C0`, `user_main` starts on its own host
+thread, the UMD mount and reads are unchanged, and the next call is
+`sceKernelLoadModule`.
+
+| Check | Result |
+|---|---|
+| Scheduler | `PSPRECOMP_REAL_THREADS=ON`; boot thread + `user_main` on separate host threads; 1 baton switch, 0 dispatch misses, 0 bad accesses, 0 traps |
+| Upstream tests | 21/21 pass with `PSPRECOMP_REAL_THREADS=ON` |
+| Game progress | UMD mount and 47 reads (96,256 bytes) still complete; worker `0x2B2C8` created |
+| Crash | the `psp_ra_is_jump` SIGSEGV is gone; last function `0x0000D028`, no fault |
+
+**Next blocker.** The game calls:
+
+```
+sceKernelLoadModule("disc0:/sce_lbn0x52c0_size0x5ba0")
+```
+
+312,231 times (NID `0x977DE386`, unimplemented, returns 0). LBN `0x52C0` is the
+`~SCE` module at sector 21184, size `0x5BA0` (23,456 bytes). The worker thread is
+created but not started until this module loads, so the run stops on the dispatch
+budget. `ModuleMgrForUser` (load/relocate/start the PRX, module UIDs) is the next
+subsystem; it is not scheduler work.
 
 ## Limitations
 
-- The inline scheduler cannot run the file worker to completion; see the next
-  blocker above. `PSPRECOMP_REAL_THREADS` is not stable enough yet.
-- `sceKernelLoadModule` (`0x977DE386`) and the `sceGe` command stream are not
-  implemented; the game reaches GE setup but no rendering exists.
+- `sceKernelLoadModule` / `sceKernelStartModule` are not implemented; the game
+  retries the `~SCE` module at LBN `0x52C0`.
+- `sceGe` command stream, renderer, audio and controls are not implemented.
 - 276 VFPU + 16 `vcmov` instructions remain traps; none were reached by this run.
 - 2,889 functions without `jr $ra` and 176 `scattered` functions remain discovery
-  caveats; they did not affect S3 execution.
+  caveats; they did not affect S4 execution.
 - No window, renderer, audio or controls; the goal is the real code path, not play.
 
 ## Repo contents
 
 Tracked: this README, `.gitignore`, `host.c`, `umd.c`, `fpl.c`, `CMakeLists.txt`, and
-two small patches against the pinned psprecomp. `build/` (tool clone, generated C,
+three small patches against the pinned psprecomp. `build/` (tool clone, generated C,
 objects, executable) and `private/` (decrypted EBOOT, ISO) are ignored.
