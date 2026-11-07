@@ -1,0 +1,41 @@
+--- a/src/hle/iofilemgr.c
++++ b/src/hle/iofilemgr.c
+@@ -34,3 +34,3 @@
+ 
+-typedef struct { FILE *f; int used; int raw; uint64_t end; } io_file;
++typedef struct { FILE *f; int used; int raw; uint64_t start, end; } io_file;
+ 
+@@ -163,2 +163,3 @@
+         g_file[i].raw = raw;
++        g_file[i].start = lbn_start;
+         g_file[i].end = lbn_end;
+@@ -184,2 +185,3 @@
+     h->raw = 0;
++    h->start = 0;
+     h->end = 0;
+@@ -199,3 +201,3 @@
+         long pos = ftell(h->f);
+-        uint64_t left = (pos >= 0 && (uint64_t)pos < h->end)
++        uint64_t left = (pos >= 0 && (uint64_t)pos >= h->start && (uint64_t)pos < h->end)
+                         ? h->end - (uint64_t)pos : 0;
+@@ -254,2 +256,20 @@
+     if (!h) { psp_ret(0x80020323); return; }
++
++    if (h->end) {
++        long current = ftell(h->f);
++        if (current < 0 || whence > 2) { psp_ret(0xFFFFFFFFu); return; }
++        int64_t base = whence == 0 ? (int64_t)h->start :
++                       whence == 1 ? (int64_t)current : (int64_t)h->end;
++        int64_t offset = (int64_t)off;
++        if (offset < -base || offset > 0x7FFFFFFFll - base) {
++            psp_ret(0xFFFFFFFFu); return;
++        }
++        int64_t pos = base + offset;
++        if (pos < (int64_t)h->start || fseek(h->f, (long)pos, SEEK_SET) != 0) {
++            psp_ret(0xFFFFFFFFu); return;
++        }
++        psp_cpu.r[PSP_REG_V0] = (uint32_t)(pos - (int64_t)h->start);
++        psp_cpu.r[PSP_REG_V1] = 0;
++        return;
++    }
+ 

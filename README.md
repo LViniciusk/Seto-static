@@ -62,6 +62,7 @@ git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-real-threads.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-namespace.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-reloc-seeds.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s6-prx.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s7-lbn-seek.patch
 
 cmake -S build/psprecomp -B build/psprecomp-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build/psprecomp-build -j 8
@@ -388,6 +389,30 @@ cmake --build build/s6-build -j 8
     build\s5-font-reloc.elf build\s6-title-reloc.elf
 ```
 
+## S7 results — LBN seek correction (partial)
+
+The game seeks to byte `165537792` in the LBN extent starting at ISO byte
+`282034176`. The S6 implementation sought to byte `165537792` of the ISO
+instead. `sceIoLseek` now treats all three seek origins and the returned position
+relative to the LBN extent, while keeping reads within that extent. The first
+bad read was actually `lbu $v0, 16($s3)` at `0x0005BE8C`; `0x00059FE0`
+was merely the last traced function. `$s3` came from `0x0005A134` via `$v0`.
+After the LBN fix the 19 bad accesses disappear (zero observed), but this does
+not establish why the game remains in loading.
+
+At 4, 12 and 30 seconds the framebuffer changed, but all three samples still
+showed the loading sprite rather than the title screen. A 30-second run reached
+1,329 vblanks and 1,332 GE lists, with zero dispatch misses, bad accesses or
+traps; five threads started. The title callback's state at `0x0126C718` and
+substate at `0x0126C71A` were both zero in repeated samples; the condition
+needed to advance is not yet established. Upstream tests passed 21/21.
+The synthetic LBN seek regression can be run with:
+
+```powershell
+cmake --build build/s6-build --target test-lbn-seek
+.\build\s6-build\test-lbn-seek.exe
+```
+
 ## Limitations
 
 - `sceReg` is not implemented: the font library's registry reads return 0 and
@@ -395,8 +420,8 @@ cmake --build build/s6-build -j 8
   reached yet.
 - Only `libtitle.prx` is integrated; the other game PRXs are not recompiled.
   The captured frame is the loading/title sprite, not a completed scene.
-- 19 bad accesses remain in EBOOT code reached after StartModule (first at
-  `0x8662CE15`); they do not stop the frame but are the next fidelity issue.
+- The LBN seek fix eliminates the 19 previously observed bad accesses, but the
+  next loading-to-title blocker is not yet identified.
 - Audio is paced by the runtime but not played; controls are not implemented.
 - 272 VFPU + 16 `vcmov` instructions remain traps in the EBOOT corpus; none
   were reached by this run. The title corpus has 22 VFPU traps, also unreached.

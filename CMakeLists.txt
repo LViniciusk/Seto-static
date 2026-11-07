@@ -61,3 +61,6 @@ else()
     message(STATUS "S6 title corpus not found under build/s6-title-reloc; building without modtitle")
 endif()
 target_link_libraries(Seto-static PRIVATE tagforce)
+
+add_executable(test-lbn-seek EXCLUDE_FROM_ALL tests/lbn_seek.c)
+target_link_libraries(test-lbn-seek PRIVATE psprecomp)
