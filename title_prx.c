@@ -14,6 +14,7 @@
 #include <psprecomp/dispatch.h>
 #include <psprecomp/hle.h>
 
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -159,13 +160,13 @@ static void title_entered(uint32_t addr) {
 
 /* Set from the guest's own step-1 dispatcher entry, so the host never reads
  * guest memory from its input thread. */
-static int g_menu_ready;
+static _Atomic int g_menu_ready;
 
-int psp_title_menu_ready(void) { return g_menu_ready; }
+int psp_title_menu_ready(void) { return atomic_load(&g_menu_ready); }
 
 static void title_menu_ready(uint32_t addr) {
     (void)addr;
-    g_menu_ready = 1;
+    atomic_store(&g_menu_ready, 1);
 }
 
 static void title_callback_entered(uint32_t addr) {

@@ -24,9 +24,10 @@ threads skipped the CPU baton. `_Thread_local` fixes it: the boot thread and
 crash, and the game reaches `sceKernelLoadModule` (see [S4 results](#s4-results)).
 
 **S8 — title input: PARTIAL.** A real Windows Enter reaches the recompiled title
-through `sceCtrlPeekBufferPositive`; the game runs its own fade/wipe and leaves
-the title. The next scene then loads `modduel_mgr`, which imports four duel
-libraries not carried by this host (see [S8 results](#s8-results--title-input)).
+through `sceCtrlPeekBufferPositive` and runs the original fade to the title menu.
+The `modduel_mgr` load is still reached only by the idle/attract path, not by
+START, because the menu waits for a further selection (see
+[S8 results](#s8-results--title-input)). The duel subsystem itself is S9.
 
 **S7 — title screen: PASS.** The EBOOT corpus is relocated into the PSP user
 RAM window, which fixes the sound engine's pointer/handle classification and
@@ -519,14 +520,17 @@ cmake --build build/s6-build --target test-lbn-seek
 ## S8 results — title input
 
 **Input path.** The host has no window, so a host thread samples
-`GetAsyncKeyState(VK_RETURN)` every 10 ms and calls
-`psp_ctrl_set(START or 0, 128, 128)` only on an edge. The runtime's pad state is
-atomic (`_Atomic` buttons/sticks), and `sceCtrlPeekBufferPositive`
-(NID `0x3A622550`) now shares the `ReadBufferPositive` writer. The game polls
-Peek through the EBOOT pad wrapper `0x08035AC8`; at the title, the game's own
-handler `0x00647164` read the pressed mask and saw `0x00000008`. The regression
-in `tests/test_hle.c` checks no buttons, centered sticks, START delivered by
-Peek, and release clearing it. Only START is mapped.
+`GetAsyncKeyState(VK_RETURN)` every 10 ms. Each physical press becomes one
+250 ms START pulse and is not repeated while the key is held; a new press after
+release pulses again. The 250 ms is deliberate: a 15 ms sample was often missed
+by the title's input update and produced the idle path described below, not a
+START transition. The runtime's pad state is atomic (`_Atomic` buttons/sticks),
+and `sceCtrlPeekBufferPositive` (NID `0x3A622550`) now shares the
+`ReadBufferPositive` writer. The menu-ready flag shared with the title is also
+atomic. The game polls Peek through the EBOOT pad wrapper `0x08035AC8`; at the
+title, the game's own handler `0x00647164` read the pressed mask and saw
+`0x00000008`. The regression in `tests/test_hle.c` checks no buttons, centered
+sticks, START delivered by Peek, and release clearing it. Only START is mapped.
 
 **Scheduler yield.** In some runs the title callback stayed inside its frame
 loop `0x006401E8`, calling `sceKernelWakeupThread` 48 million times on
@@ -539,13 +543,17 @@ the 2/5 starved runs before it, and the five final 30 s title runs had zero bad
 accesses (874–1,842 vblanks).
 
 **Transition.** On START the game runs its own fade/wipe (`0x0064641C`,
-`0x00644768`): `build/s8-fade.ppm` shows the title being wiped. A **single
-START sample at step 1** keeps the step at 2 (the fade) until it completes, then
-step 0 and `modduel_mgr` follow. A press held across the next frame is seen
-again at step 2, advances the step to 3/4 (`0x0064725C`/`0x00647280`) and stalls
-there; that was the earlier instability, not early input. The diagnostic source
-therefore pulses START for one sample (~15 ms) from the guest's own step-1 entry
-(`0x00647128`), and the input thread no longer reads guest memory.
+`0x00644768`): `build/s8-fade.ppm` shows the title being wiped. The valid
+branch is `0x0064719C`: it sets the pending step at `0x126C6FE` to 4 and
+advances the dispatcher to step 3. Step 3 (`0x0064725C`) runs `0x00644768` for
+about 20 frames; when the fade completes it calls `0x006473E0`, copies the
+pending step (4) into `0x126C6FC`, and step 4 (`0x00647280`) runs the scene
+manager `0x00647468`. The scene state at `0x126CF6C` advances `0 → 1 → 2 → 3`
+and then stops at the title menu, which waits for a further button. The host
+only sends START, so this path reaches the menu and does not issue the
+`LoadModule`. The earlier "fade stops with pending 4" was the step 3→4 handoff:
+the pending value is consumed, and state 3 is the next screen, not a stalled
+fade.
 
 The selection is now located: the 40-entry table at `0x00666B28` is indexed by
 the animation id at `0x126C6F8`; entry 5 (`0x00642FBC`) owns the menu and calls
@@ -555,40 +563,48 @@ the dispatcher `0x006470B4`. That dispatcher indexes the pointer table
 `0x00647280`; 12 and above → `0x006472EC`).
 
 Without input the step cycles `0 → 1 → 2 → 0` around vblank 400; step 1 is the
-PRESS START window and step 0 is idle. With one 15 ms START sample at step 1,
-all five measured runs kept step 2 (the fade) from vblank ~430 to ~2350, then
-returned to step 0 and issued the `LoadModule` at vblank ~2390; none derailed.
-The idle path reaches the same call at the same vblank, so the load is gated by
-the title's own timer; the START path differs in the fade it runs, not in the
-time of the load. The keyboard path is unchanged; a held key can still be seen
-at step 2 and derail, which is the game's own two-step script.
+PRESS START window and step 0 is idle. With a START pulse the title enters the
+fade path above. The diagnostic source pulses one 250 ms START from the guest's
+own step-1 entry (`0x00647128`), and the input thread no longer reads guest
+memory. In five measured 250 ms runs, four entered the START path (the step
+3→4 fade and the menu, with no `ModuleMgr` load) and one missed the input and
+took the idle path. The input sampling race is in the title's pad update, not
+in the pulse repetition; a real user can press again when the prompt is shown.
 
-A successful run issues
+The idle/attract path times out at step 2 (the 990 timer), resets to step 0 and
+issues
 
 ```
 sceKernelLoadModule("disc0:/sce_lbn0x5c20_size0x1f6f2")
 ```
 
-which is `modduel_mgr` (128,754 bytes). That module imports `libehsys` (1,245),
-`libduel_eng` (143), `libduel_draw` (38), `libdeck_swap` (3) and `libtutorial`
-(7), and reserves 11.6 MB of `.bss`. Only `libehsys` resolves here; the other
-four libraries are a duel subsystem that this host does not carry, so the next
-scene is not reached and none of them was integrated. The host now names a
-`LoadModule` path it cannot serve instead of failing silently.
+which is `modduel_mgr` (128,754 bytes), at vblank ≈ 2390. That is the only path
+that reaches the call; it is not counted as a START transition. The module
+imports `libehsys` (1,245), `libduel_eng` (143), `libduel_draw` (38),
+`libdeck_swap` (3) and `libtutorial` (7), and reserves 11.6 MB of `.bss`. Only
+`libehsys` resolves here; the other four libraries are a duel subsystem that
+this host does not carry, so the next scene is not reached and none of them was
+integrated. The host now names a `LoadModule` path it cannot serve instead of
+failing silently.
 
 **Dispatch budget.** One normal 35 s title run ended on the old fixed 5,000,000
 dispatch budget; it is now opt-in (`SETO_DISPATCH_BUDGET=<calls>`), because the
 title's wait loop legitimately runs for a long time.
 
-**Integrity.** Zero dispatch misses and traps. Of the five START runs, four had
-zero bad accesses; one had 3 at `0x3` from `0x08034644` after an `ehfile_queue`
-wait timeout. That race predates the transition work, also appears in unpressed
-runs, and is recorded but not addressed. Upstream tests 21/21; LBN seek PASS;
-all eleven psprecomp patches apply to `5ca18fa` and the clean tree passes 21/21.
+**Integrity.** Zero dispatch misses and traps. In the five 250 ms diagnostic
+runs, the four START-path runs had zero bad accesses; the one run that missed
+the input and took the idle path had 3 bad accesses at `0x3` from `0x08034644`
+after an `ehfile_queue` wait timeout. That race predates the transition work,
+also appears in unpressed runs, and is recorded but not addressed. A 15 ms
+pulse was too short: all five such runs were the idle path, so the earlier
+"5/5" claim was invalid and has been removed. Upstream tests 21/21; LBN seek
+PASS; all eleven psprecomp patches apply to `5ca18fa` and the clean tree passes
+21/21.
 
-To reproduce: `SETO_BRINGUP_CAP=95` and `SETO_AUTO_START=1` (diagnostic single
-sample at step 1), or press Enter when the prompt is fully shown. The load
-follows at vblank ≈ 2390.
+To reproduce: `SETO_BRINGUP_CAP=95` and `SETO_AUTO_START=1` (one 250 ms
+diagnostic START at step 1), or press Enter when the prompt is shown. The fade
+reaches the title menu; the idle path reaches the `LoadModule` at vblank
+≈ 2390.
 
 ## Limitations
 
@@ -596,10 +612,9 @@ follows at vblank ≈ 2390.
   it uses defaults. `GetCharInfo`/`GetCharGlyphImage` and text rendering are not
   reached yet.
 - Only `libtitle.prx` is integrated; the other game PRXs are not recompiled.
-  S8 reaches the `modduel_mgr` load; that module needs `libduel_eng`,
-  `libduel_draw`, `libdeck_swap` and `libtutorial`, which are not integrated.
-  The load is gated by the title's own timer, so it lands at the same vblank
-  with or without START.
+  S8 reaches the title menu; the `modduel_mgr` load is reached only by the idle
+  path. That module needs `libduel_eng`, `libduel_draw`, `libdeck_swap` and
+  `libtutorial`, which are not integrated.
 - The rebased corpus relocates the EBOOT into the PSP user RAM window. The host
   refuses the unrelocated image instead of guessing its base.
 - Audio is paced by the runtime but not played. Only START is mapped; D-Pad,

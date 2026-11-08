@@ -128,7 +128,7 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                     psp_ctrl_set(PSP_CTRL_START, 128, 128);
                     fprintf(stderr, "input: auto START (vb %llu)\n",
                             (unsigned long long)psp_display_vblanks());
-                    Sleep(15);
+                    Sleep(250);
                     psp_ctrl_set(0, 128, 128);
                 } else {
                     Sleep(1);
@@ -139,10 +139,16 @@ static DWORD WINAPI input_thread(LPVOID unused) {
 #endif
         {
             int down = (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0;
-            if (down != held) {
-                held = down;
-                psp_ctrl_set(down ? PSP_CTRL_START : 0u, 128, 128);
-                fprintf(stderr, "input: START %s\n", down ? "down" : "up");
+            /* One pulse per physical press: a key held across frames must not
+             * be seen again by the title. Release re-arms the next press. */
+            if (down && !held) {
+                held = 1;
+                psp_ctrl_set(PSP_CTRL_START, 128, 128);
+                fprintf(stderr, "input: START pulse\n");
+                Sleep(250);
+                psp_ctrl_set(0, 128, 128);
+            } else if (!down) {
+                held = 0;
             }
         }
         Sleep(10);
