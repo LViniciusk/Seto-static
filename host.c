@@ -17,6 +17,8 @@
 #include <windows.h>
 
 void psp_recomp_register(void);   /* generated tagforce_register.c */
+int  seto_window_start(void);
+void seto_window_stop(void);
 void psp_umd_register(void);
 void psp_umd_set_iso(const char *path);
 void psp_fpl_register(void);
@@ -283,6 +285,14 @@ int main(int argc, char **argv) {
         psp_dispatch_set_budget(budget, on_budget);
     }
     psp_trace_watch(m.entry, on_entry);
+    if (!getenv("SETO_NO_WINDOW")) {
+        if (seto_window_start() == 0)
+            fprintf(stderr, "window: 960x544 live framebuffer\n");
+        else
+            fprintf(stderr, "window: failed; continuing headless\n");
+    } else {
+        fprintf(stderr, "window: disabled by SETO_NO_WINDOW\n");
+    }
     CreateThread(NULL, 0, input_thread, NULL, 0, NULL);
     const char *cap = getenv("SETO_BRINGUP_CAP");
     if (cap && atoi(cap) > 0) {
@@ -300,6 +310,7 @@ int main(int argc, char **argv) {
         psp_threadman_yield();
         Sleep(1);
     }
+    seto_window_stop();
     report("run ended");
     return 0;
 }
