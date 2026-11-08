@@ -23,6 +23,11 @@ threads skipped the CPU baton. `_Thread_local` fixes it: the boot thread and
 `user_main` now alternate on separate host threads without the `psp_ra_is_jump`
 crash, and the game reaches `sceKernelLoadModule` (see [S4 results](#s4-results)).
 
+**S8 — title input: PARTIAL.** A real Windows Enter reaches the recompiled title
+through `sceCtrlPeekBufferPositive`; the game runs its own fade/wipe and leaves
+the title. The next scene then loads `modduel_mgr`, which imports four duel
+libraries not carried by this host (see [S8 results](#s8-results--title-input)).
+
 **S7 — title screen: PASS.** The EBOOT corpus is relocated into the PSP user
 RAM window, which fixes the sound engine's pointer/handle classification and
 lets the loading stream retire. The GE now applies `ORIGIN`/`OFFSET` to relative
@@ -72,6 +77,7 @@ git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s6-prx.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s7-lbn-seek.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s7-ge-callback.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s7-address-space.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s8-input.patch
 
 cmake -S build/psprecomp -B build/psprecomp-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build/psprecomp-build -j 8
@@ -105,7 +111,12 @@ cmake --build build/s5-build -j 8
 $env:PSPRECOMP_TRACE_IO = '1'
 # optional: bound a bring-up run with a report after N seconds (unset = run on)
 $env:SETO_BRINGUP_CAP = '30'
+# optional: stop after N indirect dispatches (unset = no budget)
+$env:SETO_DISPATCH_BUDGET = '50000000'
 ```
+
+The host has no window; the keyboard is read from the global async key state.
+**Enter is START** (PSP `0x00000008`). Other buttons are not mapped yet.
 
 Without `build/s5-font-reloc`, CMake configures the EBOOT-only host and reports
 the missing corpus; passing the third argument then fails with a clear message.
@@ -504,17 +515,57 @@ cmake --build build/s6-build --target test-lbn-seek
 .\build\s6-build\test-lbn-seek.exe
 ```
 
+## S8 results — title input
+
+**Input path.** The host has no window, so a host thread samples
+`GetAsyncKeyState(VK_RETURN)` every 10 ms and calls
+`psp_ctrl_set(START or 0, 128, 128)` only on an edge. The runtime's pad state is
+atomic (`_Atomic` buttons/sticks), and `sceCtrlPeekBufferPositive`
+(NID `0x3A622550`) now shares the `ReadBufferPositive` writer. The game polls
+Peek through the EBOOT pad wrapper `0x08035AC8`; at the title, the game's own
+handler `0x00647164` read the pressed mask and saw `0x00000008`. The regression
+in `tests/test_hle.c` checks no buttons, centered sticks, START delivered by
+Peek, and release clearing it. Only START is mapped.
+
+**Transition.** On START the game runs its own fade/wipe (`0x0064641C`,
+`0x00644768`): `build/s8-fade.ppm` shows the title being wiped. It then leaves
+the title: one run reached the next-scene loading state (animation `32/32`) and
+issued
+
+```
+sceKernelLoadModule("disc0:/sce_lbn0x5c20_size0x1f6f2")
+```
+
+which is `modduel_mgr` (128,754 bytes). That module imports `libehsys` (1,245),
+`libduel_eng` (143), `libduel_draw` (38), `libdeck_swap` (3) and `libtutorial`
+(7), and reserves 11.6 MB of `.bss`. Only `libehsys` resolves here; the other
+four libraries are a duel subsystem that this host does not carry, so the next
+scene is not reached and none of them was integrated. The host now names a
+`LoadModule` path it cannot serve instead of failing silently.
+
+**Dispatch budget.** One normal 35 s title run ended on the old fixed 5,000,000
+dispatch budget; it is now opt-in (`SETO_DISPATCH_BUDGET=<calls>`), because the
+title's wait loop legitimately runs for a long time.
+
+**Integrity.** Zero dispatch misses, bad accesses or traps across the title and
+transition runs; upstream tests 21/21; LBN seek PASS; all ten psprecomp patches
+apply to `5ca18fa` and the clean tree passes 21/21.
+
+To reproduce: run with `SETO_BRINGUP_CAP=30`, wait for the title, press Enter.
+
 ## Limitations
 
 - `sceReg` is not implemented: the font library's registry reads return 0 and
   it uses defaults. `GetCharInfo`/`GetCharGlyphImage` and text rendering are not
   reached yet.
 - Only `libtitle.prx` is integrated; the other game PRXs are not recompiled.
-  S7 reaches and holds the title menu, but there is no input, so the game does
-  not proceed past "PRESS START BUTTON".
+  S8 accepts START and leaves the title, but the next scene needs
+  `modduel_mgr` plus `libduel_eng`, `libduel_draw`, `libdeck_swap` and
+  `libtutorial`, which are not integrated.
 - The rebased corpus relocates the EBOOT into the PSP user RAM window. The host
   refuses the unrelocated image instead of guessing its base.
-- Audio is paced by the runtime but not played; controls are not implemented.
+- Audio is paced by the runtime but not played. Only START is mapped; D-Pad,
+  CROSS and CIRCLE are not.
 - 270 VFPU + 16 `vcmov` instructions remain traps in the rebased EBOOT corpus;
   none were reached by this run. The title corpus has 22 VFPU traps, also
   unreached.
@@ -526,6 +577,6 @@ cmake --build build/s6-build --target test-lbn-seek
 
 Tracked: this README, `.gitignore`, `host.c`, `umd.c`, `fpl.c`, `font_prx.c`,
 `title_prx.c`, `scripts/relocate_prx.py`, `CMakeLists.txt`, `tests/lbn_seek.c`,
-and nine small patches against the pinned psprecomp. `build/` (tool clone, generated C,
+and ten small patches against the pinned psprecomp. `build/` (tool clone, generated C,
 relocated ELF, objects, executable) and `private/` (decrypted EBOOT, ISO) are
 ignored.

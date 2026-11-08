@@ -31,7 +31,6 @@ int  psp_title_image_load(const char *path, uint32_t eboot_info);
 
 /* The EBOOT's single PT_LOAD has memsz 0x631A80; .bss runs to there. */
 #define MODULE_SPAN 0x00640000u
-#define DISPATCH_BUDGET 5000000u
 
 static void report(const char *why) {
     fprintf(stderr, "%s\n", why);
@@ -105,6 +104,27 @@ static DWORD WINAPI bringup_cap(LPVOID unused) {
     report(why);
     fflush(stderr);
     _Exit(5);
+}
+
+/* Real Windows keyboard, sampled without a window or message loop. START only;
+ * the rest of the pad is added when a scene asks for it. The thread ends with
+ * the process (or when the game exits) and releases what it held. */
+#define PSP_CTRL_START 0x00000008u
+
+static DWORD WINAPI input_thread(LPVOID unused) {
+    (void)unused;
+    int held = 0;
+    while (!psp_exit_requested()) {
+        int down = (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0;
+        if (down != held) {
+            held = down;
+            psp_ctrl_set(down ? PSP_CTRL_START : 0u, 128, 128);
+            fprintf(stderr, "input: START %s\n", down ? "down" : "up");
+        }
+        Sleep(10);
+    }
+    psp_ctrl_set(0, 128, 128);
+    return 0;
 }
 
 /* Entry reached: the first thing the run has to prove. */
@@ -188,8 +208,17 @@ int main(int argc, char **argv) {
     fflush(stdout);
 
     psp_set_miss_handler(on_miss);
-    psp_dispatch_set_budget(DISPATCH_BUDGET, on_budget);
+    /* Opt-in like the cap: SETO_DISPATCH_BUDGET=<calls>. The title's wait loop
+     * legitimately runs millions of dispatches, so the old fixed 5M ended
+     * normal runs at the title. */
+    const char *db = getenv("SETO_DISPATCH_BUDGET");
+    uint64_t budget = db ? strtoull(db, NULL, 0) : 0;
+    if (budget) {
+        printf("dispatch budget %llu\n", (unsigned long long)budget);
+        psp_dispatch_set_budget(budget, on_budget);
+    }
     psp_trace_watch(m.entry, on_entry);
+    CreateThread(NULL, 0, input_thread, NULL, 0, NULL);
     const char *cap = getenv("SETO_BRINGUP_CAP");
     if (cap && atoi(cap) > 0) {
         g_cap_seconds = (unsigned)atoi(cap);

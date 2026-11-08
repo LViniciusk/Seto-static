@@ -1,0 +1,104 @@
+diff --git a/src/hle/misc.c b/src/hle/misc.c
+index d52fbcf..a1d5648 100644
+--- a/src/hle/misc.c
++++ b/src/hle/misc.c
+@@ -9,6 +9,7 @@
+ 
+ #include "psprecomp/hle.h"
+ 
++#include <stdatomic.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -120,14 +121,16 @@ static void hle_ModuleOk(void)             { psp_ret(SCE_KERNEL_ERROR_OK); }
+ 
+ /* ---- sceCtrl ------------------------------------------------------------- */
+ 
+-static uint32_t g_buttons;
+-static uint8_t  g_analog_x = 128, g_analog_y = 128;
++/* The host feeds this from its input thread while a guest thread reads it, so
++ * the state is atomic rather than a plain read/write pair. */
++static _Atomic uint32_t g_buttons;
++static _Atomic uint8_t  g_analog_x = 128, g_analog_y = 128;
+ static uint32_t g_ctrl_frame;
+ 
+ void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay) {
+-    g_buttons = buttons;
+-    g_analog_x = ax;
+-    g_analog_y = ay;
++    atomic_store(&g_buttons, buttons);
++    atomic_store(&g_analog_x, ax);
++    atomic_store(&g_analog_y, ay);
+ }
+ 
+ static void hle_CtrlSet(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+@@ -136,12 +139,15 @@ static void hle_CtrlSet(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+ static void hle_ReadBufferPositive(void) {
+     uint32_t buf = psp_arg(0), count = psp_arg(1);
+     if (!count) count = 1;
++    /* One snapshot per call: the input thread may update between reads. */
++    uint32_t buttons = atomic_load(&g_buttons);
++    uint8_t ax = atomic_load(&g_analog_x), ay = atomic_load(&g_analog_y);
+     for (uint32_t i = 0; i < count; i++) {
+         uint32_t at = buf + i * 16;
+         psp_write32(at, g_ctrl_frame++);
+-        psp_write32(at + 4, g_buttons);
+-        psp_write8(at + 8, g_analog_x);
+-        psp_write8(at + 9, g_analog_y);
++        psp_write32(at + 4, buttons);
++        psp_write8(at + 8, ax);
++        psp_write8(at + 9, ay);
+         for (int k = 10; k < 16; k++) psp_write8(at + (uint32_t)k, 0);
+     }
+     psp_ret(count);
+@@ -300,6 +306,9 @@ void psp_misc_register(void) {
+     psp_hle_register(0x1F4011E6, "sceCtrl", "sceCtrlSetSamplingMode",     hle_CtrlSet);
+     psp_hle_register(0x6A2774F3, "sceCtrl", "sceCtrlSetSamplingCycle",    hle_CtrlSet);
+     psp_hle_register(0x1F803938, "sceCtrl", "sceCtrlReadBufferPositive",  hle_ReadBufferPositive);
++    /* The title polls Peek; against a flat guest image both forms return the
++     * current state, which is what the game's edge detector needs. */
++    psp_hle_register(0x3A622550, "sceCtrl", "sceCtrlPeekBufferPositive",  hle_ReadBufferPositive);
+ 
+     psp_hle_register(0x5EC81C55, "sceAudio", "sceAudioChReserve",            hle_ChReserve);
+     psp_hle_register(0x6FC46853, "sceAudio", "sceAudioChRelease",            hle_ChRelease);
+diff --git a/tests/test_hle.c b/tests/test_hle.c
+index c670f90..804b087 100644
+--- a/tests/test_hle.c
++++ b/tests/test_hle.c
+@@ -964,6 +964,28 @@ static void test_callbacks(void) {
+           (unsigned long long)psp_power_registered());
+ }
+ 
++/* The host feeds the pad from its input thread; the guest sees one snapshot per
++ * call from Read and Peek, and a release clears the mask. */
++static void test_ctrl(void) {
++    const uint32_t BUF = 0x08860000u;
++    const uint32_t START = 0x00000008u;
++
++    psp_ctrl_set(0, 128, 128);
++    CHECK(call(psp_nid("sceCtrlReadBufferPositive"), BUF, 1, 0, 0) == 1,
++          "ctrl read returns the count");
++    CHECK(psp_read32(BUF + 4) == 0, "no buttons initially, got 0x%08X", psp_read32(BUF + 4));
++    CHECK(psp_read8(BUF + 8) == 128 && psp_read8(BUF + 9) == 128,
++          "sticks centered at 128/128, got %u/%u", psp_read8(BUF + 8), psp_read8(BUF + 9));
++
++    psp_ctrl_set(START, 128, 128);
++    call(psp_nid("sceCtrlPeekBufferPositive"), BUF, 1, 0, 0);
++    CHECK(psp_read32(BUF + 4) == START, "peek delivers START, got 0x%08X", psp_read32(BUF + 4));
++
++    psp_ctrl_set(0, 128, 128);
++    call(psp_nid("sceCtrlPeekBufferPositive"), BUF, 1, 0, 0);
++    CHECK(psp_read32(BUF + 4) == 0, "release clears START, got 0x%08X", psp_read32(BUF + 4));
++}
++
+ int main(void) {
+     CHECK(psp_mem_init() == 0, "memory init");
+     psp_cpu_reset();
+@@ -980,6 +1002,7 @@ int main(void) {
+     test_threads();
+     test_vpl();
+     test_guest_strings();
++    test_ctrl();
+     test_ge_display_list();
+     test_ge_callbacks();
+     test_ge_infinite_list();
