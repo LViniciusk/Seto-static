@@ -28,6 +28,9 @@ void font_psp_recomp_register(void);   /* relocated PRX corpus */
 #ifdef HAVE_TITLE_CORPUS
 int  psp_title_image_load(const char *path, uint32_t eboot_info);
 int  psp_title_menu_ready(void);
+void psp_title_start_request(int on);
+int  psp_title_start_done(void);
+int  psp_title_scene3(void);
 #endif
 
 /* The EBOOT's single PT_LOAD has memsz 0x631A80; .bss runs to there. */
@@ -116,6 +119,7 @@ static DWORD WINAPI input_thread(LPVOID unused) {
     (void)unused;
     const char *auto_start = getenv("SETO_AUTO_START");
     int sent = 0, held = 0;
+    DWORD press_ms = 0;
     while (!psp_exit_requested()) {
         /* libtitle accepts START at its PRESS START step: animation 5 owns the
          * frame and its step index (0x126C6FC) is 1. The same index occurs
@@ -125,11 +129,22 @@ static DWORD WINAPI input_thread(LPVOID unused) {
             if (!sent) {
                 if (psp_title_menu_ready()) {
                     sent = 1;
-                    psp_ctrl_set(PSP_CTRL_START, 128, 128);
-                    fprintf(stderr, "input: auto START (vb %llu)\n",
+                    psp_title_start_request(1);
+                    fprintf(stderr, "input: auto START request (vb %llu)\n",
                             (unsigned long long)psp_display_vblanks());
-                    Sleep(250);
-                    psp_ctrl_set(0, 128, 128);
+                    for (int i = 0; i < 500 && !psp_title_start_done(); i++)
+                        Sleep(10);
+                    for (int i = 0; i < 500 && !psp_title_scene3(); i++)
+                        Sleep(10);
+                    psp_title_start_request(0);
+                    fprintf(stderr, "input: auto START done=%d scene3=%d (vb %llu)\n",
+                            psp_title_start_done(), psp_title_scene3(),
+                            (unsigned long long)psp_display_vblanks());
+                    if (psp_title_scene3()) {
+                        Sleep(2000);
+                        if (psp_display_capture("build/s8-menu.ppm") == 0)
+                            fprintf(stderr, "capture: build/s8-menu.ppm\n");
+                    }
                 } else {
                     Sleep(1);
                     continue;
@@ -139,17 +154,34 @@ static DWORD WINAPI input_thread(LPVOID unused) {
 #endif
         {
             int down = (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0;
-            /* One pulse per physical press: a key held across frames must not
-             * be seen again by the title. Release re-arms the next press. */
+            /* One request per physical press. The title re-issues the pad edge
+             * until its own step advances, so a slow frame cannot lose it;
+             * release clears the request. */
             if (down && !held) {
                 held = 1;
+                press_ms = GetTickCount();
+#ifdef HAVE_TITLE_CORPUS
+                psp_title_start_request(1);
+#else
                 psp_ctrl_set(PSP_CTRL_START, 128, 128);
-                fprintf(stderr, "input: START pulse\n");
-                Sleep(250);
-                psp_ctrl_set(0, 128, 128);
-            } else if (!down) {
+#endif
+                fprintf(stderr, "input: START press\n");
+            } else if (!down && held) {
                 held = 0;
+#ifdef HAVE_TITLE_CORPUS
+                psp_title_start_request(0);
+#else
+                psp_ctrl_set(0, 128, 128);
+#endif
+                fprintf(stderr, "input: START release\n");
             }
+#ifdef HAVE_TITLE_CORPUS
+            else if (held && !psp_title_start_done() &&
+                     GetTickCount() - press_ms > 5000) {
+                psp_title_start_request(0);
+                fprintf(stderr, "input: START timeout\n");
+            }
+#endif
         }
         Sleep(10);
     }

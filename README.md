@@ -23,11 +23,11 @@ threads skipped the CPU baton. `_Thread_local` fixes it: the boot thread and
 `user_main` now alternate on separate host threads without the `psp_ra_is_jump`
 crash, and the game reaches `sceKernelLoadModule` (see [S4 results](#s4-results)).
 
-**S8 — title input: PARTIAL.** A real Windows Enter reaches the recompiled title
-through `sceCtrlPeekBufferPositive` and runs the original fade to the title menu.
-The `modduel_mgr` load is still reached only by the idle/attract path, not by
-START, because the menu waits for a further selection (see
-[S8 results](#s8-results--title-input)). The duel subsystem itself is S9.
+**S8 — title input: PASS.** A real Windows Enter reaches the recompiled title
+through `sceCtrlPeekBufferPositive`, runs the original fade and reaches the
+interactive title menu (scene state 3) in 5/5 diagnostic runs. The menu itself
+needs a further selection, which is S9 (see
+[S8 results](#s8-results--title-input)).
 
 **S7 — title screen: PASS.** The EBOOT corpus is relocated into the PSP user
 RAM window, which fixes the sound engine's pointer/handle classification and
@@ -520,17 +520,22 @@ cmake --build build/s6-build --target test-lbn-seek
 ## S8 results — title input
 
 **Input path.** The host has no window, so a host thread samples
-`GetAsyncKeyState(VK_RETURN)` every 10 ms. Each physical press becomes one
-250 ms START pulse and is not repeated while the key is held; a new press after
-release pulses again. The 250 ms is deliberate: a 15 ms sample was often missed
-by the title's input update and produced the idle path described below, not a
-START transition. The runtime's pad state is atomic (`_Atomic` buttons/sticks),
-and `sceCtrlPeekBufferPositive` (NID `0x3A622550`) now shares the
-`ReadBufferPositive` writer. The menu-ready flag shared with the title is also
-atomic. The game polls Peek through the EBOOT pad wrapper `0x08035AC8`; at the
-title, the game's own handler `0x00647164` read the pressed mask and saw
-`0x00000008`. The regression in `tests/test_hle.c` checks no buttons, centered
-sticks, START delivered by Peek, and release clearing it. Only START is mapped.
+`GetAsyncKeyState(VK_RETURN)` every 10 ms. One physical press sets one START
+request; release clears it. The title reads a one-frame press edge at
+`0x08101530`, and the EBOOT input update `0x08035AC8` clears that edge on its
+next run. If the title frame lands after the clear, the press is lost: a 250 ms
+pulse was missed in one of five runs (the dispatcher read step 2 with buttons 0
+while Peek had already seen START). The fix is to re-issue the pad edge from the
+guest's own input-update entry until the title's step reaches 3; the loop then
+stops. This is one logical press, not a held START. The request times out after
+5 s if the title never consumes it. The runtime's pad state is atomic
+(`_Atomic` buttons/sticks), and `sceCtrlPeekBufferPositive` (NID `0x3A622550`)
+shares the `ReadBufferPositive` writer. The menu-ready, request, done and
+scene-3 flags are `_Atomic`. The game polls Peek through the EBOOT pad wrapper
+`0x08035AC8`; at the title, the game's own handler `0x00647164` read the pressed
+mask and saw `0x00000008`. The regression in `tests/test_hle.c` checks no
+buttons, centered sticks, START delivered by Peek, and release clearing it.
+Only START is mapped.
 
 **Scheduler yield.** In some runs the title callback stayed inside its frame
 loop `0x006401E8`, calling `sceKernelWakeupThread` 48 million times on
@@ -563,13 +568,23 @@ the dispatcher `0x006470B4`. That dispatcher indexes the pointer table
 `0x00647280`; 12 and above → `0x006472EC`).
 
 Without input the step cycles `0 → 1 → 2 → 0` around vblank 400; step 1 is the
-PRESS START window and step 0 is idle. With a START pulse the title enters the
-fade path above. The diagnostic source pulses one 250 ms START from the guest's
-own step-1 entry (`0x00647128`), and the input thread no longer reads guest
-memory. In five measured 250 ms runs, four entered the START path (the step
-3→4 fade and the menu, with no `ModuleMgr` load) and one missed the input and
-took the idle path. The input sampling race is in the title's pad update, not
-in the pulse repetition; a real user can press again when the prompt is shown.
+PRESS START window and step 0 is idle. With a START request the title enters the
+fade path above. The diagnostic sets the request at the guest's step-1 entry
+(`0x00647128`); the input-update watch `0x08035AC8` re-issues the pad edge until
+the title's step reaches 3. In five independent runs the request was published
+at vblank 412–449, and step 3 + scene state 3 were reached at vblank 474–509,
+**5/5**, with no `ModuleMgr` load. The request loop stops at step 3, so it cannot
+repeat at the menu.
+
+**Menu capture.** `build/s8-menu.ppm` is captured 2 s after scene state 3 in
+each diagnostic run. It shows the title artwork with the magenta/orange
+selection bar but no distinguishable menu text; the scene state 3 handler entry
+is the proof of the state. No artificial image is produced.
+
+The 250 ms blind pulse from the previous commit is gone: the EBOOT input update
+clears the one-frame edge at `0x08101530`, and a slow title frame could read it
+after the clear. The request loop is synchronized to the guest's own input
+update, not to host time.
 
 The idle/attract path times out at step 2 (the 990 timer), resets to step 0 and
 issues
@@ -591,20 +606,19 @@ failing silently.
 dispatch budget; it is now opt-in (`SETO_DISPATCH_BUDGET=<calls>`), because the
 title's wait loop legitimately runs for a long time.
 
-**Integrity.** Zero dispatch misses and traps. In the five 250 ms diagnostic
-runs, the four START-path runs had zero bad accesses; the one run that missed
-the input and took the idle path had 3 bad accesses at `0x3` from `0x08034644`
-after an `ehfile_queue` wait timeout. That race predates the transition work,
-also appears in unpressed runs, and is recorded but not addressed. A 15 ms
-pulse was too short: all five such runs were the idle path, so the earlier
-"5/5" claim was invalid and has been removed. Upstream tests 21/21; LBN seek
-PASS; all eleven psprecomp patches apply to `5ca18fa` and the clean tree passes
-21/21.
+**Integrity.** Zero dispatch misses and traps in the five diagnostic runs. Four
+had zero bad accesses; one had 3 at `0x3` from `0x08034644` **before** the START
+request, during the title load. That is the pre-existing `ehfile_queue` race,
+not caused by START and not blocking the transition. The same race appeared
+before START in earlier runs. A 6 s physical Enter test produced exactly one
+`input: START press`, one release, and scene state 3 with zero bad accesses.
+Upstream tests 21/21; LBN seek PASS; all eleven psprecomp patches apply to
+`5ca18fa` and the clean tree passes 21/21.
 
-To reproduce: `SETO_BRINGUP_CAP=95` and `SETO_AUTO_START=1` (one 250 ms
-diagnostic START at step 1), or press Enter when the prompt is shown. The fade
-reaches the title menu; the idle path reaches the `LoadModule` at vblank
-≈ 2390.
+To reproduce: `SETO_BRINGUP_CAP=60` and `SETO_AUTO_START=1` (request at step 1,
+capture 2 s after scene state 3), or press Enter when the prompt is shown and
+hold until the fade starts. The fade reaches the title menu; the idle path
+reaches the `LoadModule` at vblank ≈ 2390.
 
 ## Limitations
 

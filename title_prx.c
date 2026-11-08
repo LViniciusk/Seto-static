@@ -164,9 +164,54 @@ static _Atomic int g_menu_ready;
 
 int psp_title_menu_ready(void) { return atomic_load(&g_menu_ready); }
 
+/* The title reads the game's one-frame press edge at 0x08101530, and the
+ * EBOOT input update clears it on its next run. If the title's frame lands
+ * after that, the press is lost. Re-issue the edge on the guest's own input
+ * update until the title reaches step 3; then stop. */
+static _Atomic int g_start_request;
+static _Atomic int g_start_done;
+static _Atomic int g_scene3;
+static int g_pad_on;
+
+int psp_title_scene3(void) { return atomic_load(&g_scene3); }
+
+void psp_title_start_request(int on) {
+    if (on) {
+        atomic_store(&g_start_done, 0);
+        atomic_store(&g_start_request, 1);
+    } else {
+        atomic_store(&g_start_request, 0);
+    }
+}
+
+int psp_title_start_done(void) { return atomic_load(&g_start_done); }
+
+static void title_input_update(uint32_t addr) {
+    (void)addr;
+    int step = (short)psp_read16(0x0126C6FCu);
+    if (!atomic_load(&g_start_request) || step < 1) {
+        if (g_pad_on) { psp_ctrl_set(0, 128, 128); g_pad_on = 0; }
+        return;
+    }
+    if (step >= 3) {
+        if (g_pad_on) { psp_ctrl_set(0, 128, 128); g_pad_on = 0; }
+        atomic_store(&g_start_done, 1);
+        return;
+    }
+    g_pad_on ^= 1;
+    psp_ctrl_set(g_pad_on ? 0x00000008u : 0u, 128, 128);
+}
+
+static void title_scene3(uint32_t addr) {
+    (void)addr;
+    atomic_store(&g_scene3, 1);
+}
+
 static void title_menu_ready(uint32_t addr) {
     (void)addr;
     atomic_store(&g_menu_ready, 1);
+    psp_trace_watch(0x08035AC8u, title_input_update);
+    psp_trace_watch_label(0x00645084u, title_scene3);
 }
 
 static void title_callback_entered(uint32_t addr) {
