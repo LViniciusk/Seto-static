@@ -63,6 +63,7 @@ git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-namespace.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-reloc-seeds.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s6-prx.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s7-lbn-seek.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s7-ge-callback.patch
 
 cmake -S build/psprecomp -B build/psprecomp-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build/psprecomp-build -j 8
@@ -389,7 +390,9 @@ cmake --build build/s6-build -j 8
     build\s5-font-reloc.elf build\s6-title-reloc.elf
 ```
 
-## S7 results — LBN seek correction (partial)
+## S7 results — LBN seek, GE callbacks and the sound-stream blocker
+
+### LBN seek
 
 The game seeks to byte `165537792` in the LBN extent starting at ISO byte
 `282034176`. The S6 implementation sought to byte `165537792` of the ISO
@@ -400,13 +403,39 @@ was merely the last traced function. `$s3` came from `0x0005A134` via `$v0`.
 After the LBN fix the 19 bad accesses disappear (zero observed), but this does
 not establish why the game remains in loading.
 
-At 4, 12 and 30 seconds the framebuffer changed, but all three samples still
-showed the loading sprite rather than the title screen. A 30-second run reached
-1,329 vblanks and 1,332 GE lists, with zero dispatch misses, bad accesses or
-traps; five threads started. The title callback's state at `0x0126C718` and
-substate at `0x0126C71A` were both zero in repeated samples; the condition
-needed to advance is not yet established. Upstream tests passed 21/21.
-The synthetic LBN seek regression can be run with:
+### GE callbacks
+
+The EBOOT registers a GE callback (signal `0x00004084`, finish `0x00004100`)
+and passes the returned id to `sceGeListEnQueue`. The runtime returned 0 from
+`sceGeSetCallback` and never invoked either function, although the game's
+finish handler is what retires its render queue. The runtime now implements
+`sceGeSetCallback`/`sceGeUnsetCallback` with the PSP `PspGeCallbackData` layout
+(`signal_func`, `signal_arg`, `finish_func`, `finish_arg`), stores the id on the
+queue, and delivers the signal and finish callbacks with the id and the
+registered argument while preserving the caller's registers. A list that
+finishes after a later `sceGeListUpdateStallAddr` delivers exactly once. The
+new regression in `tests/test_hle.c` registers a finish callback, enqueues a
+`FINISH` list, checks the id, argument and register preservation, then unsets
+the callback and checks it is not called. The game called the finish callback
+329 times in the measured run.
+
+### Remaining blocker
+
+The title still does not advance. The title callback `0x00640034` enters the
+animation 0 handler `0x00643120`, requests animation 3, then runs the animation 2
+handler `0x00643250` and blocks in `0x006469A8`. That function waits for the
+sound stream queued at `0x00417004` to drain. The stream is pushed there by the
+sound sequence thread with state `+0x30 = 27` after `msd.ehp` loads (its async
+callback `0x0064AA0` ran), but no voice is registered in the sound voice table
+at `0x00417058`. The stream therefore never starts and never retires. A
+20-second run keeps the animation state at `2/3` and the stream positions at
+`1/1`; the frame remains the loading sprite. This is the first concrete
+blocker; the sound engine's voice allocation is a subsystem, not a one-call HLE
+gap.
+
+Final run: 535 vblanks, 538 GE lists, 133,652 commands, 22,850 vertices,
+38,772,104 pixels, five threads, zero dispatch misses, bad accesses or traps.
+Upstream tests passed 21/21. The synthetic LBN seek regression can be run with:
 
 ```powershell
 cmake --build build/s6-build --target test-lbn-seek
@@ -420,8 +449,9 @@ cmake --build build/s6-build --target test-lbn-seek
   reached yet.
 - Only `libtitle.prx` is integrated; the other game PRXs are not recompiled.
   The captured frame is the loading/title sprite, not a completed scene.
-- The LBN seek fix eliminates the 19 previously observed bad accesses, but the
-  next loading-to-title blocker is not yet identified.
+- The LBN seek fix eliminates the 19 previously observed bad accesses. The next
+  loading-to-title blocker is the sound stream at `0x00417004`, whose voice is
+  never registered in the sound voice table at `0x00417058`.
 - Audio is paced by the runtime but not played; controls are not implemented.
 - 272 VFPU + 16 `vcmov` instructions remain traps in the EBOOT corpus; none
   were reached by this run. The title corpus has 22 VFPU traps, also unreached.
@@ -432,7 +462,7 @@ cmake --build build/s6-build --target test-lbn-seek
 ## Repo contents
 
 Tracked: this README, `.gitignore`, `host.c`, `umd.c`, `fpl.c`, `font_prx.c`,
-`title_prx.c`, `scripts/relocate_prx.py`, `CMakeLists.txt`, and six small
-patches against the pinned psprecomp. `build/` (tool clone, generated C,
+`title_prx.c`, `scripts/relocate_prx.py`, `CMakeLists.txt`, `tests/lbn_seek.c`,
+and eight small patches against the pinned psprecomp. `build/` (tool clone, generated C,
 relocated ELF, objects, executable) and `private/` (decrypted EBOOT, ISO) are
 ignored.
