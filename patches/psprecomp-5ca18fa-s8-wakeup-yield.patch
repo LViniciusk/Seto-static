@@ -1,8 +1,28 @@
 diff --git a/src/hle/threadman.c b/src/hle/threadman.c
-index 4178541..f445d85 100644
+index 4178541..c12ee68 100644
 --- a/src/hle/threadman.c
 +++ b/src/hle/threadman.c
-@@ -1085,9 +1085,18 @@ static void hle_WakeupThread(void) {
+@@ -258,6 +258,9 @@ static uint64_t        g_baton_takes;      /* every acquisition, by anyone */
+ #endif
+ static uint64_t        g_handovers;        /* parks that handed the CPU over */
+ static uint64_t        g_handovers_expired;
++#if PSPRECOMP_REAL_THREADS
++static uint64_t        g_last_wake_yield;  /* host time of the last wakeup handover */
++#endif
+ 
+ /* Per host thread, so a nested park (an interrupt handler that waits) restores
+  * its outer nesting on the way back. */
+@@ -555,6 +558,9 @@ void psp_threadman_reset(void) {
+     g_wait_gaveup = 0;
+     g_handovers = 0;
+     g_handovers_expired = 0;
++#if PSPRECOMP_REAL_THREADS
++    g_last_wake_yield = 0;
++#endif
+     g_vtime_us = 0;
+     g_epoch_us = host_now_us();
+ 
+@@ -1085,9 +1091,17 @@ static void hle_WakeupThread(void) {
      /* One core: waking a higher-priority sleeper runs it before the waker.
       * The game's module loader relies on this as its yield -- it wakes the
       * caller, which then suspends the loader. Without the handover the loader
@@ -16,11 +36,10 @@ index 4178541..f445d85 100644
 +     * hardware the timer preempts them; here the wakeup must hand over, at
 +     * most once a millisecond so the call stays cheap. Without it the loop
 +     * starves the display thread and the title never leaves its load. */
-+    static uint64_t last_yield;
 +    uint64_t now = host_deadline_us();
 +    int preempt = g_tls_me && t->state != TH_SUSPENDED && !t->exited && !t->terminated &&
-+                  (t->priority < g_tls_me->priority || now - last_yield >= 1000);
-+    if (preempt) last_yield = now;
++                  (t->priority < g_tls_me->priority || now - g_last_wake_yield >= 1000);
++    if (preempt) g_last_wake_yield = now;
  #endif
      wake_thread(t);
  #if PSPRECOMP_REAL_THREADS

@@ -533,8 +533,10 @@ loop `0x006401E8`, calling `sceKernelWakeupThread` 48 million times on
 `user_main`. The runtime only handed the CPU over when the woken thread had
 higher priority, so the display thread starved: 370 vblanks in 45 s. A wakeup
 now also hands over for a live same/lower-priority target, at most once per
-millisecond. After the change, 5/5 runs held a normal rate (1,178–1,360 vblanks
-at 45 s, 0–1 wakeups) instead of the 2/5 starved runs before it.
+millisecond; its timestamp is reset with the scheduler. After the change, 5/5
+runs held a normal rate (1,178–1,360 vblanks at 45 s, 0–1 wakeups) instead of
+the 2/5 starved runs before it, and the five final 30 s title runs had zero bad
+accesses (874–1,842 vblanks).
 
 **Transition.** On START the game runs its own fade/wipe (`0x0064641C`,
 `0x00644768`): `build/s8-fade.ppm` shows the title being wiped. START reached
@@ -542,8 +544,17 @@ at 45 s, 0–1 wakeups) instead of the 2/5 starved runs before it.
 15 runs the handler kept running, consumed the pending animation (`0x126C6FE`)
 and reached the next-scene loading state (animation `32/32`); in the others the
 handler is not called again after the press, the pending animation stays `4`,
-and the title remains on the fade. The first divergence is therefore the
-handler selection after START (`0x00647164`), not the input path.
+and the title remains on the fade.
+
+The selection is now located: program 5 (`0x00642FBC`) calls the dispatcher
+`0x006470B4`, which indexes the pointer table `0x00666CA0` by the 16-bit counter
+`0x126C6FC` (index 1 → `0x00647128` → `0x00647164`; index 3 → `0x0064725C`,
+index 4 → `0x00647280`; 12 and above → `0x006472EC`). That counter is also the
+loading sequence's step (`0x00643120` increments it), so a press taken at step 3
+starts a transition handler that never completes, while the successful runs
+pressed at step 1. Pressing as soon as the host first observes step 1 still
+failed 4/5, because the first step 1 belongs to the loading sequence; the menu's
+active window has not been isolated, so no forcing was added.
 
 A successful run issues
 
@@ -562,9 +573,12 @@ scene is not reached and none of them was integrated. The host now names a
 dispatch budget; it is now opt-in (`SETO_DISPATCH_BUDGET=<calls>`), because the
 title's wait loop legitimately runs for a long time.
 
-**Integrity.** Zero dispatch misses, bad accesses or traps across the title and
-transition runs; upstream tests 21/21; LBN seek PASS; all eleven psprecomp
-patches apply to `5ca18fa` and the clean tree passes 21/21.
+**Integrity.** Zero dispatch misses and traps; five final 30 s title runs had
+zero bad accesses. One earlier 26 s run had 3 bad accesses at `0x3` from
+`0x08034644` after an `ehfile_queue` wait timeout; it predates the scheduler
+change and is an intermittent file-queue race, not addressed here. Upstream
+tests 21/21; LBN seek PASS; all eleven psprecomp patches apply to `5ca18fa` and
+the clean tree passes 21/21.
 
 To reproduce: run with `SETO_BRINGUP_CAP=95`, wait for the title, press Enter.
 A successful transition takes 55–70 s of host time; it is not yet reliable.
