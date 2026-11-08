@@ -96,8 +96,8 @@ static void on_budget(void) {
  * instead, so a hung first stage still names itself. */
 static DWORD WINAPI bringup_cap(LPVOID unused) {
     (void)unused;
-    Sleep(8000);
-    report("stopped by the 8 s bring-up cap");
+    Sleep(30000);
+    report("stopped by the 30 s bring-up cap");
     fflush(stderr);
     _Exit(5);
 }

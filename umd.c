@@ -70,9 +70,16 @@ static void hle_WaitDriveStatCB(void) {
     hle_WaitDriveStat();
 }
 
+/* WaitDriveStat never parks in this static-disc host, so there are no pending
+ * waits to cancel. In particular, cancellation must not deactivate the drive. */
+static void hle_CancelWaitDriveStat(void) {
+    psp_ret(0);
+}
+
 void psp_umd_register(void) {
     psp_hle_register(0xC6183D47, "sceUmdUser", "sceUmdActivate",       hle_Activate);
-    psp_hle_register(0x6AF9B50A, "sceUmdUser", "sceUmdDeactivate",     hle_Deactivate);
+    psp_hle_register(0xE83742BA, "sceUmdUser", "sceUmdDeactivate",     hle_Deactivate);
+    psp_hle_register(0x6AF9B50A, "sceUmdUser", "sceUmdCancelWaitDriveStat", hle_CancelWaitDriveStat);
     psp_hle_register(0x6B4A146C, "sceUmdUser", "sceUmdGetDriveStat",   hle_GetDriveStat);
     psp_hle_register(0x8EF08FCE, "sceUmdUser", "sceUmdWaitDriveStat",  hle_WaitDriveStat);
     psp_hle_register(0x4A9E5E29, "sceUmdUser", "sceUmdWaitDriveStatCB", hle_WaitDriveStatCB);

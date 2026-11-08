@@ -1,0 +1,117 @@
+diff --git a/src/hle/ge.c b/src/hle/ge.c
+index f8e9340..4990bdb 100644
+--- a/src/hle/ge.c
++++ b/src/hle/ge.c
+@@ -656,11 +656,11 @@ static void run_list(ge_queue *q) {
+             break;
+ 
+         case GE_JUMP:
+-            q->list = (q->base | (arg & 0xFFFFFC));
++            q->list = ((q->base | (arg & 0xFFFFFC)) + q->origin) & 0x0FFFFFFFu;
+             break;
+         case GE_CALL:
+             if (sp < GE_STACK) stack[sp++] = q->list;
+-            q->list = (q->base | (arg & 0xFFFFFC));
++            q->list = ((q->base | (arg & 0xFFFFFC)) + q->origin) & 0x0FFFFFFFu;
+             break;
+         case GE_RET:
+             if (sp > 0) q->list = stack[--sp];
+@@ -695,7 +695,7 @@ static void run_list(ge_queue *q) {
+ 
+         case GE_BASE:        q->base = (arg & 0xFF0000) << 8; break;
+         case GE_ORIGIN_ADDR: q->origin = q->list - 4; break;
+-        case GE_OFFSET_ADDR: q->base = arg << 8; break;
++        case GE_OFFSET_ADDR: q->origin = arg << 8; break;
+ 
+         case GE_VTYPE: g_ge.vtype = arg; break;
+         case GE_FBP:
+@@ -823,8 +823,8 @@ static void run_list(ge_queue *q) {
+         case GE_SFIX:  g_ds.blend_sfix = arg; break;
+         case GE_DFIX:  g_ds.blend_dfix = arg; break;
+ 
+-        case GE_VADDR: g_ge.vaddr = (q->base | (arg & 0xFFFFFF)); break;
+-        case GE_IADDR: g_ge.iaddr = (q->base | (arg & 0xFFFFFF)); break;
++        case GE_VADDR: g_ge.vaddr = ((q->base | arg) + q->origin) & 0x0FFFFFFFu; break;
++        case GE_IADDR: g_ge.iaddr = ((q->base | arg) + q->origin) & 0x0FFFFFFFu; break;
+ 
+         default:
+             if (light_cmd(cmd, arg)) break;
+diff --git a/tests/test_emit.c b/tests/test_emit.c
+index d81d961..80ab5b6 100644
+--- a/tests/test_emit.c
++++ b/tests/test_emit.c
+@@ -890,7 +890,34 @@ static void check_jump_runs_foreign_slot(void) {
+     }
+ }
+ 
++static void check_indirect_import_registration(void) {
++    const uint32_t stub[] = { 0x03E00008u, 0 };
++    uint32_t owners[] = { BASE, BASE };
++    uint32_t imports[] = { BASE, BASE + 8 };
++    a_func fn = {0};
++    fn.addr = fn.start = BASE;
++    fn.end = BASE + 8;
++    fn.insns = 2;
++    fn.has_return = 1;
++    a_analysis an;
++    hand_built(&an, owners, 2, &fn, 1, stub);
++    an.imports = imports;
++    an.nimports = 2;
++    char *src = emit_case(&an, "t_indirect_import");
++    free(src);
++    src = slurp("./t_indirect_import_register.c", NULL);
++    CHECK(src != NULL, "indirect import registration is readable");
++    if (src) {
++        expect_order(src, "psp_register(0x08804000u, psp_func_08804000);",
++                     "psp_register(0x08804000u, psp_import_08804000);",
++                     "psp_register(0x08804008u, psp_import_08804008);",
++                     "imports override raw stubs and include import-only entries");
++        free(src);
++    }
++}
++
+ int main(void) {
++    check_indirect_import_registration();
+     uint8_t code[sizeof CODE];
+     for (size_t i = 0; i < sizeof CODE / sizeof CODE[0]; i++) {
+         code[i * 4 + 0] = (uint8_t)(CODE[i]);
+diff --git a/tests/test_hle.c b/tests/test_hle.c
+index 3379ac2..c670f90 100644
+--- a/tests/test_hle.c
++++ b/tests/test_hle.c
+@@ -526,6 +526,20 @@ static void test_ge_display_list(void) {
+     CHECK(failed == 0, "100 finished lists enqueue without running out of slots: %d failed", failed);
+     CHECK(psp_ge_command_count() - lists_before == 600,
+           "all 100 lists ran: %llu commands", (unsigned long long)(psp_ge_command_count() - lists_before));
++
++    /* ORIGIN is the command's address; BASE and OFFSET are independent. */
++    psp_write32(LIST, 0x14000000u);                /* ORIGIN = LIST */
++    psp_write32(LIST + 4, 0x08000010u);           /* JUMP -> LIST + 16 */
++    psp_write32(LIST + 8, 0x04000063u);           /* skipped PRIM */
++    psp_write32(LIST + 16, 0x13000100u);          /* OFFSET = 0x10000 */
++    psp_write32(LIST + 20, 0x10080000u);          /* BASE = 0x08000000 */
++    psp_write32(LIST + 24, 0x08810040u);          /* JUMP -> LIST + 64 */
++    psp_write32(LIST + 64, 0x0F000000u);
++    before = psp_ge_command_count();
++    uint64_t bad_before = psp_mem_bad_access;
++    call(psp_nid("sceGeListEnQueue"), LIST, 0, 0, 0);
++    CHECK(psp_ge_command_count() - before == 6, "ORIGIN/OFFSET jumps reach FINISH in six commands");
++    CHECK(psp_mem_bad_access == bad_before, "relative jumps never read the unmapped low window");
+     CHECK(call(psp_nid("sceGeListUpdateStallAddr"), qid, LIST, 0, 0) == 0,
+           "moving the stall of a finished list is not an error");
+     CHECK(call(psp_nid("sceGeEdramGetAddr"), 0, 0, 0, 0) == PSP_VRAM_BASE,
+diff --git a/tools/allegrexrecomp/emit.c b/tools/allegrexrecomp/emit.c
+index ab6dd64..0bf4678 100644
+--- a/tools/allegrexrecomp/emit.c
++++ b/tools/allegrexrecomp/emit.c
+@@ -1461,6 +1461,10 @@ int a_emit(const a_analysis *an, const emit_opts *o) {
+     for (i = 0; i < c.nentries; i++)
+         fprintf(of.f, "    psp_register_label(0x%08Xu, psp_at_%08X);\n",
+                 c.entries[i], c.entries[i]);
++    /* A re-exported import is called indirectly too, not as its bare jr $ra. */
++    for (i = 0; i < an->nimports; i++)
++        fprintf(of.f, "    psp_register(0x%08Xu, psp_import_%08X);\n",
++                an->imports[i], an->imports[i]);
+     fprintf(of.f, "}\n");
+     COMMIT();
+ 

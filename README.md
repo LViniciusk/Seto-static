@@ -23,6 +23,13 @@ threads skipped the CPU baton. `_Thread_local` fixes it: the boot thread and
 `user_main` now alternate on separate host threads without the `psp_ra_is_jump`
 crash, and the game reaches `sceKernelLoadModule` (see [S4 results](#s4-results)).
 
+**S7 — title screen: PASS.** The EBOOT corpus is relocated into the PSP user
+RAM window, which fixes the sound engine's pointer/handle classification and
+lets the loading stream retire. The GE now applies `ORIGIN`/`OFFSET` to relative
+list addresses, indirect calls resolve re-exported imports to their real HLE
+thunks, and `sceUmdDeactivate` no longer aliases `sceUmdCancelWaitDriveStat`. The
+real title screen is reached and captured (see [S7 results](#s7-results--title-screen)).
+
 **S5 — sceFont_Library integration: PASS.** The 44,052-byte PRX is rebased to
 `0x08900000`, all 933 PSP relocations are applied offline, and the namespaced
 541-function corpus is linked with the EBOOT. Minimal ModuleMgr serves the real
@@ -64,12 +71,16 @@ git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-reloc-seeds.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s6-prx.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s7-lbn-seek.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s7-ge-callback.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s7-address-space.patch
 
 cmake -S build/psprecomp -B build/psprecomp-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build/psprecomp-build -j 8
 
 $tool  = "build/psprecomp-build/tools/allegrexrecomp/allegrexrecomp.exe"
-$eboot = "private/ULUS10136_EBOOT.elf"
+# The EBOOT is linked at 0; the host runs it in the PSP user RAM window, where
+# its static objects are pointers rather than the engine's packed handles.
+python scripts\relocate_prx.py private\ULUS10136_EBOOT.elf build\s7-eboot-reloc.elf --base 0x08000000
+$eboot = "build/s7-eboot-reloc.elf"
 & $tool info  $eboot
 & $tool cover $eboot
 & $tool funcs $eboot
@@ -77,7 +88,7 @@ New-Item -ItemType Directory -Force build/tagforce
 & $tool emit $eboot build/tagforce tagforce
 ```
 
-`emit` is deterministic: a second run reports `0 of 81 files changed`.
+`emit` is deterministic: a second run reports `0 of 82 files changed`.
 
 ### 2. Native host (S2–S5)
 
@@ -85,9 +96,9 @@ New-Item -ItemType Directory -Force build/tagforce
 cmake -S . -B build/s5-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build/s5-build -j 8
 # EBOOT only (S2–S4 behaviour):
-.\build\s5-build\Seto-static.exe private\ULUS10136_EBOOT.elf private\TF1.iso
+.\build\s5-build\Seto-static.exe build\s7-eboot-reloc.elf private\TF1.iso
 # S5: load the relocated PRX, register its corpus and bind the seven NIDs:
-.\build\s5-build\Seto-static.exe private\ULUS10136_EBOOT.elf private\TF1.iso `
+.\build\s5-build\Seto-static.exe build\s7-eboot-reloc.elf private\TF1.iso `
     build\s5-font-reloc.elf
 
 # names every guest file open/raw sector read and its mapped host path
@@ -390,7 +401,12 @@ cmake --build build/s6-build -j 8
     build\s5-font-reloc.elf build\s6-title-reloc.elf
 ```
 
-## S7 results — LBN seek, GE callbacks and the sound-stream blocker
+## S7 results — title screen
+
+The run reaches the real title menu. `build/s7-title.ppm` (and
+`build/s7-title.png`) is the game's own Yu-Gi-Oh! GX Tag Force screen with
+"PRESS START BUTTON"; the earlier S6 frame was the loading sprite. The fixes
+below are ordered by when they became the first unmet condition.
 
 ### LBN seek
 
@@ -420,38 +436,65 @@ finish interrupt, and a list stopped at its stall delivers nothing until
 no duplicate after completion, `END` alone, the argument/id, and register
 preservation. The game's finish handler ran 329 times in the instrumented run.
 
-### Remaining blocker
+### Module placement and the sound stream
 
-The title still does not advance. The title callback `0x00640034` enters the
-animation 0 handler `0x00643120`, requests animation 3, then runs the animation 2
-handler `0x00643250` and blocks in `0x006469A8`. That function waits for the
-sound stream queued at `0x00417004` to drain. The stream is pushed there by the
-sound sequence thread with state `+0x30 = 27` after `msd.ehp` loads (its async
-callback `0x0064AA0` ran).
+The title callback `0x00640034` enters the animation handlers and blocks in
+`0x006469A8`, which waits for the sound stream queued at `0x00417004` to drain.
+The stream is allocated, keyed on (`__sceSasSetVoice`/`__sceSasSetKeyOn` with a
+real sample at `0x00617488`) and reaches its natural end; the blocker was the
+queue *removal*. The cleanup path `0x005CA74` calls `0x005D72C` to classify its
+argument: a value with bit `0x20000000` is a packed handle, bit `0x10000000`
+selects the low 16 bits, a value below `0x08000000` is re-encoded through
+`0x005D6A8`, and anything else is already a pointer. With the EBOOT linked at 0,
+the stream object `0x00418F60` fell in the "encode" range, so the cleanup received
+a packed handle instead of the queue node, cleared the wrong slot and left the
+stream queued forever.
 
-The voice allocator `0x005B52C` is reached with the stream object (`a2 = 4`) and
-returns 1: its internal lookups `0x005A134`, `0x0059FE8` and `0x005A19C` return
-`0x00612660`, `0x00612540` and `0x006126D8`. So a voice slot is allocated in the
-sound bank.
+The EBOOT corpus is now relocated to `0x08000000` (`relocate_prx.py --base`),
+the PSP user RAM window. All of its static objects move with it
+(`0x00418F60` → `0x08418F60`), `0x005D72C` returns the pointer unchanged, the
+queue entry is found and removed, and `0x006469A8` releases. This is an address
+classification problem, not an audio one: no SAS HLE return was changed. The
+rebased corpus discovers 5,042 functions and compiles without errors.
 
-The `+0x50` area is not a pre-filled descriptor list: `0x005BB14` calls
-`0x005E4AC(object + 80, 4096)`, clearing a 4 KB scratch buffer. The real first
-condition is the active-stream table at `0x00417058`. It is an array of 32
-entries of 12 bytes; the sound thread's `0x0058820` loop reads the stream-object
-pointer from each entry and processes only the entries present. The table stays
-zero, so `0x005AF4C` sees no active entry and clears bit `0x100` of `+0x40`; no
-`__sceSasSetVoice`/`__sceSasSetKeyOn` for voice 4 (or 27) is reached. The stream
-stays only in the main queue at `0x00417004`, so the queue never drains.
+### GE relative addresses
 
-The capability lookup `0x005D6A8`/`0x005A1E0` returns 0 for the stream handle
-`0x1012621A`; that is a lead, but it is not proven to be the insertion condition.
-No audio code was changed: no runtime or HLE return was shown to produce the
-missing table entry, and the zeroed `+0x50` scratch buffer is normal.
+The rebase exposed a GE bug: the game's display lists use `ORIGIN` (the address
+of the command itself) and relative `JUMP`/`CALL` offsets, and the runtime added
+the 24-bit operand straight to `BASE`. A list at `0x080E9E28` therefore jumped to
+`0x00000178` and produced 214 million bad accesses in one run. `JUMP` and `CALL`
+now add `origin`; `VADDR`/`IADDR` do too; `OFFSET` (`0x13`) stores an origin
+offset instead of overwriting `BASE`. Addresses are masked to the 28-bit physical
+space. The regression in `tests/test_hle.c` walks an `ORIGIN` + `OFFSET` + `BASE`
+list and asserts six commands, `FINISH`, and zero bad accesses.
 
-Final run: 561 vblanks, 564 GE lists, 140,876 commands, 22,174 vertices,
-40,947,010 pixels, 283 finishes, five threads, zero dispatch misses, bad
-accesses or traps. Upstream tests passed 21/21. The synthetic LBN seek
-regression can be run with:
+### Indirect imports
+
+A re-exported import called through the EBOOT export table is an indirect
+dispatch target. The emitter registered function entries only, so the call landed
+on the raw `jr $ra` stub at `0x0806B1E4` and returned 0 for
+`sceGeEdramGetAddr`; the renderer initialized with a zero VRAM base. The emitter
+now registers every import thunk after the function entries, so it wins any
+collision (and import-only addresses such as the re-exports are covered too).
+`tests/test_emit.c` covers the precedence and an import-only entry.
+
+### UMD cancellation
+
+`sceUmdDeactivate` was bound to NID `0x6AF9B50A`, which is
+`sceUmdCancelWaitDriveStat`; the real deactivate is `0xE83742BA`
+(`0x6AF9B50A` is Cancel). The title loader calls cancel, so the runtime
+deactivated the drive, later reads returned `-1`, and the loader tore down before
+loading `title_menu/title_menu_e.ehp`. The NIDs are separated and cancel is a
+no-op (this host never parks a drive wait). With the drive kept active, the
+317 KB menu resource loads and the title menu renders.
+
+### Title frame
+
+Final run: 858 vblanks, 862 GE lists, 586,002 commands, 84,018 vertices,
+229,837,439 pixels, 860 finishes, five threads, zero dispatch misses, bad
+accesses or traps, 5,278,704 ISO bytes. A second independent 30-second run at 784
+vblanks produced the same title frame. The synthetic LBN seek regression can be
+run with:
 
 ```powershell
 cmake --build build/s6-build --target test-lbn-seek
@@ -464,14 +507,14 @@ cmake --build build/s6-build --target test-lbn-seek
   it uses defaults. `GetCharInfo`/`GetCharGlyphImage` and text rendering are not
   reached yet.
 - Only `libtitle.prx` is integrated; the other game PRXs are not recompiled.
-  The captured frame is the loading/title sprite, not a completed scene.
-- The LBN seek fix eliminates the 19 previously observed bad accesses. The next
-  loading-to-title blocker is the missing insertion of the stream object into the
-  active-stream table at `0x00417058`, before the SAS key-on. The `+0x50` scratch
-  buffer being zero is normal.
+  S7 reaches and holds the title menu, but there is no input, so the game does
+  not proceed past "PRESS START BUTTON".
+- The rebased corpus relocates the EBOOT into the PSP user RAM window. The host
+  refuses the unrelocated image instead of guessing its base.
 - Audio is paced by the runtime but not played; controls are not implemented.
-- 272 VFPU + 16 `vcmov` instructions remain traps in the EBOOT corpus; none
-  were reached by this run. The title corpus has 22 VFPU traps, also unreached.
+- 270 VFPU + 16 `vcmov` instructions remain traps in the rebased EBOOT corpus;
+  none were reached by this run. The title corpus has 22 VFPU traps, also
+  unreached.
 - 2,889 functions without `jr $ra` and 176 `scattered` functions remain discovery
   caveats; they did not affect the EBOOT run.
 - No window; the goal is the real code path, not play.
@@ -480,6 +523,6 @@ cmake --build build/s6-build --target test-lbn-seek
 
 Tracked: this README, `.gitignore`, `host.c`, `umd.c`, `fpl.c`, `font_prx.c`,
 `title_prx.c`, `scripts/relocate_prx.py`, `CMakeLists.txt`, `tests/lbn_seek.c`,
-and eight small patches against the pinned psprecomp. `build/` (tool clone, generated C,
+and nine small patches against the pinned psprecomp. `build/` (tool clone, generated C,
 relocated ELF, objects, executable) and `private/` (decrypted EBOOT, ISO) are
 ignored.
