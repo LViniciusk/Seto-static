@@ -29,6 +29,12 @@ interactive title menu (scene state 3) in 5/5 diagnostic runs. The menu itself
 needs a further selection, which is S9 (see
 [S8 results](#s8-results--title-input)).
 
+**S9.1 — live Win32 window: PASS.** A native 960 × 544 window presents the
+PSP front buffer at ~30 FPS with correct colours, orientation and 30:17
+letterboxing on resize. The existing input path still reaches START → fade →
+scene state 3 in 5/5 window runs (see
+[S9.1 results](#s91-results--live-win32-window)).
+
 **S7 — title screen: PASS.** The EBOOT corpus is relocated into the PSP user
 RAM window, which fixes the sound engine's pointer/handle classification and
 lets the loading stream retire. The GE now applies `ORIGIN`/`OFFSET` to relative
@@ -117,8 +123,10 @@ $env:SETO_BRINGUP_CAP = '30'
 $env:SETO_DISPATCH_BUDGET = '50000000'
 ```
 
-The host has no window; the keyboard is read from the global async key state.
-**Enter is START** (PSP `0x00000008`). Other buttons are not mapped yet.
+The host opens a native Win32 window that presents the live PSP framebuffer;
+set `SETO_NO_WINDOW=1` for a headless diagnostic run. The keyboard is read from
+the global async key state. **Enter is START** (PSP `0x00000008`); click the
+window and hold Enter until the fade starts. Other buttons are not mapped yet.
 
 Without `build/s5-font-reloc`, CMake configures the EBOOT-only host and reports
 the missing corpus; passing the third argument then fails with a clear message.
@@ -619,6 +627,92 @@ To reproduce: `SETO_BRINGUP_CAP=60` and `SETO_AUTO_START=1` (request at step 1,
 capture 2 s after scene state 3), or press Enter when the prompt is shown and
 hold until the fade starts. The fade reaches the title menu; the idle path
 reaches the `LoadModule` at vblank ≈ 2390.
+
+## S9.1 results — live Win32 window
+
+**Implementation.** `host_window.c` adds one presentation thread and a native
+window; the game, GE and scheduler are untouched. The thread creates a
+`WS_OVERLAPPEDWINDOW` with a 960 × 544 client area using `RegisterClassExW` /
+`CreateWindowExW`, runs a normal `GetMessageW` loop, and updates on a 33 ms
+`SetTimer` (~30 FPS). `WM_SIZE` only invalidates; `WM_PAINT` uses
+`StretchDIBits` into a 30:17 fit, centred with a black background; `WM_CLOSE` /
+`WM_DESTROY` kill the timer and exit the thread. The two 480 × 272 buffers and
+the `BITMAPINFO` are allocated once. `SETO_NO_WINDOW=1` skips the window.
+
+**Framebuffer.** `psp_display_read` returns the front buffer; the runtime
+documents that the game double-buffers, so reading it while the guest runs is
+the intended use. The presentation thread reads one snapshot per timer tick.
+The pixels are `0xAABBGGRR`; the top-down 32-bit `BI_RGB` DIB needs
+`0x00RRGGBB`, so red and blue are swapped once per frame. The window never
+writes guest memory or changes display state.
+
+**Visual validation.** The window showed the real Konami loading frame, the
+title artwork, `PRESS START BUTTON`, the text fading into the selection bar and
+the scene-state-3 title screen. Captures are in `build/s9-shot-4.png`,
+`build/s9-shot-8.png`, `build/s9-fade-00.png`, `build/s9-fade-03.png`,
+`build/s9-fade-04.png` and `build/s9-shot-12.png` (ignored, not committed).
+Resizing to 1200 × 500 and 400 × 400 produced letterboxed images with no
+distortion (`build/s9-wide.png`, `build/s9-small.png`); colours and vertical
+orientation were correct. Scene state 3 still renders the title artwork with
+the magenta/orange bar, not a visually distinct menu text; that is recorded,
+not changed here.
+
+**Functional validation (five window runs, `SETO_AUTO_START=1`, 20 s cap).**
+
+| Run | Window | START request | Scene state 3 | Bad accesses |
+|---:|---|---:|---:|---:|
+| 1 | 960 × 544 | vb 466 | vb 532 | 0 |
+| 2 | 960 × 544 | vb 463 | vb 521 | 3 (before START) |
+| 3 | 960 × 544 | vb 461 | vb 519 | 6 (before START) |
+| 4 | 960 × 544 | vb 442 | vb 505 | 3 (before START) |
+| 5 | 960 × 544 | vb 419 | vb 472 | 0 |
+
+All five reached scene state 3 through the original branch. A physical Enter
+hold produced one `input: START press`, one release and no repeated request.
+Closing the window destroyed the presentation thread; the process continued to
+the bring-up cap and reported normally.
+
+**Performance.** With the same 20 s cap, windowed runs progressed
+512–1074 vblanks and headless runs 520–778 (one headless run produced no
+report); the windowed process used about 11.8 s CPU at 15 s wall versus 3.6 s
+headless. The extra CPU is the 30 FPS read/convert/StretchDIBits thread, not a
+guest slowdown: the window does not alter timers or the scheduler, and
+windowed runs reached scene state 3 in 5/5. The vblank numbers are noisy because
+the focused window changes OS scheduling; no regression was observed in the
+game path.
+
+**Manual run.**
+
+```powershell
+cd C:\Users\Vinicius\Documents\Github\Seto-static
+
+# Build the current source (the generated corpora under build\ are reused).
+cmake -S . -B build\s9-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+cmake --build build\s9-build -j 8
+
+# Run with the real EBOOT, ISO and PRXs used in S5-S8.
+.\build\s9-build\Seto-static.exe `
+    build\s7-eboot-reloc.elf `
+    "C:\Users\Vinicius\Documents\Github\Seto\TF1.iso" `
+    build\s5-font-reloc.elf `
+    build\s6-title-reloc.elf
+
+# The window opens at 960 x 544. Click it and hold Enter until the fade starts.
+# Release Enter to re-arm a later press.
+
+# Optional: stop after 30 seconds and print the diagnostics.
+$env:SETO_BRINGUP_CAP = '30'
+
+# Optional: run without the window (headless diagnostics).
+$env:SETO_NO_WINDOW = '1'
+
+# Stop a run without a cap: Ctrl+C in this console, or from another PowerShell:
+Stop-Process -Name Seto-static
+```
+
+The generated `build\s7-eboot-reloc.elf`, `build\s5-font-reloc.elf` and
+`build\s6-title-reloc.elf` come from the Reproduce steps above and are ignored
+by Git. If they are missing, regenerate them first.
 
 ## Limitations
 
