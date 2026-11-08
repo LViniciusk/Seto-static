@@ -25,8 +25,11 @@
 /* The EBOOT's loader resolves libtitle.prx to this ISO extent before it calls
  * sceKernelLoadModule; the 0x38B12 size is the 232,210-byte ELF checked below. */
 #define TITLE_LBN_PATH  "disc0:/sce_lbn0x5e70_size0x38b12"
-#define EBOOT_INFO      0x0006B81Cu   /* modehsys module info, mapped at 0 */
-#define EBOOT_END       0x00631A80u
+/* The EBOOT corpus is relocated to 0x08000000 so the game's own pointers and
+ * hashed handles occupy the live RAM window instead of the low scratch area. */
+#define EBOOT_BASE      0x08000000u
+#define EBOOT_INFO      (EBOOT_BASE + 0x0006B81Cu)   /* modehsys module info */
+#define EBOOT_SIZE      0x00631A80u
 #define TITLE_MAX_EXP   1300
 
 static uint16_t rd16(const uint8_t *p) {
@@ -53,6 +56,12 @@ static int cmp_export(const void *a, const void *b) {
 /* Built from the EBOOT's .lib.ent table in guest memory. Only libehsys is
  * needed; the unnamed main-module entry is ignored. */
 static int build_exports(uint32_t info) {
+    if (info != EBOOT_INFO) {
+        fprintf(stderr, "title PRX: EBOOT corpus is not relocated to 0x08000000 "
+                        "(module info 0x%08X, expected 0x%08X); see README\n",
+                info, EBOOT_INFO);
+        return -1;
+    }
     char name[29];
     for (int i = 0; i < 28; i++) name[i] = (char)psp_read8(info + 4u + (uint32_t)i);
     name[28] = 0;
@@ -93,7 +102,8 @@ static int build_exports(uint32_t info) {
             for (uint16_t i = 0; i < nfunc; i++) {
                 uint32_t nid = psp_read32(table + (uint32_t)i * 4u);
                 uint32_t addr = psp_read32(table + (total + i) * 4u);
-                if (addr >= EBOOT_END || !psp_lookup(addr)) continue;
+                if (addr < EBOOT_BASE || addr >= EBOOT_BASE + EBOOT_SIZE ||
+                    !psp_lookup(addr)) continue;
                 if (g_nexports < TITLE_MAX_EXP) {
                     g_exports[g_nexports].nid = nid;
                     g_exports[g_nexports].addr = addr;
@@ -197,7 +207,7 @@ int psp_title_image_load(const char *path, uint32_t eboot_info) {
         return -1;
     }
     if (filesz > memsz || (uint64_t)off + filesz > (uint64_t)n ||
-        (uint64_t)vaddr + memsz > TITLE_END_MAX || vaddr < EBOOT_END) {
+        (uint64_t)vaddr + memsz > TITLE_END_MAX) {
         free(d);
         fprintf(stderr, "title PRX: segment outside the reserved window\n");
         return -1;
