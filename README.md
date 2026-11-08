@@ -78,6 +78,7 @@ git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s7-lbn-seek.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s7-ge-callback.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s7-address-space.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s8-input.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s8-wakeup-yield.patch
 
 cmake -S build/psprecomp -B build/psprecomp-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build/psprecomp-build -j 8
@@ -527,10 +528,24 @@ handler `0x00647164` read the pressed mask and saw `0x00000008`. The regression
 in `tests/test_hle.c` checks no buttons, centered sticks, START delivered by
 Peek, and release clearing it. Only START is mapped.
 
+**Scheduler yield.** In some runs the title callback stayed inside its frame
+loop `0x006401E8`, calling `sceKernelWakeupThread` 48 million times on
+`user_main`. The runtime only handed the CPU over when the woken thread had
+higher priority, so the display thread starved: 370 vblanks in 45 s. A wakeup
+now also hands over for a live same/lower-priority target, at most once per
+millisecond. After the change, 5/5 runs held a normal rate (1,178–1,360 vblanks
+at 45 s, 0–1 wakeups) instead of the 2/5 starved runs before it.
+
 **Transition.** On START the game runs its own fade/wipe (`0x0064641C`,
-`0x00644768`): `build/s8-fade.ppm` shows the title being wiped. It then leaves
-the title: one run reached the next-scene loading state (animation `32/32`) and
-issued
+`0x00644768`): `build/s8-fade.ppm` shows the title being wiped. START reached
+`0x00647164` in every run, but the transition is not reproducible yet: in 3 of
+15 runs the handler kept running, consumed the pending animation (`0x126C6FE`)
+and reached the next-scene loading state (animation `32/32`); in the others the
+handler is not called again after the press, the pending animation stays `4`,
+and the title remains on the fade. The first divergence is therefore the
+handler selection after START (`0x00647164`), not the input path.
+
+A successful run issues
 
 ```
 sceKernelLoadModule("disc0:/sce_lbn0x5c20_size0x1f6f2")
@@ -548,10 +563,11 @@ dispatch budget; it is now opt-in (`SETO_DISPATCH_BUDGET=<calls>`), because the
 title's wait loop legitimately runs for a long time.
 
 **Integrity.** Zero dispatch misses, bad accesses or traps across the title and
-transition runs; upstream tests 21/21; LBN seek PASS; all ten psprecomp patches
-apply to `5ca18fa` and the clean tree passes 21/21.
+transition runs; upstream tests 21/21; LBN seek PASS; all eleven psprecomp
+patches apply to `5ca18fa` and the clean tree passes 21/21.
 
-To reproduce: run with `SETO_BRINGUP_CAP=30`, wait for the title, press Enter.
+To reproduce: run with `SETO_BRINGUP_CAP=95`, wait for the title, press Enter.
+A successful transition takes 55–70 s of host time; it is not yet reliable.
 
 ## Limitations
 
@@ -559,9 +575,9 @@ To reproduce: run with `SETO_BRINGUP_CAP=30`, wait for the title, press Enter.
   it uses defaults. `GetCharInfo`/`GetCharGlyphImage` and text rendering are not
   reached yet.
 - Only `libtitle.prx` is integrated; the other game PRXs are not recompiled.
-  S8 accepts START and leaves the title, but the next scene needs
-  `modduel_mgr` plus `libduel_eng`, `libduel_draw`, `libdeck_swap` and
-  `libtutorial`, which are not integrated.
+  S8 accepts START, but the title-to-loading transition completes in only some
+  runs. A successful transition then needs `modduel_mgr` plus `libduel_eng`,
+  `libduel_draw`, `libdeck_swap` and `libtutorial`, which are not integrated.
 - The rebased corpus relocates the EBOOT into the PSP user RAM window. The host
   refuses the unrelocated image instead of guessing its base.
 - Audio is paced by the runtime but not played. Only START is mapped; D-Pad,
@@ -577,6 +593,6 @@ To reproduce: run with `SETO_BRINGUP_CAP=30`, wait for the title, press Enter.
 
 Tracked: this README, `.gitignore`, `host.c`, `umd.c`, `fpl.c`, `font_prx.c`,
 `title_prx.c`, `scripts/relocate_prx.py`, `CMakeLists.txt`, `tests/lbn_seek.c`,
-and ten small patches against the pinned psprecomp. `build/` (tool clone, generated C,
+and eleven small patches against the pinned psprecomp. `build/` (tool clone, generated C,
 relocated ELF, objects, executable) and `private/` (decrypted EBOOT, ISO) are
 ignored.

@@ -1,0 +1,26 @@
+diff --git a/src/hle/threadman.c b/src/hle/threadman.c
+index 4178541..f445d85 100644
+--- a/src/hle/threadman.c
++++ b/src/hle/threadman.c
+@@ -1085,9 +1085,18 @@ static void hle_WakeupThread(void) {
+     /* One core: waking a higher-priority sleeper runs it before the waker.
+      * The game's module loader relies on this as its yield -- it wakes the
+      * caller, which then suspends the loader. Without the handover the loader
+-     * spins and the caller never runs. */
+-    int preempt = g_tls_me && t != g_tls_me && t->priority < g_tls_me->priority
+-                  && t->state != TH_SUSPENDED && !t->exited && !t->terminated;
++     * spins and the caller never runs.
++     *
++     * Some guest loops also use a wakeup of their own thread as their only
++     * yield (libtitle's frame loop wakes user_main millions of times). On
++     * hardware the timer preempts them; here the wakeup must hand over, at
++     * most once a millisecond so the call stays cheap. Without it the loop
++     * starves the display thread and the title never leaves its load. */
++    static uint64_t last_yield;
++    uint64_t now = host_deadline_us();
++    int preempt = g_tls_me && t->state != TH_SUSPENDED && !t->exited && !t->terminated &&
++                  (t->priority < g_tls_me->priority || now - last_yield >= 1000);
++    if (preempt) last_yield = now;
+ #endif
+     wake_thread(t);
+ #if PSPRECOMP_REAL_THREADS
