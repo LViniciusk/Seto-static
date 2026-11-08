@@ -1,5 +1,5 @@
 diff --git a/src/hle/ge.c b/src/hle/ge.c
-index 69cf226..0a2940b 100644
+index 69cf226..f8e9340 100644
 --- a/src/hle/ge.c
 +++ b/src/hle/ge.c
 @@ -25,6 +25,7 @@
@@ -10,13 +10,14 @@ index 69cf226..0a2940b 100644
  #include "psprecomp/render.h"
  
  #include <math.h>
-@@ -128,11 +129,22 @@ typedef struct {
+@@ -128,11 +129,23 @@ typedef struct {
      uint32_t stall;     /* stop before this address; 0 means "no stall" */
      uint32_t base;      /* GE_BASE: high bits for addresses */
      uint32_t origin;
 +    uint32_t cbid;      /* callback registered with this list, or -1 */
      int      used;
      int      done;
++    int      finished;  /* reached FINISH (not just END) */
  } ge_queue;
  
 +/* PspGeCallbackData: signal_func, signal_arg, finish_func, finish_arg.
@@ -33,7 +34,7 @@ index 69cf226..0a2940b 100644
  static uint32_t g_next_id;
  
  static uint64_t g_unsupported;     /* vertices in a format we do not read */
-@@ -328,6 +340,7 @@ static struct {
+@@ -328,6 +341,7 @@ static struct {
  
  void psp_ge_reset(void) {
      memset(g_queue, 0, sizeof g_queue);
@@ -41,7 +42,7 @@ index 69cf226..0a2940b 100644
      memset(&g_ge, 0, sizeof g_ge);
      memset(&g_ds, 0, sizeof g_ds);
      memset(g_clut, 0, sizeof g_clut);
-@@ -583,6 +596,23 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -583,6 +597,23 @@ static void draw_prim(uint32_t type, uint32_t count) {
   * Taken literally, 0x88000 is main RAM: for a vaddr-0 module, its own code. */
  static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZE - 1)); }
  
@@ -65,7 +66,25 @@ index 69cf226..0a2940b 100644
  /* Walk a list until END/FINISH, the stall address, or a step budget.
   *
   * The budget is not paranoia: a list whose JUMP forms a cycle is a normal
-@@ -652,8 +682,7 @@ static void run_list(ge_queue *q) {
+@@ -642,18 +673,24 @@ static void run_list(ge_queue *q) {
+             break;
+ 
+         case GE_END:
++            /* END releases the queue but is not the finish interrupt; only
++             * FINISH raises the finish callback. */
++            q->done = 1;
++            q->finished = 0;
++            q->used = 0;
++            return;
+         case GE_FINISH:
+-            if (cmd == GE_FINISH) g_ge.finishes++;
++            g_ge.finishes++;
+             /* A finished list gives its slot back. Keeping it used meant the
+              * ninth enqueue failed, and WTF then dropped 3,870 of 3,885
+              * frames while running at full speed. */
+             q->done = 1;
++            q->finished = 1;
+             q->used = 0;
              return;
  
          case GE_SIGNAL:
@@ -75,7 +94,7 @@ index 69cf226..0a2940b 100644
              break;
  
          case GE_BASE:        q->base = (arg & 0xFF0000) << 8; break;
-@@ -822,6 +851,7 @@ static void enqueue(int head) {
+@@ -822,6 +859,7 @@ static void enqueue(int head) {
      q->id    = g_next_id++;
      q->list  = psp_arg(0) & ~3u;
      q->stall = psp_arg(1) & ~3u;
@@ -83,31 +102,31 @@ index 69cf226..0a2940b 100644
      q->used  = 1;
      (void)head;
  
-@@ -829,8 +859,10 @@ static void enqueue(int head) {
+@@ -829,8 +867,10 @@ static void enqueue(int head) {
       * returning, which is indistinguishable from the game's point of view
       * because every way it can observe progress -- ListSync, DrawSync -- then
       * reports completion. */
 +    uint32_t id = q->id, cbid = q->cbid;
      run_list(q);
 -    psp_ret(q->id);
-+    ge_deliver(1, cbid);
++    if (q->finished) ge_deliver(1, cbid);
 +    psp_ret(id);
  }
  
  static void hle_ListEnQueue(void)     { enqueue(0); }
-@@ -847,7 +879,10 @@ static void hle_ListUpdateStallAddr(void) {
+@@ -847,7 +887,10 @@ static void hle_ListUpdateStallAddr(void) {
          return;
      }
      q->stall = psp_arg(1) & ~3u;
 -    if (!q->done) run_list(q);          /* the new stall released more commands */
 +    if (!q->done) {
 +        run_list(q);                    /* the new stall released more commands */
-+        if (q->done) ge_deliver(1, q->cbid);
++        if (q->finished) ge_deliver(1, q->cbid);
 +    }
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -859,8 +894,27 @@ static void hle_DrawSync(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+@@ -859,8 +902,27 @@ static void hle_DrawSync(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
  static void hle_Break(void)    { psp_ret(SCE_KERNEL_ERROR_OK); }
  static void hle_Continue(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
  
@@ -138,10 +157,10 @@ index 69cf226..0a2940b 100644
  /* eDRAM is the GPU-visible VRAM window: 2 MB at 0x04000000. */
  static void hle_EdramGetAddr(void) { psp_ret(PSP_VRAM_BASE); }
 diff --git a/tests/test_hle.c b/tests/test_hle.c
-index b41d6ef..e65f8d5 100644
+index b41d6ef..3379ac2 100644
 --- a/tests/test_hle.c
 +++ b/tests/test_hle.c
-@@ -534,6 +534,50 @@ static void test_ge_display_list(void) {
+@@ -534,6 +534,70 @@ static void test_ge_display_list(void) {
            "eDRAM is 2 MB");
  }
  
@@ -183,6 +202,26 @@ index b41d6ef..e65f8d5 100644
 +    CHECK(psp_cpu.r[PSP_REG_S3] == 0x5A5A5A5A,
 +          "a GE callback does not disturb the caller's registers");
 +
++    /* A list that stops at its stall is not finished. Releasing the stall
++     * finishes it once; a second update must not deliver a duplicate. */
++    g_ge_cb_calls = 0;
++    uint32_t stalled = call(psp_nid("sceGeListEnQueue"), LIST, LIST, id, 0);
++    CHECK(stalled != 0, "stalled list enqueued, got 0x%08X", stalled);
++    CHECK(g_ge_cb_calls == 0, "a list stopped at its stall has not finished");
++    CHECK(call(psp_nid("sceGeListUpdateStallAddr"), stalled, 0, 0, 0) == 0,
++          "stall release succeeds");
++    CHECK(g_ge_cb_calls == 1, "the released list finishes once, got %u", g_ge_cb_calls);
++    CHECK(call(psp_nid("sceGeListUpdateStallAddr"), stalled, 0, 0, 0) == 0,
++          "updating a finished list is harmless");
++    CHECK(g_ge_cb_calls == 1, "a finished list does not finish twice");
++
++    /* END releases the queue but is not the finish interrupt. */
++    psp_write32(LIST + 0, (0x0Cu << 24));   /* END */
++    g_ge_cb_calls = 0;
++    call(psp_nid("sceGeListEnQueue"), LIST, 0, id, 0);
++    CHECK(g_ge_cb_calls == 0, "END alone does not raise the finish callback");
++
++    psp_write32(LIST + 0, (0x0Fu << 24));   /* FINISH for the unset check */
 +    CHECK(call(psp_nid("sceGeUnsetCallback"), id, 0, 0, 0) == 0, "unset succeeds");
 +    g_ge_cb_calls = 0;
 +    call(psp_nid("sceGeListEnQueue"), LIST, 0, id, 0);
@@ -192,7 +231,7 @@ index b41d6ef..e65f8d5 100644
  /* A list that jumps to itself must terminate rather than hang the host -- this
   * is a normal transient state while the CPU is still writing the list. */
  static void test_ge_infinite_list(void) {
-@@ -903,6 +947,7 @@ int main(void) {
+@@ -903,6 +967,7 @@ int main(void) {
      test_vpl();
      test_guest_strings();
      test_ge_display_list();

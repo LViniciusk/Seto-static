@@ -411,13 +411,14 @@ and passes the returned id to `sceGeListEnQueue`. The runtime returned 0 from
 finish handler is what retires its render queue. The runtime now implements
 `sceGeSetCallback`/`sceGeUnsetCallback` with the PSP `PspGeCallbackData` layout
 (`signal_func`, `signal_arg`, `finish_func`, `finish_arg`), stores the id on the
-queue, and delivers the signal and finish callbacks with the id and the
-registered argument while preserving the caller's registers. A list that
-finishes after a later `sceGeListUpdateStallAddr` delivers exactly once. The
-new regression in `tests/test_hle.c` registers a finish callback, enqueues a
-`FINISH` list, checks the id, argument and register preservation, then unsets
-the callback and checks it is not called. The game called the finish callback
-329 times in the measured run.
+queue, and delivers the signal callback with the id and the registered argument
+while preserving the caller's registers. The finish callback is delivered only
+when the list reaches `FINISH`: `END` releases the queue without raising the
+finish interrupt, and a list stopped at its stall delivers nothing until
+`sceGeListUpdateStallAddr` releases it, exactly once. The new regression in
+`tests/test_hle.c` covers the normal finish, a stalled list released later,
+no duplicate after completion, `END` alone, the argument/id, and register
+preservation. The game's finish handler ran 329 times in the instrumented run.
 
 ### Remaining blocker
 
@@ -426,16 +427,25 @@ animation 0 handler `0x00643120`, requests animation 3, then runs the animation 
 handler `0x00643250` and blocks in `0x006469A8`. That function waits for the
 sound stream queued at `0x00417004` to drain. The stream is pushed there by the
 sound sequence thread with state `+0x30 = 27` after `msd.ehp` loads (its async
-callback `0x0064AA0` ran), but no voice is registered in the sound voice table
-at `0x00417058`. The stream therefore never starts and never retires. A
-20-second run keeps the animation state at `2/3` and the stream positions at
-`1/1`; the frame remains the loading sprite. This is the first concrete
-blocker; the sound engine's voice allocation is a subsystem, not a one-call HLE
-gap.
+callback `0x0064AA0` ran).
 
-Final run: 535 vblanks, 538 GE lists, 133,652 commands, 22,850 vertices,
-38,772,104 pixels, five threads, zero dispatch misses, bad accesses or traps.
-Upstream tests passed 21/21. The synthetic LBN seek regression can be run with:
+The voice allocator `0x005B52C` is reached with the stream object (`a2 = 4`) and
+returns 1: its internal lookups `0x005A134`, `0x0059FE8` and `0x005A19C` return
+`0x00612660`, `0x00612540` and `0x006126D8`. So a voice is allocated in the
+sound bank. The missing step is later: the stream's voice-descriptor array at
+`+0x50` is empty (the initializer writes zeros there), so `0x005AF4C` clears bit
+`0x100` of `+0x40`, the active-voice table at `0x00417058` keeps slot 4 at zero,
+and no `__sceSasSetVoice`/`__sceSasSetKeyOn` for voice 4 (or 27) is reached. The
+stream positions stay `1/1`; a 20-second run keeps the animation state at `2/3`
+and the frame is the loading sprite. The absence of a voice in `0x00417058` is
+therefore a symptom, not the cause: the first condition is the empty descriptor
+array at `+0x50` / the missing key-on in the game's stream setup. That setup is
+a sound-engine subsystem, not a one-call HLE gap.
+
+Final run: 561 vblanks, 564 GE lists, 140,876 commands, 22,174 vertices,
+40,947,010 pixels, 283 finishes, five threads, zero dispatch misses, bad
+accesses or traps. Upstream tests passed 21/21. The synthetic LBN seek
+regression can be run with:
 
 ```powershell
 cmake --build build/s6-build --target test-lbn-seek
@@ -450,8 +460,8 @@ cmake --build build/s6-build --target test-lbn-seek
 - Only `libtitle.prx` is integrated; the other game PRXs are not recompiled.
   The captured frame is the loading/title sprite, not a completed scene.
 - The LBN seek fix eliminates the 19 previously observed bad accesses. The next
-  loading-to-title blocker is the sound stream at `0x00417004`, whose voice is
-  never registered in the sound voice table at `0x00417058`.
+  loading-to-title blocker is the empty voice-descriptor array at object `+0x50`
+  in the sound stream at `0x00417004`, before any SAS key-on.
 - Audio is paced by the runtime but not played; controls are not implemented.
 - 272 VFPU + 16 `vcmov` instructions remain traps in the EBOOT corpus; none
   were reached by this run. The title corpus has 22 VFPU traps, also unreached.
