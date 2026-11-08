@@ -93,11 +93,16 @@ static void on_budget(void) {
 
 /* A guest loop that never parks cannot reach the host's run loop, and the
  * dispatcher budget does not see direct calls. Report from a host thread
- * instead, so a hung first stage still names itself. */
+ * instead, so a hung first stage still names itself. The cap is opt-in:
+ * SETO_BRINGUP_CAP=<seconds> bounds the run; without it the game keeps running. */
+static unsigned g_cap_seconds;
+
 static DWORD WINAPI bringup_cap(LPVOID unused) {
     (void)unused;
-    Sleep(30000);
-    report("stopped by the 30 s bring-up cap");
+    Sleep(g_cap_seconds * 1000u);
+    char why[64];
+    snprintf(why, sizeof why, "stopped by the %u s bring-up cap", g_cap_seconds);
+    report(why);
     fflush(stderr);
     _Exit(5);
 }
@@ -185,7 +190,12 @@ int main(int argc, char **argv) {
     psp_set_miss_handler(on_miss);
     psp_dispatch_set_budget(DISPATCH_BUDGET, on_budget);
     psp_trace_watch(m.entry, on_entry);
-    CreateThread(NULL, 0, bringup_cap, NULL, 0, NULL);
+    const char *cap = getenv("SETO_BRINGUP_CAP");
+    if (cap && atoi(cap) > 0) {
+        g_cap_seconds = (unsigned)atoi(cap);
+        printf("bring-up cap %u s\n", g_cap_seconds);
+        CreateThread(NULL, 0, bringup_cap, NULL, 0, NULL);
+    }
 
     uint32_t r = psp_module_start(&m);
     printf("module_start returned 0x%08X\n", r);

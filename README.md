@@ -103,6 +103,8 @@ cmake --build build/s5-build -j 8
 
 # names every guest file open/raw sector read and its mapped host path
 $env:PSPRECOMP_TRACE_IO = '1'
+# optional: bound a bring-up run with a report after N seconds (unset = run on)
+$env:SETO_BRINGUP_CAP = '30'
 ```
 
 Without `build/s5-font-reloc`, CMake configures the EBOOT-only host and reports
@@ -490,11 +492,12 @@ no-op (this host never parks a drive wait). With the drive kept active, the
 
 ### Title frame
 
-Final run: 858 vblanks, 862 GE lists, 586,002 commands, 84,018 vertices,
-229,837,439 pixels, 860 finishes, five threads, zero dispatch misses, bad
-accesses or traps, 5,278,704 ISO bytes. A second independent 30-second run at 784
-vblanks produced the same title frame. The synthetic LBN seek regression can be
-run with:
+Final run (`SETO_BRINGUP_CAP=30`): 876 vblanks, 878 GE lists, 611,100 commands,
+85,924 vertices, 235,207,386 pixels, 877 finishes, five threads, zero dispatch
+misses, bad accesses or traps, 5,278,704 ISO bytes. A second independent 30-second
+run produced the same title frame. Without `SETO_BRINGUP_CAP` the host does not
+exit on its own; the cap is a diagnostic, not part of the game. The synthetic LBN
+seek regression can be run with:
 
 ```powershell
 cmake --build build/s6-build --target test-lbn-seek
