@@ -189,7 +189,7 @@ int psp_title_start_done(void) { return atomic_load(&g_start_done); }
 static void title_input_update(uint32_t addr) {
     (void)addr;
     int step = (short)psp_read16(0x0126C6FCu);
-    if (!atomic_load(&g_start_request) || step < 1) {
+    if (!atomic_load(&g_start_request) || atomic_load(&g_start_done) || step < 1) {
         if (g_pad_on) { psp_ctrl_set(0, 128, 128); g_pad_on = 0; }
         return;
     }

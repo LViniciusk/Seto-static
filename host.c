@@ -118,7 +118,7 @@ static DWORD WINAPI bringup_cap(LPVOID unused) {
 static DWORD WINAPI input_thread(LPVOID unused) {
     (void)unused;
     const char *auto_start = getenv("SETO_AUTO_START");
-    int sent = 0, held = 0;
+    int sent = 0, held = 0, timed_out = 0;
     DWORD press_ms = 0;
     while (!psp_exit_requested()) {
         /* libtitle accepts START at its PRESS START step: animation 5 owns the
@@ -159,6 +159,7 @@ static DWORD WINAPI input_thread(LPVOID unused) {
              * release clears the request. */
             if (down && !held) {
                 held = 1;
+                timed_out = 0;
                 press_ms = GetTickCount();
 #ifdef HAVE_TITLE_CORPUS
                 psp_title_start_request(1);
@@ -168,6 +169,7 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                 fprintf(stderr, "input: START press\n");
             } else if (!down && held) {
                 held = 0;
+                timed_out = 0;
 #ifdef HAVE_TITLE_CORPUS
                 psp_title_start_request(0);
 #else
@@ -176,8 +178,9 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                 fprintf(stderr, "input: START release\n");
             }
 #ifdef HAVE_TITLE_CORPUS
-            else if (held && !psp_title_start_done() &&
+            else if (held && !timed_out && !psp_title_start_done() &&
                      GetTickCount() - press_ms > 5000) {
+                timed_out = 1;
                 psp_title_start_request(0);
                 fprintf(stderr, "input: START timeout\n");
             }
