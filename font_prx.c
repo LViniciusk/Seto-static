@@ -244,6 +244,10 @@ static void hle_LoadModule(void) {
     }
 #endif
     if (!g_font_loaded || strcmp(path, FONT_LBN_PATH) != 0) {
+        /* A module the game loads at run time and this host does not carry.
+         * Naming it is the difference between "the scene is stuck" and why. */
+        static unsigned logged;
+        if (logged++ < 4) fprintf(stderr, "ModuleMgr: '%s' not integrated (ENOENT)\n", path);
         psp_ret(0x80010002u);          /* ENOENT */
         return;
     }

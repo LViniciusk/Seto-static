@@ -23,6 +23,12 @@ threads skipped the CPU baton. `_Thread_local` fixes it: the boot thread and
 `user_main` now alternate on separate host threads without the `psp_ra_is_jump`
 crash, and the game reaches `sceKernelLoadModule` (see [S4 results](#s4-results)).
 
+**S8 — title input: PASS.** A real Windows Enter reaches the recompiled title
+through `sceCtrlPeekBufferPositive`, runs the original fade and reaches the
+interactive title menu (scene state 3) in 5/5 diagnostic runs. The menu itself
+needs a further selection, which is S9 (see
+[S8 results](#s8-results--title-input)).
+
 **S7 — title screen: PASS.** The EBOOT corpus is relocated into the PSP user
 RAM window, which fixes the sound engine's pointer/handle classification and
 lets the loading stream retire. The GE now applies `ORIGIN`/`OFFSET` to relative
@@ -72,6 +78,8 @@ git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s6-prx.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s7-lbn-seek.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s7-ge-callback.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s7-address-space.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s8-input.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s8-wakeup-yield.patch
 
 cmake -S build/psprecomp -B build/psprecomp-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build/psprecomp-build -j 8
@@ -105,7 +113,12 @@ cmake --build build/s5-build -j 8
 $env:PSPRECOMP_TRACE_IO = '1'
 # optional: bound a bring-up run with a report after N seconds (unset = run on)
 $env:SETO_BRINGUP_CAP = '30'
+# optional: stop after N indirect dispatches (unset = no budget)
+$env:SETO_DISPATCH_BUDGET = '50000000'
 ```
+
+The host has no window; the keyboard is read from the global async key state.
+**Enter is START** (PSP `0x00000008`). Other buttons are not mapped yet.
 
 Without `build/s5-font-reloc`, CMake configures the EBOOT-only host and reports
 the missing corpus; passing the third argument then fails with a clear message.
@@ -504,17 +517,122 @@ cmake --build build/s6-build --target test-lbn-seek
 .\build\s6-build\test-lbn-seek.exe
 ```
 
+## S8 results — title input
+
+**Input path.** The host has no window, so a host thread samples
+`GetAsyncKeyState(VK_RETURN)` every 10 ms. One physical press sets one START
+request; release clears it. The title reads a one-frame press edge at
+`0x08101530`, and the EBOOT input update `0x08035AC8` clears that edge on its
+next run. If the title frame lands after the clear, the press is lost: a 250 ms
+pulse was missed in one of five runs (the dispatcher read step 2 with buttons 0
+while Peek had already seen START). The fix is to re-issue the pad edge from the
+guest's own input-update entry until the title's step reaches 3; the loop then
+stops. This is one logical press, not a held START. The request times out after
+5 s if the title never consumes it. The runtime's pad state is atomic
+(`_Atomic` buttons/sticks), and `sceCtrlPeekBufferPositive` (NID `0x3A622550`)
+shares the `ReadBufferPositive` writer. The menu-ready, request, done and
+scene-3 flags are `_Atomic`. The game polls Peek through the EBOOT pad wrapper
+`0x08035AC8`; at the title, the game's own handler `0x00647164` read the pressed
+mask and saw `0x00000008`. The regression in `tests/test_hle.c` checks no
+buttons, centered sticks, START delivered by Peek, and release clearing it.
+Only START is mapped.
+
+**Scheduler yield.** In some runs the title callback stayed inside its frame
+loop `0x006401E8`, calling `sceKernelWakeupThread` 48 million times on
+`user_main`. The runtime only handed the CPU over when the woken thread had
+higher priority, so the display thread starved: 370 vblanks in 45 s. A wakeup
+now also hands over for a live same/lower-priority target, at most once per
+millisecond; its timestamp is reset with the scheduler. After the change, 5/5
+runs held a normal rate (1,178–1,360 vblanks at 45 s, 0–1 wakeups) instead of
+the 2/5 starved runs before it, and the five final 30 s title runs had zero bad
+accesses (874–1,842 vblanks).
+
+**Transition.** On START the game runs its own fade/wipe (`0x0064641C`,
+`0x00644768`): `build/s8-fade.ppm` shows the title being wiped. The valid
+branch is `0x0064719C`: it sets the pending step at `0x126C6FE` to 4 and
+advances the dispatcher to step 3. Step 3 (`0x0064725C`) runs `0x00644768` for
+about 20 frames; when the fade completes it calls `0x006473E0`, copies the
+pending step (4) into `0x126C6FC`, and step 4 (`0x00647280`) runs the scene
+manager `0x00647468`. The scene state at `0x126CF6C` advances `0 → 1 → 2 → 3`
+and then stops at the title menu, which waits for a further button. The host
+only sends START, so this path reaches the menu and does not issue the
+`LoadModule`. The earlier "fade stops with pending 4" was the step 3→4 handoff:
+the pending value is consumed, and state 3 is the next screen, not a stalled
+fade.
+
+The selection is now located: the 40-entry table at `0x00666B28` is indexed by
+the animation id at `0x126C6F8`; entry 5 (`0x00642FBC`) owns the menu and calls
+the dispatcher `0x006470B4`. That dispatcher indexes the pointer table
+`0x00666CA0` by the 16-bit step at `0x126C6FC` (step 1 → `0x00647128` →
+`0x00647164`; step 2 → `0x00647164`; step 3 → `0x0064725C`; step 4 →
+`0x00647280`; 12 and above → `0x006472EC`).
+
+Without input the step cycles `0 → 1 → 2 → 0` around vblank 400; step 1 is the
+PRESS START window and step 0 is idle. With a START request the title enters the
+fade path above. The diagnostic sets the request at the guest's step-1 entry
+(`0x00647128`); the input-update watch `0x08035AC8` re-issues the pad edge until
+the title's step reaches 3. In five independent runs the request was published
+at vblank 412–449, and step 3 + scene state 3 were reached at vblank 474–509,
+**5/5**, with no `ModuleMgr` load. The request loop stops at step 3, so it cannot
+repeat at the menu.
+
+**Menu capture.** `build/s8-menu.ppm` is captured 2 s after scene state 3 in
+each diagnostic run. It shows the title artwork with the magenta/orange
+selection bar but no distinguishable menu text; the scene state 3 handler entry
+is the proof of the state. No artificial image is produced.
+
+The 250 ms blind pulse from the previous commit is gone: the EBOOT input update
+clears the one-frame edge at `0x08101530`, and a slow title frame could read it
+after the clear. The request loop is synchronized to the guest's own input
+update, not to host time.
+
+The idle/attract path times out at step 2 (the 990 timer), resets to step 0 and
+issues
+
+```
+sceKernelLoadModule("disc0:/sce_lbn0x5c20_size0x1f6f2")
+```
+
+which is `modduel_mgr` (128,754 bytes), at vblank ≈ 2390. That is the only path
+that reaches the call; it is not counted as a START transition. The module
+imports `libehsys` (1,245), `libduel_eng` (143), `libduel_draw` (38),
+`libdeck_swap` (3) and `libtutorial` (7), and reserves 11.6 MB of `.bss`. Only
+`libehsys` resolves here; the other four libraries are a duel subsystem that
+this host does not carry, so the next scene is not reached and none of them was
+integrated. The host now names a `LoadModule` path it cannot serve instead of
+failing silently.
+
+**Dispatch budget.** One normal 35 s title run ended on the old fixed 5,000,000
+dispatch budget; it is now opt-in (`SETO_DISPATCH_BUDGET=<calls>`), because the
+title's wait loop legitimately runs for a long time.
+
+**Integrity.** Zero dispatch misses and traps in the five diagnostic runs. Four
+had zero bad accesses; one had 3 at `0x3` from `0x08034644` **before** the START
+request, during the title load. That is the pre-existing `ehfile_queue` race,
+not caused by START and not blocking the transition. The same race appeared
+before START in earlier runs. A 6 s physical Enter test produced exactly one
+`input: START press`, one release, and scene state 3 with zero bad accesses.
+Upstream tests 21/21; LBN seek PASS; all eleven psprecomp patches apply to
+`5ca18fa` and the clean tree passes 21/21.
+
+To reproduce: `SETO_BRINGUP_CAP=60` and `SETO_AUTO_START=1` (request at step 1,
+capture 2 s after scene state 3), or press Enter when the prompt is shown and
+hold until the fade starts. The fade reaches the title menu; the idle path
+reaches the `LoadModule` at vblank ≈ 2390.
+
 ## Limitations
 
 - `sceReg` is not implemented: the font library's registry reads return 0 and
   it uses defaults. `GetCharInfo`/`GetCharGlyphImage` and text rendering are not
   reached yet.
 - Only `libtitle.prx` is integrated; the other game PRXs are not recompiled.
-  S7 reaches and holds the title menu, but there is no input, so the game does
-  not proceed past "PRESS START BUTTON".
+  S8 reaches the title menu; the `modduel_mgr` load is reached only by the idle
+  path. That module needs `libduel_eng`, `libduel_draw`, `libdeck_swap` and
+  `libtutorial`, which are not integrated.
 - The rebased corpus relocates the EBOOT into the PSP user RAM window. The host
   refuses the unrelocated image instead of guessing its base.
-- Audio is paced by the runtime but not played; controls are not implemented.
+- Audio is paced by the runtime but not played. Only START is mapped; D-Pad,
+  CROSS and CIRCLE are not.
 - 270 VFPU + 16 `vcmov` instructions remain traps in the rebased EBOOT corpus;
   none were reached by this run. The title corpus has 22 VFPU traps, also
   unreached.
@@ -526,6 +644,6 @@ cmake --build build/s6-build --target test-lbn-seek
 
 Tracked: this README, `.gitignore`, `host.c`, `umd.c`, `fpl.c`, `font_prx.c`,
 `title_prx.c`, `scripts/relocate_prx.py`, `CMakeLists.txt`, `tests/lbn_seek.c`,
-and nine small patches against the pinned psprecomp. `build/` (tool clone, generated C,
+and eleven small patches against the pinned psprecomp. `build/` (tool clone, generated C,
 relocated ELF, objects, executable) and `private/` (decrypted EBOOT, ISO) are
 ignored.
