@@ -539,22 +539,26 @@ the 2/5 starved runs before it, and the five final 30 s title runs had zero bad
 accesses (874–1,842 vblanks).
 
 **Transition.** On START the game runs its own fade/wipe (`0x0064641C`,
-`0x00644768`): `build/s8-fade.ppm` shows the title being wiped. START reached
-`0x00647164` in every run, but the transition is not reproducible yet: in 3 of
-15 runs the handler kept running, consumed the pending animation (`0x126C6FE`)
-and reached the next-scene loading state (animation `32/32`); in the others the
-handler is not called again after the press, the pending animation stays `4`,
-and the title remains on the fade.
+`0x00644768`): `build/s8-fade.ppm` shows the title being wiped. The input now
+arrives at the game's PRESS START window (below); the fade itself still stops in
+most runs, leaving the pending animation at `4`.
 
-The selection is now located: program 5 (`0x00642FBC`) calls the dispatcher
-`0x006470B4`, which indexes the pointer table `0x00666CA0` by the 16-bit counter
-`0x126C6FC` (index 1 → `0x00647128` → `0x00647164`; index 3 → `0x0064725C`,
-index 4 → `0x00647280`; 12 and above → `0x006472EC`). That counter is also the
-loading sequence's step (`0x00643120` increments it), so a press taken at step 3
-starts a transition handler that never completes, while the successful runs
-pressed at step 1. Pressing as soon as the host first observes step 1 still
-failed 4/5, because the first step 1 belongs to the loading sequence; the menu's
-active window has not been isolated, so no forcing was added.
+The selection is now located: the 40-entry table at `0x00666B28` is indexed by
+the animation id at `0x126C6F8`; entry 5 (`0x00642FBC`) owns the menu and calls
+the dispatcher `0x006470B4`. That dispatcher indexes the pointer table
+`0x00666CA0` by the 16-bit step at `0x126C6FC` (step 1 → `0x00647128` →
+`0x00647164`; step 2 → `0x00647164`; step 3 → `0x0064725C`; step 4 →
+`0x00647280`; 12 and above → `0x006472EC`).
+
+Without input the step cycles `0 → 1 → 2 → 0` around vblank 400. Steps 1–2 are
+the PRESS START window; step 0 is idle. The `SETO_AUTO_START` diagnostic source
+pulses START through `psp_ctrl_set` at the first step 1–2;
+the keyboard path is unchanged. The idle path (no valid press) reaches
+`modduel_mgr` in **5/5** runs at vblank ≈ 2400. A press in the 1–2 window starts
+the original fade, but in 3 of 5 runs the fade handler stops being called before
+the 990 timer, pending animation `4` is never consumed, and the idle path no
+longer reaches the load. The input is therefore delivered at the right window;
+the remaining fault is the continuity of the fade handler, not early input.
 
 A successful run issues
 

@@ -113,13 +113,34 @@ static DWORD WINAPI bringup_cap(LPVOID unused) {
 
 static DWORD WINAPI input_thread(LPVOID unused) {
     (void)unused;
-    int held = 0;
+    const char *auto_start = getenv("SETO_AUTO_START");
+    int sent = 0, held = 0;
     while (!psp_exit_requested()) {
-        int down = (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0;
-        if (down != held) {
-            held = down;
-            psp_ctrl_set(down ? PSP_CTRL_START : 0u, 128, 128);
-            fprintf(stderr, "input: START %s\n", down ? "down" : "up");
+        /* libtitle accepts START at its PRESS START step: animation 5 owns the
+         * frame and its step index (0x126C6FC) is 1. The same index occurs
+         * during the loading sequence, but then the animation is not 5. */
+        if (auto_start) {
+            if (!sent) {
+                int step = (int16_t)psp_read16(0x0126C6FCu);
+                if (psp_read16(0x0126C6F8u) == 5 && (step == 1 || step == 2)) {
+                    sent = 1;
+                    psp_ctrl_set(PSP_CTRL_START, 128, 128);
+                    fprintf(stderr, "input: auto START (anim 5, step %d, vb %llu)\n",
+                            step, (unsigned long long)psp_display_vblanks());
+                    Sleep(150);
+                    psp_ctrl_set(0, 128, 128);
+                } else {
+                    Sleep(1);
+                    continue;
+                }
+            }
+        } else {
+            int down = (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0;
+            if (down != held) {
+                held = down;
+                psp_ctrl_set(down ? PSP_CTRL_START : 0u, 128, 128);
+                fprintf(stderr, "input: START %s\n", down ? "down" : "up");
+            }
         }
         Sleep(10);
     }
