@@ -35,6 +35,12 @@ letterboxing on resize. The existing input path still reaches START → fade →
 scene state 3 in 5/5 window runs (see
 [S9.1 results](#s91-results--live-win32-window)).
 
+**S9.2 — title menu: PASS.** The scene state 3 handler uses D-pad Up/Down
+(`0x10`/`0x40`) to move the cursor and CROSS (`0x4000`) to confirm. With those
+controls, the original menu advances from cursor 1 to 0 and confirmation changes
+the scene state from 3 to 4, presenting the next scene, in 5/5 headless runs
+(see [S9.2 results](#s92-results--title-menu)).
+
 **S7 — title screen: PASS.** The EBOOT corpus is relocated into the PSP user
 RAM window, which fixes the sound engine's pointer/handle classification and
 lets the loading stream retire. The GE now applies `ORIGIN`/`OFFSET` to relative
@@ -125,8 +131,9 @@ $env:SETO_DISPATCH_BUDGET = '50000000'
 
 The host opens a native Win32 window that presents the live PSP framebuffer;
 set `SETO_NO_WINDOW=1` for a headless diagnostic run. The keyboard is read from
-the global async key state. **Enter is START** (PSP `0x00000008`); click the
-window and hold Enter until the fade starts. Other buttons are not mapped yet.
+the global async key state. **Enter is START** (PSP `0x00000008`), **Up/Down
+are the D-pad** (`0x10`/`0x40`) and **Z is CROSS** (`0x4000`). Click the window
+and hold Enter until the fade starts; at the title menu use Up/Down and Z.
 
 Without `build/s5-font-reloc`, CMake configures the EBOOT-only host and reports
 the missing corpus; passing the third argument then fails with a clear message.
@@ -698,7 +705,8 @@ cmake --build build\s9-build -j 8
     build\s6-title-reloc.elf
 
 # The window opens at 960 x 544. Click it and hold Enter until the fade starts.
-# Release Enter to re-arm a later press.
+# Release Enter to re-arm a later press. At the title menu use Up/Down to move
+# and Z (CROSS) to confirm.
 
 # Optional: stop after 30 seconds and print the diagnostics.
 $env:SETO_BRINGUP_CAP = '30'
@@ -713,6 +721,56 @@ Stop-Process -Name Seto-static
 The generated `build\s7-eboot-reloc.elf`, `build\s5-font-reloc.elf` and
 `build\s6-title-reloc.elf` come from the Reproduce steps above and are ignored
 by Git. If they are missing, regenerate them first.
+
+## S9.2 results — title menu
+
+**Handler.** The scene state 3 handler `0x00645084` reads the game pad through
+`0x00664014`: `+4` is the one-frame press edge. The confirm filter
+`0x006646F4` returns `0x4000` at this state, so the accepted confirm button is
+**CROSS**. With no edge it checks `0x10` (**UP**) and `0x40` (**DOWN**) to move
+the cursor at `0x126CFBC`; the option table is at `0x126CFA8` and the option
+count at `0x126CF74` is 2. Confirmation copies the selected value
+(`0x126CF71`) to `0x126CF6E` and advances the scene state. Both cursor positions
+(0 and 1) reach the same next scene state 4.
+
+**Controls and implementation.** Only UP, DOWN and CROSS are needed; left/right,
+CIRCLE and START-as-confirm are not. The window keyboard maps Up/Down to
+`0x10`/`0x40` and Z to `0x4000`; Enter remains START.
+
+- `title_prx.c`: the existing input-update watch `0x08035AC8` now also reads the
+  scene state (`0x126CF6C`) and cursor (`0x126CFBC`). A menu request toggles the
+  requested pad edge while the state is 3, using the same one-frame edge path as
+  START. START request/done handling is unchanged.
+- `host.c`: the diagnostic sends UP then CROSS through the same
+  `psp_title_menu_request` used by the keyboard. The real keyboard has one
+  request per press, an 800 ms bound, and does not repeat while held.
+- No guest state is written and the Win32 window is unchanged. All automated
+  runs use `SETO_NO_WINDOW=1`.
+
+**Validation (five independent headless runs).**
+
+| Run | START done | Scene 3 | UP cursor | CROSS | Final state | Bad accesses |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | vb 491 | yes | 1 → 0 | accepted | 4 | 3 (before START) |
+| 2 | vb 524 | yes | 1 → 0 | accepted | 4 | 0 |
+| 3 | vb 518 | yes | 1 → 0 | accepted | 4 | 0 |
+| 4 | vb 492 | yes | 1 → 0 | accepted | 4 | 0 |
+| 5 | vb 524 | yes | 1 → 0 | accepted | 4 | 0 |
+
+All five reached scene state 4; zero dispatch misses and zero traps. The one
+bad-access run logged the known `ehfile_queue` accesses at `0x3`/`0x08034644`
+before START, not during the selection. A physical keyboard test with no window
+also produced START press/release, UP cursor 1 → 0, Z CROSS, state 3 → 4 and
+zero bad accesses.
+
+**Progression.** The confirmation reaches scene state 4, phase 2. The first
+frame of the next scene is in `build/s92-after.ppm` (the character/arena view,
+dark because the transition is still fading in). `0x126F6FC` remains 0 and no
+`sceKernelLoadModule` is issued; `0x006475C0` (phase 2) is the next wait and is
+left for S9.3. The title menu still has no distinguishable text, but its cursor
+and confirmation are processed by the original code.
+
+**Integrity.** Upstream 21/21; LBN seek PASS; `git diff --check` clean.
 
 ## Limitations
 

@@ -33,6 +33,9 @@ int  psp_title_menu_ready(void);
 void psp_title_start_request(int on);
 int  psp_title_start_done(void);
 int  psp_title_scene3(void);
+int  psp_title_scene_state(void);
+int  psp_title_scene_cursor(void);
+void psp_title_menu_request(uint32_t mask);
 #endif
 
 /* The EBOOT's single PT_LOAD has memsz 0x631A80; .bss runs to there. */
@@ -116,11 +119,37 @@ static DWORD WINAPI bringup_cap(LPVOID unused) {
  * the rest of the pad is added when a scene asks for it. The thread ends with
  * the process (or when the game exits) and releases what it held. */
 #define PSP_CTRL_START 0x00000008u
+#define PSP_CTRL_UP    0x00000010u
+#define PSP_CTRL_DOWN  0x00000040u
+#define PSP_CTRL_CROSS 0x00004000u
+
+#ifdef HAVE_TITLE_CORPUS
+/* Send one menu button until the guest changes the observed cursor or scene
+ * state, or a short timeout expires. The title input update supplies the edge. */
+static void auto_menu(uint32_t mask, int by_cursor) {
+    const int c0 = psp_title_scene_cursor();
+    const int s0 = psp_title_scene_state();
+    psp_title_menu_request(mask);
+    for (int i = 0; i < 200; i++) {
+        const int c = psp_title_scene_cursor();
+        const int s = psp_title_scene_state();
+        if (s != s0 || (by_cursor && c != c0)) break;
+        Sleep(10);
+    }
+    psp_title_menu_request(0);
+    fprintf(stderr, "input: auto menu 0x%04X state %d->%d cursor %d->%d\n",
+            mask, s0, psp_title_scene_state(), c0, psp_title_scene_cursor());
+}
+#endif
 
 static DWORD WINAPI input_thread(LPVOID unused) {
     (void)unused;
     const char *auto_start = getenv("SETO_AUTO_START");
     int sent = 0, held = 0, timed_out = 0;
+    int held_up = 0, held_down = 0, held_cross = 0;
+    uint32_t menu_mask = 0;
+    int menu_cursor = 0, menu_state = 0;
+    DWORD menu_deadline = 0;
     DWORD press_ms = 0;
     while (!psp_exit_requested()) {
         /* libtitle accepts START at its PRESS START step: animation 5 owns the
@@ -143,9 +172,15 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                             psp_title_start_done(), psp_title_scene3(),
                             (unsigned long long)psp_display_vblanks());
                     if (psp_title_scene3()) {
-                        Sleep(2000);
-                        if (psp_display_capture("build/s8-menu.ppm") == 0)
-                            fprintf(stderr, "capture: build/s8-menu.ppm\n");
+                        fprintf(stderr, "input: auto scene3 cursor=%d state=%d\n",
+                                psp_title_scene_cursor(), psp_title_scene_state());
+                        auto_menu(PSP_CTRL_UP, 1);
+                        auto_menu(PSP_CTRL_CROSS, 0);
+                        fprintf(stderr, "input: auto menu result state=%d cursor=%d\n",
+                                psp_title_scene_state(), psp_title_scene_cursor());
+                        Sleep(1000);
+                        if (psp_display_capture("build/s92-after.ppm") == 0)
+                            fprintf(stderr, "capture: build/s92-after.ppm\n");
                     }
                 } else {
                     Sleep(1);
@@ -155,6 +190,57 @@ static DWORD WINAPI input_thread(LPVOID unused) {
         } else
 #endif
         {
+#ifdef HAVE_TITLE_CORPUS
+            const int state = psp_title_scene_state();
+            if (menu_mask) {
+                const int c = psp_title_scene_cursor();
+                const int s = psp_title_scene_state();
+                if (s != menu_state ||
+                    (menu_mask != PSP_CTRL_CROSS && c != menu_cursor) ||
+                    GetTickCount() > menu_deadline) {
+                    psp_title_menu_request(0);
+                    fprintf(stderr, "input: menu 0x%04X done state=%d cursor=%d\n",
+                            menu_mask, s, c);
+                    menu_mask = 0;
+                }
+            }
+            const int kup = (GetAsyncKeyState(VK_UP) & 0x8000) != 0;
+            const int kdown = (GetAsyncKeyState(VK_DOWN) & 0x8000) != 0;
+            const int kcross = (GetAsyncKeyState('Z') & 0x8000) != 0;
+            if (kup && !held_up) {
+                held_up = 1;
+                if (state == 3 && !menu_mask) {
+                    menu_mask = PSP_CTRL_UP;
+                    menu_cursor = psp_title_scene_cursor();
+                    menu_state = state;
+                    menu_deadline = GetTickCount() + 800;
+                    psp_title_menu_request(menu_mask);
+                    fprintf(stderr, "input: UP press\n");
+                }
+            } else if (!kup) held_up = 0;
+            if (kdown && !held_down) {
+                held_down = 1;
+                if (state == 3 && !menu_mask) {
+                    menu_mask = PSP_CTRL_DOWN;
+                    menu_cursor = psp_title_scene_cursor();
+                    menu_state = state;
+                    menu_deadline = GetTickCount() + 800;
+                    psp_title_menu_request(menu_mask);
+                    fprintf(stderr, "input: DOWN press\n");
+                }
+            } else if (!kdown) held_down = 0;
+            if (kcross && !held_cross) {
+                held_cross = 1;
+                if (state == 3 && !menu_mask) {
+                    menu_mask = PSP_CTRL_CROSS;
+                    menu_cursor = psp_title_scene_cursor();
+                    menu_state = state;
+                    menu_deadline = GetTickCount() + 800;
+                    psp_title_menu_request(menu_mask);
+                    fprintf(stderr, "input: CROSS press\n");
+                }
+            } else if (!kcross) held_cross = 0;
+#endif
             int down = (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0;
             /* One request per physical press. The title re-issues the pad edge
              * until its own step advances, so a slow frame cannot lose it;
