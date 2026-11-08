@@ -431,16 +431,22 @@ callback `0x0064AA0` ran).
 
 The voice allocator `0x005B52C` is reached with the stream object (`a2 = 4`) and
 returns 1: its internal lookups `0x005A134`, `0x0059FE8` and `0x005A19C` return
-`0x00612660`, `0x00612540` and `0x006126D8`. So a voice is allocated in the
-sound bank. The missing step is later: the stream's voice-descriptor array at
-`+0x50` is empty (the initializer writes zeros there), so `0x005AF4C` clears bit
-`0x100` of `+0x40`, the active-voice table at `0x00417058` keeps slot 4 at zero,
-and no `__sceSasSetVoice`/`__sceSasSetKeyOn` for voice 4 (or 27) is reached. The
-stream positions stay `1/1`; a 20-second run keeps the animation state at `2/3`
-and the frame is the loading sprite. The absence of a voice in `0x00417058` is
-therefore a symptom, not the cause: the first condition is the empty descriptor
-array at `+0x50` / the missing key-on in the game's stream setup. That setup is
-a sound-engine subsystem, not a one-call HLE gap.
+`0x00612660`, `0x00612540` and `0x006126D8`. So a voice slot is allocated in the
+sound bank.
+
+The `+0x50` area is not a pre-filled descriptor list: `0x005BB14` calls
+`0x005E4AC(object + 80, 4096)`, clearing a 4 KB scratch buffer. The real first
+condition is the active-stream table at `0x00417058`. It is an array of 32
+entries of 12 bytes; the sound thread's `0x0058820` loop reads the stream-object
+pointer from each entry and processes only the entries present. The table stays
+zero, so `0x005AF4C` sees no active entry and clears bit `0x100` of `+0x40`; no
+`__sceSasSetVoice`/`__sceSasSetKeyOn` for voice 4 (or 27) is reached. The stream
+stays only in the main queue at `0x00417004`, so the queue never drains.
+
+The capability lookup `0x005D6A8`/`0x005A1E0` returns 0 for the stream handle
+`0x1012621A`; that is a lead, but it is not proven to be the insertion condition.
+No audio code was changed: no runtime or HLE return was shown to produce the
+missing table entry, and the zeroed `+0x50` scratch buffer is normal.
 
 Final run: 561 vblanks, 564 GE lists, 140,876 commands, 22,174 vertices,
 40,947,010 pixels, 283 finishes, five threads, zero dispatch misses, bad
@@ -460,8 +466,9 @@ cmake --build build/s6-build --target test-lbn-seek
 - Only `libtitle.prx` is integrated; the other game PRXs are not recompiled.
   The captured frame is the loading/title sprite, not a completed scene.
 - The LBN seek fix eliminates the 19 previously observed bad accesses. The next
-  loading-to-title blocker is the empty voice-descriptor array at object `+0x50`
-  in the sound stream at `0x00417004`, before any SAS key-on.
+  loading-to-title blocker is the missing insertion of the stream object into the
+  active-stream table at `0x00417058`, before the SAS key-on. The `+0x50` scratch
+  buffer being zero is normal.
 - Audio is paced by the runtime but not played; controls are not implemented.
 - 272 VFPU + 16 `vcmov` instructions remain traps in the EBOOT corpus; none
   were reached by this run. The title corpus has 22 VFPU traps, also unreached.
