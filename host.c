@@ -27,6 +27,7 @@ void font_psp_recomp_register(void);   /* relocated PRX corpus */
 #endif
 #ifdef HAVE_TITLE_CORPUS
 int  psp_title_image_load(const char *path, uint32_t eboot_info);
+int  psp_title_menu_ready(void);
 #endif
 
 /* The EBOOT's single PT_LOAD has memsz 0x631A80; .bss runs to there. */
@@ -119,22 +120,24 @@ static DWORD WINAPI input_thread(LPVOID unused) {
         /* libtitle accepts START at its PRESS START step: animation 5 owns the
          * frame and its step index (0x126C6FC) is 1. The same index occurs
          * during the loading sequence, but then the animation is not 5. */
+#ifdef HAVE_TITLE_CORPUS
         if (auto_start) {
             if (!sent) {
-                int step = (int16_t)psp_read16(0x0126C6FCu);
-                if (psp_read16(0x0126C6F8u) == 5 && (step == 1 || step == 2)) {
+                if (psp_title_menu_ready()) {
                     sent = 1;
                     psp_ctrl_set(PSP_CTRL_START, 128, 128);
-                    fprintf(stderr, "input: auto START (anim 5, step %d, vb %llu)\n",
-                            step, (unsigned long long)psp_display_vblanks());
-                    Sleep(150);
+                    fprintf(stderr, "input: auto START (vb %llu)\n",
+                            (unsigned long long)psp_display_vblanks());
+                    Sleep(15);
                     psp_ctrl_set(0, 128, 128);
                 } else {
                     Sleep(1);
                     continue;
                 }
             }
-        } else {
+        } else
+#endif
+        {
             int down = (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0;
             if (down != held) {
                 held = down;

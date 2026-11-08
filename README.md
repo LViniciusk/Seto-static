@@ -539,9 +539,13 @@ the 2/5 starved runs before it, and the five final 30 s title runs had zero bad
 accesses (874–1,842 vblanks).
 
 **Transition.** On START the game runs its own fade/wipe (`0x0064641C`,
-`0x00644768`): `build/s8-fade.ppm` shows the title being wiped. The input now
-arrives at the game's PRESS START window (below); the fade itself still stops in
-most runs, leaving the pending animation at `4`.
+`0x00644768`): `build/s8-fade.ppm` shows the title being wiped. A **single
+START sample at step 1** keeps the step at 2 (the fade) until it completes, then
+step 0 and `modduel_mgr` follow. A press held across the next frame is seen
+again at step 2, advances the step to 3/4 (`0x0064725C`/`0x00647280`) and stalls
+there; that was the earlier instability, not early input. The diagnostic source
+therefore pulses START for one sample (~15 ms) from the guest's own step-1 entry
+(`0x00647128`), and the input thread no longer reads guest memory.
 
 The selection is now located: the 40-entry table at `0x00666B28` is indexed by
 the animation id at `0x126C6F8`; entry 5 (`0x00642FBC`) owns the menu and calls
@@ -550,15 +554,14 @@ the dispatcher `0x006470B4`. That dispatcher indexes the pointer table
 `0x00647164`; step 2 → `0x00647164`; step 3 → `0x0064725C`; step 4 →
 `0x00647280`; 12 and above → `0x006472EC`).
 
-Without input the step cycles `0 → 1 → 2 → 0` around vblank 400. Steps 1–2 are
-the PRESS START window; step 0 is idle. The `SETO_AUTO_START` diagnostic source
-pulses START through `psp_ctrl_set` at the first step 1–2;
-the keyboard path is unchanged. The idle path (no valid press) reaches
-`modduel_mgr` in **5/5** runs at vblank ≈ 2400. A press in the 1–2 window starts
-the original fade, but in 3 of 5 runs the fade handler stops being called before
-the 990 timer, pending animation `4` is never consumed, and the idle path no
-longer reaches the load. The input is therefore delivered at the right window;
-the remaining fault is the continuity of the fade handler, not early input.
+Without input the step cycles `0 → 1 → 2 → 0` around vblank 400; step 1 is the
+PRESS START window and step 0 is idle. With one 15 ms START sample at step 1,
+all five measured runs kept step 2 (the fade) from vblank ~430 to ~2350, then
+returned to step 0 and issued the `LoadModule` at vblank ~2390; none derailed.
+The idle path reaches the same call at the same vblank, so the load is gated by
+the title's own timer; the START path differs in the fade it runs, not in the
+time of the load. The keyboard path is unchanged; a held key can still be seen
+at step 2 and derail, which is the game's own two-step script.
 
 A successful run issues
 
@@ -577,15 +580,15 @@ scene is not reached and none of them was integrated. The host now names a
 dispatch budget; it is now opt-in (`SETO_DISPATCH_BUDGET=<calls>`), because the
 title's wait loop legitimately runs for a long time.
 
-**Integrity.** Zero dispatch misses and traps; five final 30 s title runs had
-zero bad accesses. One earlier 26 s run had 3 bad accesses at `0x3` from
-`0x08034644` after an `ehfile_queue` wait timeout; it predates the scheduler
-change and is an intermittent file-queue race, not addressed here. Upstream
-tests 21/21; LBN seek PASS; all eleven psprecomp patches apply to `5ca18fa` and
-the clean tree passes 21/21.
+**Integrity.** Zero dispatch misses and traps. Of the five START runs, four had
+zero bad accesses; one had 3 at `0x3` from `0x08034644` after an `ehfile_queue`
+wait timeout. That race predates the transition work, also appears in unpressed
+runs, and is recorded but not addressed. Upstream tests 21/21; LBN seek PASS;
+all eleven psprecomp patches apply to `5ca18fa` and the clean tree passes 21/21.
 
-To reproduce: run with `SETO_BRINGUP_CAP=95`, wait for the title, press Enter.
-A successful transition takes 55–70 s of host time; it is not yet reliable.
+To reproduce: `SETO_BRINGUP_CAP=95` and `SETO_AUTO_START=1` (diagnostic single
+sample at step 1), or press Enter when the prompt is fully shown. The load
+follows at vblank ≈ 2390.
 
 ## Limitations
 
@@ -593,9 +596,10 @@ A successful transition takes 55–70 s of host time; it is not yet reliable.
   it uses defaults. `GetCharInfo`/`GetCharGlyphImage` and text rendering are not
   reached yet.
 - Only `libtitle.prx` is integrated; the other game PRXs are not recompiled.
-  S8 accepts START, but the title-to-loading transition completes in only some
-  runs. A successful transition then needs `modduel_mgr` plus `libduel_eng`,
+  S8 reaches the `modduel_mgr` load; that module needs `libduel_eng`,
   `libduel_draw`, `libdeck_swap` and `libtutorial`, which are not integrated.
+  The load is gated by the title's own timer, so it lands at the same vblank
+  with or without START.
 - The rebased corpus relocates the EBOOT into the PSP user RAM window. The host
   refuses the unrelocated image instead of guessing its base.
 - Audio is paced by the runtime but not played. Only START is mapped; D-Pad,

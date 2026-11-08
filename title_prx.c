@@ -157,8 +157,20 @@ static void title_entered(uint32_t addr) {
     fprintf(stderr, "title: entered recompiled function 0x%08X (module_start)\n", addr);
 }
 
+/* Set from the guest's own step-1 dispatcher entry, so the host never reads
+ * guest memory from its input thread. */
+static int g_menu_ready;
+
+int psp_title_menu_ready(void) { return g_menu_ready; }
+
+static void title_menu_ready(uint32_t addr) {
+    (void)addr;
+    g_menu_ready = 1;
+}
+
 static void title_callback_entered(uint32_t addr) {
     fprintf(stderr, "title: entered recompiled callback 0x%08X\n", addr);
+    psp_trace_watch(0x00647128u, title_menu_ready);
 }
 
 int psp_title_image_load(const char *path, uint32_t eboot_info) {
