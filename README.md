@@ -1060,6 +1060,15 @@ CROSS is the conversation button, not the command-menu button. The Talk/Duel/
 Item/PDA/Map menu therefore does not come from a raw pad bit handled by the
 field or by the four observed EBOOT pad consumers.
 
+**The map list is field-side.** `modfield`'s constructor
+(`psp_func_08C00038`) calls the EBOOT list API — wrapper `0x74E51EA4`
+(`0x0805504C`) and callback `0xF1BC43DB` (`0x08055044`) — with the text blob at
+`0x08C35E74` (`bg_XX [ROOM]` lines for the 22 travel rooms) and stores the
+returned list handle in its globals. That list is the travel/map destination
+list behind the Map option; it is not the 5-option Talk/Duel/Item/PDA/Map menu.
+The field module imports that helper only once, at init, so the command menu
+itself is still EBOOT/story UI.
+
 **Live tracing.** `SETO_TRACE_FIELD=1` logs the field state word
 (`0x093CDAFC`) on every change and every `story -> field` command dispatch
 (export `0x86220A06`). A headless story run shows the field cycling
