@@ -41,6 +41,9 @@ void psp_deck_prepare(const char *path, uint32_t eboot_info);
 #ifdef HAVE_DECKTUT_CORPUS
 int  psp_decktut_image_load(const char *path, uint32_t eboot_info);
 #endif
+#ifdef HAVE_DUEL_CORPUS
+int  psp_duel_images_load(const char *const *paths, uint32_t eboot_info);
+#endif
 #ifdef HAVE_TITLE_CORPUS
 int  psp_title_image_load(const char *path, uint32_t eboot_info);
 int  psp_title_menu_ready(void);
@@ -158,6 +161,33 @@ static int box_up(void) {
     return light * 4 > total * 3;
 }
 
+static int menu_panel(void) {
+    static uint32_t px[480 * 272];
+    if (psp_display_read(px) != 0) return 0;
+    int light = 0, total = 0;
+    for (int y = 40; y < 130; y += 6)
+        for (int x = 14; x < 92; x += 6) {
+            const uint32_t c = px[y * 480 + x];
+            if ((int)(c & 0xFF) > 150 && (int)((c >> 8) & 0xFF) > 140 &&
+                (int)((c >> 16) & 0xFF) > 110) light++;
+            total++;
+        }
+    return light * 2 > total;
+}
+
+/* Row of the orange highlight in the destination list, or -1. */
+static int menu_row(void) {
+    static uint32_t px[480 * 272];
+    if (psp_display_read(px) != 0) return -1;
+    for (int y = 34; y < 172; y++) {
+        const uint32_t c = px[y * 480 + 30];
+        const int r = (int)(c & 0xFF), g = (int)((c >> 8) & 0xFF),
+                  b = (int)((c >> 16) & 0xFF);
+        if (r > 235 && g > 145 && g < 205 && b < 125) return (y - 30) / 28;
+    }
+    return -1;
+}
+
 static void field_press(uint32_t mask) {
     psp_title_walk(mask, 128, 128);
     psp_ctrl_set(mask, 128, 128);
@@ -237,6 +267,8 @@ static DWORD WINAPI field_state_monitor(LPVOID unused) {
     return 0;
 }
 
+static volatile int g_input_done;
+
 static DWORD WINAPI input_thread(LPVOID unused) {
     (void)unused;
     const char *auto_start = getenv("SETO_AUTO_START");
@@ -280,16 +312,23 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                         if (psp_display_capture("build/s92-after.ppm") == 0)
                             fprintf(stderr, "capture: build/s92-after.ppm\n");
                         fprintf(stderr, "input: auto name advance\n");
-                        for (int i = 0; i < 80 && psp_title_scene_state() == 4 &&
+                        int last_state = psp_title_scene_state();
+                        for (int i = 0; i < 600 && psp_title_scene_state() == 4 &&
                                            !psp_story_started(); i++) {
-                            auto_press((i & 1) ? 0x00000008u : 0x00004000u);
-                            Sleep(300);
+                            auto_press(0x00004000u);
+                            Sleep(250);
+                            const int s = psp_title_scene_state();
+                            if (s != last_state) {
+                                fprintf(stderr, "input: auto state %d->%d phase=%d story=%d\n",
+                                        last_state, s, psp_title_scene_phase(),
+                                        psp_story_started());
+                                last_state = s;
+                            }
                         }
                         fprintf(stderr, "input: auto name dialog state=%d phase=%d cursor=%d story=%d\n",
                                 psp_title_scene_state(), psp_title_scene_phase(),
                                 psp_title_scene_cursor(), psp_story_started());
-                        int last_state = psp_title_scene_state();
-                        for (int i = 0; i < 150 && !psp_story_started(); i++) {
+                        for (int i = 0; i < 300 && !psp_story_started(); i++) {
                             Sleep(100);
                             const int s = psp_title_scene_state();
                             if (s != last_state) {
@@ -409,14 +448,43 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                     auto_press(0x00004000u);
                                     Sleep(2500);
                                     psp_display_capture("build/s93-map-cross.ppm");
-                                    /* Destination list: Main Gate is first,
-                                     * Classroom second. Go to the classroom. */
-                                    auto_press(0x00000040u);
-                                    Sleep(1200);
+                                    /* The list can open seconds after the map
+                                     * CROSS when that press lands in a fade.
+                                     * Wait for it, move the highlight to
+                                     * Classroom (row 1), then confirm. */
+                                    int list = menu_panel();
+                                    for (int t = 0; t < 8 && !list; t++) {
+                                        auto_press(0x00004000u);
+                                        Sleep(1200);
+                                        list = menu_panel();
+                                    }
+                                    fprintf(stderr, "input: travel list=%d row=%d\n",
+                                            list, menu_row());
+                                    for (int t = 0; t < 6; t++) {
+                                        const int row = menu_row();
+                                        if (row == 1) break;
+                                        if (row == 0) {
+                                            auto_press(0x00000040u);
+                                            Sleep(1200);
+                                        } else {
+                                            Sleep(1000);
+                                        }
+                                    }
                                     psp_display_capture("build/s93-travel-class.ppm");
-                                    auto_press(0x00004000u);
-                                    Sleep(4000);
-                                    psp_display_capture("build/s93-travel0.ppm");
+                                    fprintf(stderr, "input: travel row=%d\n", menu_row());
+                                    /* Confirm until the list closes; if it
+                                     * resets to Main Gate, move down again. */
+                                    for (int t = 0; t < 8 && menu_panel(); t++) {
+                                        auto_press(0x00004000u);
+                                        Sleep(2000);
+                                        if (menu_panel() && menu_row() == 0) {
+                                            auto_press(0x00000040u);
+                                            Sleep(1200);
+                                        }
+                                    }
+                                    psp_display_capture("build/s93-travel-confirm.ppm");
+                                    fprintf(stderr, "input: travel done list=%d\n",
+                                            menu_panel());
                                     for (int k = 0; k < 15; k++) {
                                         auto_press(0x00004000u);
                                         Sleep(1000);
@@ -424,6 +492,18 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                             char path[64];
                                             snprintf(path, sizeof path,
                                                      "build/s93-travel%d.ppm", k);
+                                            psp_display_capture(path);
+                                        }
+                                    }
+                                    /* Classroom: advance the story towards
+                                     * the first duel and watch ModuleMgr. */
+                                    for (int k = 0; k < 300; k++) {
+                                        auto_press(0x00004000u);
+                                        Sleep(800);
+                                        if (k % 25 == 24) {
+                                            char path[64];
+                                            snprintf(path, sizeof path,
+                                                     "build/s93-class%d.ppm", k + 1);
                                             psp_display_capture(path);
                                         }
                                     }
@@ -437,6 +517,7 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                             }
                             if (menu) {
                                 fprintf(stderr, "input: auto menu path done\n");
+                                g_input_done = 1;
                                 return 0;
                             }
                             static const struct { int ax, ay; const char *name; }
@@ -648,6 +729,7 @@ static DWORD WINAPI input_thread(LPVOID unused) {
         Sleep(10);
     }
     psp_ctrl_set(0, 128, 128);
+    g_input_done = 1;
     return 0;
 }
 
@@ -672,6 +754,12 @@ int main(int argc, char **argv) {
     const char *field = argc > 6 ? argv[6] : NULL;
     const char *deck = argc > 7 ? argv[7] : NULL;
     const char *decktut = argc > 8 ? argv[8] : NULL;
+    const char *duel_mgr = argc > 9 ? argv[9] : NULL;
+    const char *duel_eng = argc > 10 ? argv[10] : NULL;
+    const char *duel_draw = argc > 11 ? argv[11] : NULL;
+    const char *duel_swap = argc > 12 ? argv[12] : NULL;
+    const char *duel_tut = argc > 13 ? argv[13] : NULL;
+    const char *duel_rec = argc > 14 ? argv[14] : NULL;
     const int free_duel = getenv("SETO_FREE_DUEL") != NULL;
 
     if (psp_mem_init() != 0) { fprintf(stderr, "memory init failed\n"); return 1; }
@@ -758,6 +846,18 @@ int main(int argc, char **argv) {
         return 1;
     }
 #endif
+#ifdef HAVE_DUEL_CORPUS
+    {
+        const char *duel[6] = { duel_mgr, duel_eng, duel_draw,
+                                duel_swap, duel_tut, duel_rec };
+        if (psp_duel_images_load(duel, m.info) != 0) return 1;
+    }
+#else
+    if (duel_mgr || duel_eng || duel_draw || duel_swap || duel_tut || duel_rec) {
+        fprintf(stderr, "duel PRX: this build has no duel corpora (build/s9duel-*-reloc)\n");
+        return 1;
+    }
+#endif
 
     /* This EBOOT has no .ctors section. The upstream heuristic scans the last
      * 64 KB of the image for a run of pointers into that same window and here
@@ -811,11 +911,13 @@ int main(int argc, char **argv) {
     uint32_t r = psp_module_start(&m);
     printf("module_start returned 0x%08X\n", r);
 
-    /* If module_start returns, keep the scheduler turning for a bounded slice
-     * of real time before reporting. */
-    for (int i = 0; i < 5000 && !psp_exit_requested(); i++) {
+    /* Keep the scheduler turning until the scripted input finishes, then for a
+     * short grace slice so the last presses can request modules. */
+    int idle = 0;
+    while (!psp_exit_requested() && idle < 5000) {
         psp_threadman_yield();
         Sleep(1);
+        idle = g_input_done ? idle + 1 : 0;
     }
     seto_window_stop();
     report("run ended");

@@ -32,6 +32,10 @@ int psp_deck_start(uint32_t uid, uint32_t status_ptr);
 int psp_decktut_load_uid(const char *path, uint32_t *uid);
 int psp_decktut_start(uint32_t uid, uint32_t status_ptr);
 #endif
+#ifdef HAVE_DUEL_CORPUS
+int psp_duel_load_uid(const char *path, uint32_t *uid);
+int psp_duel_start(uint32_t uid, uint32_t status_ptr);
+#endif
 
 static uint16_t rd16(const uint8_t *p) {
     return (uint16_t)(p[0] | (p[1] << 8));
@@ -281,6 +285,13 @@ static void hle_LoadModule(void) {
         return;
     }
 #endif
+#ifdef HAVE_DUEL_CORPUS
+    uint32_t dueluid;
+    if (psp_duel_load_uid(path, &dueluid)) {
+        psp_ret(dueluid);
+        return;
+    }
+#endif
     if (!g_font_loaded || strcmp(path, FONT_LBN_PATH) != 0) {
         /* A module the game loads at run time and this host does not carry.
          * Naming it is the difference between "the scene is stuck" and why. */
@@ -308,6 +319,9 @@ static void hle_StartModule(void) {
 #endif
 #ifdef HAVE_DECKTUT_CORPUS
     if (psp_decktut_start(psp_arg(0), psp_arg(3))) return;
+#endif
+#ifdef HAVE_DUEL_CORPUS
+    if (psp_duel_start(psp_arg(0), psp_arg(3))) return;
 #endif
     if (psp_arg(0) != g_font_uid) {
         psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID);

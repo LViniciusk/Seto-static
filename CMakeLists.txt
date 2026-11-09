@@ -93,6 +93,70 @@ if(DECKTUT_SOURCES)
     target_link_libraries(decktutprx PRIVATE psprecomp)
 endif()
 
+# S9.9: the duel subsystem requested by the first scripted duel. modduel_mgr
+# imports libduel_eng/libduel_draw/libdeck_swap/libtutorial, so the six images
+# are loaded together into the low window.
+file(GLOB DUELMGR_SOURCES CONFIGURE_DEPENDS
+     ${CMAKE_CURRENT_SOURCE_DIR}/build/s9duel-mgr-reloc/*.c)
+file(GLOB DUELENG_SOURCES CONFIGURE_DEPENDS
+     ${CMAKE_CURRENT_SOURCE_DIR}/build/s9duel-eng-reloc/*.c)
+file(GLOB DUELDRAW_SOURCES CONFIGURE_DEPENDS
+     ${CMAKE_CURRENT_SOURCE_DIR}/build/s9duel-draw-reloc/*.c)
+file(GLOB DUELSWAP_SOURCES CONFIGURE_DEPENDS
+     ${CMAKE_CURRENT_SOURCE_DIR}/build/s9duel-swap-reloc/*.c)
+file(GLOB DUELTUT_SOURCES CONFIGURE_DEPENDS
+     ${CMAKE_CURRENT_SOURCE_DIR}/build/s9duel-tut-reloc/*.c)
+file(GLOB DUELREC_SOURCES CONFIGURE_DEPENDS
+     ${CMAKE_CURRENT_SOURCE_DIR}/build/s9duel-rec-reloc/*.c)
+if(DUELMGR_SOURCES)
+    add_library(duelmgrprx OBJECT ${DUELMGR_SOURCES})
+    target_compile_definitions(duelmgrprx PRIVATE
+        PSPRECOMP_NAMESPACE=duelmgr_ PSPRECOMP_TRACE
+        psp_hle_call=duel_import_forward)
+    target_include_directories(duelmgrprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s9duel-mgr-reloc)
+    target_link_libraries(duelmgrprx PRIVATE psprecomp)
+endif()
+if(DUELENG_SOURCES)
+    add_library(duelengprx OBJECT ${DUELENG_SOURCES})
+    target_compile_definitions(duelengprx PRIVATE
+        PSPRECOMP_NAMESPACE=dueleng_ PSPRECOMP_TRACE
+        psp_hle_call=duel_import_forward)
+    target_include_directories(duelengprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s9duel-eng-reloc)
+    target_link_libraries(duelengprx PRIVATE psprecomp)
+endif()
+if(DUELDRAW_SOURCES)
+    add_library(dueldrawprx OBJECT ${DUELDRAW_SOURCES})
+    target_compile_definitions(dueldrawprx PRIVATE
+        PSPRECOMP_NAMESPACE=dueldraw_ PSPRECOMP_TRACE
+        psp_hle_call=duel_import_forward)
+    target_include_directories(dueldrawprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s9duel-draw-reloc)
+    target_link_libraries(dueldrawprx PRIVATE psprecomp)
+endif()
+if(DUELSWAP_SOURCES)
+    add_library(duelswapprx OBJECT ${DUELSWAP_SOURCES})
+    target_compile_definitions(duelswapprx PRIVATE
+        PSPRECOMP_NAMESPACE=duelswap_ PSPRECOMP_TRACE
+        psp_hle_call=duel_import_forward)
+    target_include_directories(duelswapprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s9duel-swap-reloc)
+    target_link_libraries(duelswapprx PRIVATE psprecomp)
+endif()
+if(DUELTUT_SOURCES)
+    add_library(dueltutprx OBJECT ${DUELTUT_SOURCES})
+    target_compile_definitions(dueltutprx PRIVATE
+        PSPRECOMP_NAMESPACE=dueltut_ PSPRECOMP_TRACE
+        psp_hle_call=duel_import_forward)
+    target_include_directories(dueltutprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s9duel-tut-reloc)
+    target_link_libraries(dueltutprx PRIVATE psprecomp)
+endif()
+if(DUELREC_SOURCES)
+    add_library(duelrecprx OBJECT ${DUELREC_SOURCES})
+    target_compile_definitions(duelrecprx PRIVATE
+        PSPRECOMP_NAMESPACE=duelrec_ PSPRECOMP_TRACE
+        psp_hle_call=duel_import_forward)
+    target_include_directories(duelrecprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s9duel-rec-reloc)
+    target_link_libraries(duelrecprx PRIVATE psprecomp)
+endif()
+
 set(SETO_SOURCES host.c host_window.c umd.c fpl.c font_prx.c)
 if(TITLE_SOURCES)
     list(APPEND SETO_SOURCES title_prx.c)
@@ -108,6 +172,10 @@ if(DECK_SOURCES)
 endif()
 if(DECKTUT_SOURCES)
     list(APPEND SETO_SOURCES decktut_prx.c)
+endif()
+if(DUELMGR_SOURCES AND DUELENG_SOURCES AND DUELDRAW_SOURCES AND
+   DUELSWAP_SOURCES AND DUELTUT_SOURCES AND DUELREC_SOURCES)
+    list(APPEND SETO_SOURCES duel_prx.c)
 endif()
 add_executable(Seto-static ${SETO_SOURCES})
 if(FONT_SOURCES)
@@ -145,6 +213,16 @@ if(DECKTUT_SOURCES)
     target_compile_definitions(Seto-static PRIVATE HAVE_DECKTUT_CORPUS)
 else()
     message(STATUS "S9.7 deck tutorial corpus not found under build/s93-decktut-reloc; building without moddeck_tutorial")
+endif()
+if(DUELMGR_SOURCES AND DUELENG_SOURCES AND DUELDRAW_SOURCES AND
+   DUELSWAP_SOURCES AND DUELTUT_SOURCES AND DUELREC_SOURCES)
+    target_sources(Seto-static PRIVATE
+        $<TARGET_OBJECTS:duelmgrprx> $<TARGET_OBJECTS:duelengprx>
+        $<TARGET_OBJECTS:dueldrawprx> $<TARGET_OBJECTS:duelswapprx>
+        $<TARGET_OBJECTS:dueltutprx> $<TARGET_OBJECTS:duelrecprx>)
+    target_compile_definitions(Seto-static PRIVATE HAVE_DUEL_CORPUS)
+else()
+    message(STATUS "S9.9 duel corpora not found under build/s9duel-*-reloc; building without the duel subsystem")
 endif()
 target_link_libraries(Seto-static PRIVATE tagforce gdi32)
 
