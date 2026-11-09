@@ -48,6 +48,12 @@ the Story/Deck/Character List modules, and renders the Group List screen. A
 title-menu option for a duel has not yet been driven to a battle (see
 [S9.3 results](#s93-results--story-name-menu)).
 
+**S9.7 — office exit and moddeck_tutorial: PARTIAL.** The field Map option is
+the room exit (“Exit from this spot?” YES/NO). YES advances the story and once
+requested `libdeck_tutorial.prx` (LBN `0x5790`); the module is recompiled at
+`0x093E0000` and its image/exports load, but its start was not yet reproduced
+(see [S9.7 results](#s97-results--office-exit-and-moddeck_tutorial)).
+
 **S9.6 — field action menu: PASS (menu), PARTIAL (duel).** START opens the
 field Talk/Duel/Item/PDA/Map menu at the idle state; DOWN selects Duel and
 CROSS starts the pre-duel conversation. Following the exit hint and loading
@@ -979,6 +985,33 @@ is at the bottom right hand of this room.” (`build/s181-pduel25.ppm`).
 story (`0x08910000`), field (`0x08C00000`) and the 13.8 MB deck `.bss` do not
 fit the current RAM windows together, so the request fails with ENOENT. This is
 the next memory-layout blocker, not a missing game call.
+
+## S9.7 results — office exit and moddeck_tutorial
+
+**The Map option is the room exit.** With the field action menu open, choosing
+**Map** opens the dialog “Exit from this spot?” with **YES/NO**. Confirming YES
+continues the story (Sheppard: “He'll take over from there.”), and in one run
+the game then requested `libdeck_tutorial.prx` repeatedly:
+
+```text
+module: load 'disc0:/sce_lbn0x5790_size0x292fa'   (moddeck_tutorial)
+```
+
+**moddeck_tutorial integrated.** The 168,698-byte PRX is relocated to
+`0x093E0000` (memsz `0x20910`, only 8,256 bytes of `.bss`), which fits the gap
+between modfield and the heap. The corpus resolves its 1,245 libehsys imports
+from the EBOOT and loads the image:
+
+```text
+decktut PRX 0x093E0000..0x09400910 (8256 bytes .bss), gp 0x094068B0, 1245 EBOOT exports
+```
+
+The `module_start` has not been observed yet: the tutorial request did not
+reproduce in the following runs (the YES dialogue timing varies), so the loader
+is verified at image/export level only.
+
+**Next target.** Reproduce the tutorial request and start, then follow the
+story into the classroom and capture the duel PRX requests.
 
 **Module lifecycle.** Tracing ModuleMgr shows the game stops and unloads
 `libtitle` (UID `0x00070002`) immediately before it loads `libstory` and

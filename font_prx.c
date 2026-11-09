@@ -29,6 +29,8 @@ int psp_field_load_uid(const char *path, uint32_t *uid);
 int psp_field_start(uint32_t uid, uint32_t status_ptr);
 int psp_deck_load_uid(const char *path, uint32_t *uid);
 int psp_deck_start(uint32_t uid, uint32_t status_ptr);
+int psp_decktut_load_uid(const char *path, uint32_t *uid);
+int psp_decktut_start(uint32_t uid, uint32_t status_ptr);
 #endif
 
 static uint16_t rd16(const uint8_t *p) {
@@ -242,6 +244,8 @@ static void font_char_glyph(void)   { font_call(0x980F4895u); }
 static void hle_LoadModule(void) {
     char path[128];
     psp_str(psp_arg(0), path, sizeof path);
+    if (getenv("SETO_TRACE_MODULE"))
+        fprintf(stderr, "module: load '%s'\n", path);
 #ifdef HAVE_TITLE_CORPUS
     uint32_t tuid;
     if (psp_title_load_uid(path, &tuid)) {
@@ -270,6 +274,13 @@ static void hle_LoadModule(void) {
         return;
     }
 #endif
+#ifdef HAVE_DECKTUT_CORPUS
+    uint32_t dtuid;
+    if (psp_decktut_load_uid(path, &dtuid)) {
+        psp_ret(dtuid);
+        return;
+    }
+#endif
     if (!g_font_loaded || strcmp(path, FONT_LBN_PATH) != 0) {
         /* A module the game loads at run time and this host does not carry.
          * Naming it is the difference between "the scene is stuck" and why. */
@@ -294,6 +305,9 @@ static void hle_StartModule(void) {
 #endif
 #ifdef HAVE_DECK_CORPUS
     if (psp_deck_start(psp_arg(0), psp_arg(3))) return;
+#endif
+#ifdef HAVE_DECKTUT_CORPUS
+    if (psp_decktut_start(psp_arg(0), psp_arg(3))) return;
 #endif
     if (psp_arg(0) != g_font_uid) {
         psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID);

@@ -38,6 +38,9 @@ int  psp_field_started(void);
 #ifdef HAVE_DECK_CORPUS
 int  psp_deck_image_load(const char *path, uint32_t eboot_info);
 #endif
+#ifdef HAVE_DECKTUT_CORPUS
+int  psp_decktut_image_load(const char *path, uint32_t eboot_info);
+#endif
 #ifdef HAVE_TITLE_CORPUS
 int  psp_title_image_load(const char *path, uint32_t eboot_info);
 int  psp_title_menu_ready(void);
@@ -346,6 +349,56 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                             psp_display_capture("build/s93-pause.ppm");
                             fprintf(stderr, "input: auto pause box=%d black=%d\n",
                                     box_up(), screen_black());
+                            if (getenv("SETO_MENU_MAP")) {
+                                auto_press(0x00000040u);
+                                Sleep(900);
+                                auto_press(0x00004000u);
+                                Sleep(3000);
+                                for (int i = 0; i < 30; i++) {
+                                    auto_press(0x00004000u);
+                                    Sleep(900);
+                                }
+                                for (int w = 0; w < 4; w++) {
+                                    for (int g = 0; g < 40 && box_up(); g++) {
+                                        auto_press(0x00004000u);
+                                        Sleep(250);
+                                    }
+                                    psp_title_walk(0, 255, 0);
+                                    Sleep(4000);
+                                    psp_title_walk(0, 128, 128);
+                                    Sleep(800);
+                                    auto_press(0x00004000u);
+                                    Sleep(2500);
+                                    if (screen_black()) Sleep(3000);
+                                }
+                                auto_press(0x00000008u);
+                                Sleep(5000);
+                                psp_display_capture("build/s93-menu2.ppm");
+                                for (int i = 0; i < 4; i++) {
+                                    auto_press(0x00000040u);
+                                    Sleep(400);
+                                }
+                                psp_display_capture("build/s93-map-sel.ppm");
+                                auto_press(0x00004000u);
+                                Sleep(5000);
+                                psp_display_capture("build/s93-map.ppm");
+                                auto_press(0x00004000u);
+                                Sleep(4000);
+                                psp_display_capture("build/s93-exit-yes.ppm");
+                                for (int i = 0; i < 20; i++) {
+                                    auto_press(0x00004000u);
+                                    Sleep(800);
+                                    if (i == 5 || i == 10 || i == 15) {
+                                        char path[64];
+                                        snprintf(path, sizeof path, "build/s93-exit-dlg%d.ppm", i);
+                                        psp_display_capture(path);
+                                    }
+                                }
+                                for (int i = 0; i < 8; i++) Sleep(1000);
+                                psp_display_capture("build/s93-exit-wait.ppm");
+                                fprintf(stderr, "input: auto map done state=%d phase=%d box=%d\n",
+                                        psp_title_scene_state(), psp_title_scene_phase(), box_up());
+                            } else {
                             auto_press(0x00000040u);
                             Sleep(900);
                             psp_display_capture("build/s93-pause2.ppm");
@@ -363,6 +416,7 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                             }
                             fprintf(stderr, "input: auto after duel state=%d phase=%d box=%d\n",
                                     psp_title_scene_state(), psp_title_scene_phase(), box_up());
+                            }
                             fprintf(stderr, "input: auto story done state=%d phase=%d\n",
                                     psp_title_scene_state(), psp_title_scene_phase());
                         }
@@ -496,6 +550,7 @@ int main(int argc, char **argv) {
     const char *story = argc > 5 ? argv[5] : NULL;
     const char *field = argc > 6 ? argv[6] : NULL;
     const char *deck = argc > 7 ? argv[7] : NULL;
+    const char *decktut = argc > 8 ? argv[8] : NULL;
     const int free_duel = getenv("SETO_FREE_DUEL") != NULL;
 
     if (psp_mem_init() != 0) { fprintf(stderr, "memory init failed\n"); return 1; }
@@ -571,6 +626,14 @@ int main(int argc, char **argv) {
         return 1;
     }
 #endif
+#ifdef HAVE_DECKTUT_CORPUS
+    if (decktut && psp_decktut_image_load(decktut, m.info) != 0) return 1;
+#else
+    if (decktut) {
+        fprintf(stderr, "decktut PRX: this build has no corpus (build/s93-decktut-reloc)\n");
+        return 1;
+    }
+#endif
 
     /* This EBOOT has no .ctors section. The upstream heuristic scans the last
      * 64 KB of the image for a run of pointers into that same window and here
@@ -586,6 +649,7 @@ int main(int argc, char **argv) {
     if (story) printf("story   \"%s\"\n", story);
     if (field) printf("field   \"%s\"\n", field);
     if (deck) printf("deck    \"%s\"\n", deck);
+    if (decktut) printf("decktut \"%s\"\n", decktut);
     printf("image   0x%08X..0x%08X  entry 0x%08X  gp 0x%08X  ctors %d\n",
            m.base, m.image_end, m.entry, m.gp, m.nctors);
     printf("dispatch %u functions/labels registered\n", psp_dispatch_count());
