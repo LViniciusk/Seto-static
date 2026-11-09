@@ -1042,6 +1042,15 @@ button press in the current free-roam state; the one capture that showed it
 (`s200-menu2`) came after the talk + walk prelude. This is the immediate blocker
 for the room exit.
 
+**Pad pipeline (static analysis).** The EBOOT updates the pad in
+`psp_func_08035AC8` (calls `sceCtrlPeekBufferPositive`, 0x3A622550) and keeps
+the processed snapshot at `0x0810152C` (getter `0x08035CFC`, libehsys export
+NID `0xF5E3080C`). `modstory` imports 95 libehsys exports and none of them is
+that getter; the field pad handler `0x08C0D4E8` receives the state pointer in
+`a0` and writes only TRIANGLE -> state 23 and SQUARE -> state 5. CROSS and
+START never reach either handler, so the field command menu is owned by the
+EBOOT/story UI code that consumes the snapshot from `0x0810152C`.
+
 **Live tracing.** `SETO_TRACE_FIELD=1` logs the field state word
 (`0x093CDAFC`) on every change and every `story -> field` command dispatch
 (export `0x86220A06`). A headless story run shows the field cycling
