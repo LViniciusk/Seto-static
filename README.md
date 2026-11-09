@@ -980,6 +980,14 @@ story (`0x08910000`), field (`0x08C00000`) and the 13.8 MB deck `.bss` do not
 fit the current RAM windows together, so the request fails with ENOENT. This is
 the next memory-layout blocker, not a missing game call.
 
+**Module lifecycle.** Tracing ModuleMgr shows the game stops and unloads
+`libtitle` (UID `0x00070002`) immediately before it loads `libstory` and
+`libfield`. The title is mapped in the low/extra window, so after the story
+starts that window is free: the 13.8 MB `moddeck` image fits at `0x01400000`
+without touching the story/field RAM windows or the heap. A lazy loader on the
+ModuleMgr request was prototyped, but the deck request did not reproduce in the
+later runs, so it is not committed yet.
+
 **Next target.** Follow the bottom-right exit to the classroom and reach the
 first scripted duel; free or reuse a module window so `moddeck` and the duel
 PRXs can load while story/field are resident.
