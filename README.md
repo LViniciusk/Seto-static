@@ -856,7 +856,18 @@ module calls the real field functions instead of failing.
 Reproduction (the game requests both extents by LBN, so slice them from the ISO):
 
 ```powershell
-# story: LBN 0x5e20, size 0x24c42; field: LBN 0x5c60, size 0x4a21a
+# the game requests both extents by LBN, so slice them out of the ISO
+$iso = 'C:\Users\Vinicius\Documents\Github\Seto\TF1.iso'
+$fs = [IO.File]::OpenRead($iso)
+foreach ($e in @(@(0x5e20, 0x24c42, 'build\libstory.prx'),
+                 @(0x5c60, 0x4a21a, 'build\libfield.prx'))) {
+    $fs.Position = [int64]$e[0] * 2048
+    $buf = New-Object byte[] $e[1]
+    [void]$fs.Read($buf, 0, $e[1])
+    [IO.File]::WriteAllBytes($e[2], $buf)
+}
+$fs.Close()
+
 python scripts\relocate_prx.py build\libstory.prx build\s93-story-reloc.elf --base 0x08910000
 python scripts\relocate_prx.py build\libfield.prx build\s93-field-reloc.elf --base 0x08C00000
 & $tool emit build\s93-story-reloc.elf build\s93-story-reloc story
