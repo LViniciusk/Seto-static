@@ -141,6 +141,12 @@ void story_import_forward(uint32_t nid) {
         psp_ret(0x80020001u);
         return;
     }
+    if (getenv("SETO_TRACE_FIELD") && nid == 0x86220A06u) {
+        fprintf(stderr, "field cmd: %u arg=0x%08X state=%u vb=%llu\n",
+                psp_arg(0), psp_arg(1), psp_read32(0x093CDAFCu),
+                (unsigned long long)psp_display_vblanks());
+        fflush(stderr);
+    }
     uint32_t caller_gp = psp_cpu.r[PSP_REG_GP];
     psp_cpu.r[PSP_REG_GP] = gp;
     psp_call_from_host(addr);

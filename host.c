@@ -209,6 +209,25 @@ static void auto_menu(uint32_t mask, int by_cursor) {
 }
 #endif
 
+/* Read the field state machine word (0x093CDAFC, inside modfield's .bss) and
+ * log every change. Headless runs otherwise only see pixels; this names the
+ * state the field script is in. */
+static DWORD WINAPI field_state_monitor(LPVOID unused) {
+    (void)unused;
+    uint32_t last = 0xFFFFFFFFu;
+    for (;;) {
+        const uint32_t s = psp_read32(0x093CDAFCu);
+        if (s != last) {
+            fprintf(stderr, "field state: %u (vb %llu)\n",
+                    s, (unsigned long long)psp_display_vblanks());
+            fflush(stderr);
+            last = s;
+        }
+        Sleep(50);
+    }
+    return 0;
+}
+
 static DWORD WINAPI input_thread(LPVOID unused) {
     (void)unused;
     const char *auto_start = getenv("SETO_AUTO_START");
@@ -678,6 +697,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "window: disabled by SETO_NO_WINDOW\n");
     }
     CreateThread(NULL, 0, input_thread, NULL, 0, NULL);
+    if (getenv("SETO_TRACE_FIELD"))
+        CreateThread(NULL, 0, field_state_monitor, NULL, 0, NULL);
     const char *cap = getenv("SETO_BRINGUP_CAP");
     if (cap && atoi(cap) > 0) {
         g_cap_seconds = (unsigned)atoi(cap);

@@ -1042,6 +1042,14 @@ button press in the current free-roam state; the one capture that showed it
 (`s200-menu2`) came after the talk + walk prelude. This is the immediate blocker
 for the room exit.
 
+**Live tracing.** `SETO_TRACE_FIELD=1` logs the field state word
+(`0x093CDAFC`) on every change and every `story -> field` command dispatch
+(export `0x86220A06`). A headless story run shows the field cycling
+`1 -> 5 -> 6 -> 23` during the opening script while the story issues commands
+13, 14, 15, 16, 17 and 19; state 1 is free roam. No command-menu state is
+produced by the field module itself, so the Talk/Duel/Item/PDA/Map UI belongs
+to `modstory`, not `modfield`.
+
 **Where the field logic lives (static analysis).** The field state machine is
 `psp_func_08C0C814`; its 24-entry jump table is at `0x08C34890` and the state
 word is `[0x093CDAFC]` (setter `0x08C0D464` writes state 21 with two words from
