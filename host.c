@@ -34,6 +34,7 @@ void psp_title_start_request(int on);
 int  psp_title_start_done(void);
 int  psp_title_scene3(void);
 int  psp_title_scene_state(void);
+int  psp_title_scene_phase(void);
 int  psp_title_scene_cursor(void);
 void psp_title_menu_request(uint32_t mask);
 #endif
@@ -178,9 +179,75 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                         auto_menu(PSP_CTRL_CROSS, 0);
                         fprintf(stderr, "input: auto menu result state=%d cursor=%d\n",
                                 psp_title_scene_state(), psp_title_scene_cursor());
-                        Sleep(1000);
+                        for (int i = 0; i < 500 && psp_title_scene_phase() < 3; i++)
+                            Sleep(10);
+                        fprintf(stderr, "input: auto name phase=%d state=%d\n",
+                                psp_title_scene_phase(), psp_title_scene_state());
                         if (psp_display_capture("build/s92-after.ppm") == 0)
                             fprintf(stderr, "capture: build/s92-after.ppm\n");
+                        fprintf(stderr, "input: auto name CROSS test\n");
+                        for (int i = 0; i < 50; i++) {
+                            psp_ctrl_set(0x00004000u, 128, 128);
+                            Sleep(20);
+                            psp_ctrl_set(0, 128, 128);
+                            Sleep(20);
+                        }
+                        fprintf(stderr, "input: auto name after CROSS state=%d phase=%d\n",
+                                psp_title_scene_state(), psp_title_scene_phase());
+                        Sleep(5000);
+                        fprintf(stderr, "input: auto name settled state=%d phase=%d\n",
+                                psp_title_scene_state(), psp_title_scene_phase());
+                        fprintf(stderr, "input: auto name confirm CROSS\n");
+                        for (int i = 0; i < 50; i++) {
+                            psp_ctrl_set(0x00004000u, 128, 128);
+                            Sleep(20);
+                            psp_ctrl_set(0, 128, 128);
+                            Sleep(20);
+                        }
+                        Sleep(5000);
+                        fprintf(stderr, "input: auto name confirmed state=%d phase=%d\n",
+                                psp_title_scene_state(), psp_title_scene_phase());
+                        fprintf(stderr, "input: auto name final START\n");
+                        for (int i = 0; i < 50; i++) {
+                            psp_ctrl_set(0x00000008u, 128, 128);
+                            Sleep(20);
+                            psp_ctrl_set(0, 128, 128);
+                            Sleep(20);
+                        }
+                        Sleep(2000);
+                        fprintf(stderr, "input: auto name final state=%d phase=%d\n",
+                                psp_title_scene_state(), psp_title_scene_phase());
+                        fprintf(stderr, "input: auto name dialog CROSS\n");
+                        for (int i = 0; i < 50; i++) {
+                            psp_ctrl_set(0x00004000u, 128, 128);
+                            Sleep(20);
+                            psp_ctrl_set(0, 128, 128);
+                            Sleep(20);
+                        }
+                        Sleep(5000);
+                        fprintf(stderr, "input: auto name dialog state=%d phase=%d\n",
+                                psp_title_scene_state(), psp_title_scene_phase());
+                        fprintf(stderr, "input: auto main menu DOWN x5\n");
+                        for (int i = 0; i < 5; i++) {
+                            psp_ctrl_set(0x00000040u, 128, 128);
+                            Sleep(100);
+                            psp_ctrl_set(0, 128, 128);
+                            Sleep(600);
+                        }
+                        if (psp_display_capture("build/s92-menu2.ppm") == 0)
+                            fprintf(stderr, "capture: build/s92-menu2.ppm\n");
+                        fprintf(stderr, "input: auto main menu CROSS\n");
+                        for (int i = 0; i < 50; i++) {
+                            psp_ctrl_set(0x00004000u, 128, 128);
+                            Sleep(20);
+                            psp_ctrl_set(0, 128, 128);
+                            Sleep(20);
+                        }
+                        Sleep(5000);
+                        fprintf(stderr, "input: auto main menu state=%d phase=%d\n",
+                                psp_title_scene_state(), psp_title_scene_phase());
+                        if (psp_display_capture("build/s92-name.ppm") == 0)
+                            fprintf(stderr, "capture: build/s92-name.ppm\n");
                     }
                 } else {
                     Sleep(1);
@@ -238,6 +305,11 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                     menu_deadline = GetTickCount() + 800;
                     psp_title_menu_request(menu_mask);
                     fprintf(stderr, "input: CROSS press\n");
+                } else if (state == 4) {
+                    psp_ctrl_set(PSP_CTRL_CROSS, 128, 128);
+                    Sleep(100);
+                    psp_ctrl_set(0, 128, 128);
+                    fprintf(stderr, "input: CROSS name press\n");
                 }
             } else if (!kcross) held_cross = 0;
 #endif
@@ -250,7 +322,13 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                 timed_out = 0;
                 press_ms = GetTickCount();
 #ifdef HAVE_TITLE_CORPUS
-                psp_title_start_request(1);
+                if (state == 4) {
+                    psp_ctrl_set(PSP_CTRL_START, 128, 128);
+                    Sleep(100);
+                    psp_ctrl_set(0, 128, 128);
+                } else {
+                    psp_title_start_request(1);
+                }
 #else
                 psp_ctrl_set(PSP_CTRL_START, 128, 128);
 #endif

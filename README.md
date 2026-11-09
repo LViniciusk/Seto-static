@@ -41,6 +41,13 @@ controls, the original menu advances from cursor 1 to 0 and confirmation changes
 the scene state from 3 to 4, presenting the next scene, in 5/5 headless runs
 (see [S9.2 results](#s92-results--title-menu)).
 
+**S9.3 — story/name menu: PARTIAL.** A minimal `sceUtilityOsk` HLE lets the
+original `ENTER NAME` flow return a configured name, and a minimal mailbox HLE
+unblocks the game's loader. The recompiled game reaches the **MAIN MENU**, loads
+the Story/Deck/Character List modules, and renders the Group List screen. A
+title-menu option for a duel has not yet been driven to a battle (see
+[S9.3 results](#s93-results--story-name-menu)).
+
 **S7 — title screen: PASS.** The EBOOT corpus is relocated into the PSP user
 RAM window, which fixes the sound engine's pointer/handle classification and
 lets the loading stream retire. The GE now applies `ORIGIN`/`OFFSET` to relative
@@ -92,6 +99,7 @@ git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s7-ge-callback.patc
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s7-address-space.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s8-input.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s8-wakeup-yield.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s9-mailbox.patch
 
 cmake -S build/psprecomp -B build/psprecomp-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build/psprecomp-build -j 8
@@ -627,7 +635,7 @@ request, during the title load. That is the pre-existing `ehfile_queue` race,
 not caused by START and not blocking the transition. The same race appeared
 before START in earlier runs. A 6 s physical Enter test produced exactly one
 `input: START press`, one release, and scene state 3 with zero bad accesses.
-Upstream tests 21/21; LBN seek PASS; all eleven psprecomp patches apply to
+Upstream tests 21/21; LBN seek PASS; all twelve psprecomp patches apply to
 `5ca18fa` and the clean tree passes 21/21.
 
 To reproduce: `SETO_BRINGUP_CAP=60` and `SETO_AUTO_START=1` (request at step 1,
@@ -772,6 +780,55 @@ and confirmation are processed by the original code.
 
 **Integrity.** Upstream 21/21; LBN seek PASS; `git diff --check` clean.
 
+## S9.3 results — story, name and main menu
+
+**OSK.** The title imports the system on-screen keyboard through
+`0xF6269B82`/`0xF3F76017`/`0x4B85C861`/`0x3DFAEBA9`. The host now serves that
+contract in `title_prx.c` using the standard `SceUtilityOskParams`/data layout:
+one field, the name from `SETO_PLAYER_NAME` (fallback `YUGI`), result
+`CHANGED`, and init → visible → quit → finished statuses. The title's own code
+copies the returned string and runs the original confirmation dialog. No guest
+state is written.
+
+**Mailbox.** The game's loader uses `sceKernelCreateMbx`, `DeleteMbx`,
+`SendMbx` and `PollMbx`; the runtime did not implement them. A small FIFO mailbox
+HLE (`patches/psprecomp-5ca18fa-s9-mailbox.patch`) adds the four calls. With it,
+the Group List screen progresses instead of spinning on an empty `PollMbx`.
+
+**Flow observed.** After the title menu (cursor 0) the game runs the original
+`ENTER NAME` screen. The OSK returns `YUGI`, START opens the confirmation
+dialog, and CROSS confirms it. The game then reaches the **MAIN MENU**. Menu
+options observed:
+
+| Option | Loaded/entered |
+|---:|---|
+| 1 | `libstory.prx` (`ModuleMgr` ENOENT) |
+| 2 | `libdeck.prx` (`ModuleMgr` ENOENT) |
+| 3 | `libcharalist.prx` (`ModuleMgr` ENOENT) |
+| 4 | Options screen |
+| 5 | Group List (requires the mailbox HLE) |
+| 6 | returns to the name-entry/new-game flow |
+
+The first three modules are not integrated; their `LoadModule` requests are
+recorded rather than faked. The Group List is rendered by the original code
+after the mailbox fix (`build/s92-mbx-cap.png`).
+
+**Validation.** The long synthetic path reached the name confirmation/main menu
+in 4 of 5 runs; the remaining run stopped earlier in the name animation. The
+mailbox/Group List run used the same sequence and reached scene state 4,
+phase 11. The sequence is timing-sensitive and is not yet a 5/5 battle path.
+The window is unchanged; all automated runs use `SETO_NO_WINDOW=1`.
+
+**Manual keys for this milestone.** At `ENTER NAME`, Z opens the OSK (the name
+is `SETO_PLAYER_NAME`/`YUGI`), Enter opens the confirmation dialog, and Z
+confirms it. At the main menu, Up/Down/Z navigate and select. The title menu and
+the rest of the keyboard path are unchanged.
+
+**Next target.** The title menu's second option (cursor 1) has not been driven
+to a duel. The main menu's first three modules are known but not integrated;
+the next round should identify the shortest real duel entry and integrate only
+the module(s) it requests.
+
 ## Limitations
 
 - `sceReg` is not implemented: the font library's registry reads return 0 and
@@ -796,6 +853,6 @@ and confirmation are processed by the original code.
 
 Tracked: this README, `.gitignore`, `host.c`, `umd.c`, `fpl.c`, `font_prx.c`,
 `title_prx.c`, `scripts/relocate_prx.py`, `CMakeLists.txt`, `tests/lbn_seek.c`,
-and eleven small patches against the pinned psprecomp. `build/` (tool clone, generated C,
+and twelve small patches against the pinned psprecomp. `build/` (tool clone, generated C,
 relocated ELF, objects, executable) and `private/` (decrypted EBOOT, ISO) are
 ignored.
