@@ -931,12 +931,18 @@ advances with CROSS (`We aim to create the next generation of duelists.`,
 Classroom at once.`). A clean run reaches the story scene with **0 bad
 accesses** (`build/s124-story20.ppm`).
 
-**moddeck.** Free Duel/Deck Menu requests `libdeck.prx` (LBN `0x56f0`). The
-13.8 MB `.bss` image is relocated to `0x08910000` (Free Duel mode does not load
+**moddeck.** Deck Menu requests `libdeck.prx` (LBN `0x56f0`). The 13.8 MB
+`.bss` image is relocated to `0x08910000` (this mode does not load
 story/field) and its `module_start` runs; the real Deck Editor renders
-(`build/s105-duel15.png`). The synthetic main-menu navigation still moves more
-than one entry per injected press, so selecting Free Duel deterministically is
-an open issue; the deck path was reached through the neighbouring Deck Menu.
+(`build/s105-duel15.png`).
+
+**Free Duel is locked in a fresh game.** In the main menu "Free Duel" is drawn
+with grey text (RGB 128,128,128) while Story Mode and Deck Menu are white
+(255,255,255) in the same frame, and the menu cursor skips over it
+(`build/s93-free-menu.ppm`). The main-menu navigation was not "missing" the
+entry: the entry is disabled without a save/story progress, so the deck path
+was reached through the neighbouring Deck Menu. The story is therefore the only
+route to a first duel.
 
 **Gap.** No duel has been started. The story conversation is long and the
 player has not yet left the Chancellor's Office; Free Duel selection needs a
