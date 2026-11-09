@@ -141,6 +141,7 @@ static uint32_t title_export(uint32_t nid) {
 static int g_osk_status;
 static uint32_t g_osk_params;
 
+
 static void osk_fill(void) {
     const uint32_t params = g_osk_params;
     const int count = (int)psp_read32(params + 0x30);
@@ -236,8 +237,10 @@ static _Atomic int g_scene_state;
 static _Atomic int g_scene_phase;
 static _Atomic int g_scene_cursor;
 static _Atomic uint32_t g_menu_request;
+static _Atomic uint32_t g_pad_request;
 static int g_pad_on;
 static int g_menu_on;
+static int g_pad_release;
 
 int psp_title_scene3(void) { return atomic_load(&g_scene3); }
 int psp_title_scene_state(void) { return atomic_load(&g_scene_state); }
@@ -246,6 +249,12 @@ int psp_title_scene_cursor(void) { return atomic_load(&g_scene_cursor); }
 
 void psp_title_menu_request(uint32_t mask) {
     atomic_store(&g_menu_request, mask);
+}
+
+/* One frame of pad state, applied by the vblank hook so it cannot be cleared
+ * before the game samples it. Used by the name-entry screens (state 4). */
+void psp_title_pad_request(uint32_t mask) {
+    atomic_store(&g_pad_request, mask);
 }
 
 void psp_title_start_request(int on) {
@@ -278,6 +287,19 @@ static void title_input_update(uint32_t addr) {
         return;
     }
     if (g_menu_on) { psp_ctrl_set(0, 128, 128); g_menu_on = 0; }
+
+    uint32_t pad = atomic_exchange(&g_pad_request, 0);
+    if (pad) {
+        if (g_pad_on) { psp_ctrl_set(0, 128, 128); g_pad_on = 0; }
+        psp_ctrl_set(pad, 128, 128);
+        g_pad_release = 1;
+        return;
+    }
+    if (g_pad_release) {
+        psp_ctrl_set(0, 128, 128);
+        g_pad_release = 0;
+        return;
+    }
 
     if (!atomic_load(&g_start_request) || atomic_load(&g_start_done) || step < 1) {
         if (g_pad_on) { psp_ctrl_set(0, 128, 128); g_pad_on = 0; }

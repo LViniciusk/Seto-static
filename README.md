@@ -48,6 +48,14 @@ the Story/Deck/Character List modules, and renders the Group List screen. A
 title-menu option for a duel has not yet been driven to a battle (see
 [S9.3 results](#s93-results--story-name-menu)).
 
+**S9.4 — modstory/modfield: PARTIAL.** The real `libstory.prx` and
+`libfield.prx` images are relocated and executed. `modstory`'s `module_start`
+runs, requests `libfield.prx` through ModuleMgr, and `modfield`'s
+`module_start` runs in turn. The game renders the first story-mode scene (HUD,
+character portrait, message window) and the D-pad moves the player; no duel has
+been reached yet and the dialogue text is not drawn (see
+[S9.4 results](#s94-results--modstorymodfield)).
+
 **S7 — title screen: PASS.** The EBOOT corpus is relocated into the PSP user
 RAM window, which fixes the sound engine's pointer/handle classification and
 lets the loading stream retire. The GE now applies `ORIGIN`/`OFFSET` to relative
@@ -100,6 +108,7 @@ git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s7-address-space.pa
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s8-input.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s8-wakeup-yield.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s9-mailbox.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s9-field.patch
 
 cmake -S build/psprecomp -B build/psprecomp-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build/psprecomp-build -j 8
@@ -635,7 +644,7 @@ request, during the title load. That is the pre-existing `ehfile_queue` race,
 not caused by START and not blocking the transition. The same race appeared
 before START in earlier runs. A 6 s physical Enter test produced exactly one
 `input: START press`, one release, and scene state 3 with zero bad accesses.
-Upstream tests 21/21; LBN seek PASS; all twelve psprecomp patches apply to
+Upstream tests 21/21; LBN seek PASS; all thirteen psprecomp patches apply to
 `5ca18fa` and the clean tree passes 21/21.
 
 To reproduce: `SETO_BRINGUP_CAP=60` and `SETO_AUTO_START=1` (request at step 1,
@@ -829,22 +838,70 @@ to a duel. The main menu's first three modules are known but not integrated;
 the next round should identify the shortest real duel entry and integrate only
 the module(s) it requests.
 
+## S9.4 results — modstory/modfield
+
+**Images.** Two retail PRXs are now recompiled and executed:
+
+| Module | ISO LBN | Size | Relocated base | `.bss` | Imports |
+|---|---:|---:|---:|---:|---:|
+| `modstory` (`libstory.prx`) | `0x5e20` | `0x24c42` | `0x08910000` | 2.8 MB | 137 (libehsys + 3 libfield) |
+| `modfield` (`libfield.prx`) | `0x5c60` | `0x4a21a` | `0x08C00000` | 8.2 MB | 258 (libehsys) |
+
+Both are placed with `psp_mem_write_block` in the main-RAM window; the runtime
+heap base moves from `0x08C00000` to `0x09600000` so the 8.2 MB field image has
+room. `modstory`'s three `libfield` imports (`0x86220A06`, `0x79E5F8B7`,
+`0xE92DC2F2`) are resolved from `modfield`'s own export table, so the story
+module calls the real field functions instead of failing.
+
+Reproduction (the game requests both extents by LBN, so slice them from the ISO):
+
+```powershell
+# story: LBN 0x5e20, size 0x24c42; field: LBN 0x5c60, size 0x4a21a
+python scripts\relocate_prx.py build\libstory.prx build\s93-story-reloc.elf --base 0x08910000
+python scripts\relocate_prx.py build\libfield.prx build\s93-field-reloc.elf --base 0x08C00000
+& $tool emit build\s93-story-reloc.elf build\s93-story-reloc story
+& $tool emit build\s93-field-reloc.elf build\s93-field-reloc field
+```
+
+**Runtime gaps fixed.** The field module hits `vcmov` in an EBOOT math helper;
+`psp_vcmov` and the `A_VCMOV` emitter case now exist, and the corpus is
+regenerated (0 VFPU traps in the story run). `sceDisplayGetVcount` and
+`sceDisplayGetAccumulatedHcount` were missing; they now report the runtime's
+real vblank counter (the accumulated hcount is 0 because there is no scanout).
+Both changes are in `patches/psprecomp-5ca18fa-s9-field.patch`.
+
+**Observed flow.** Selecting Story at the main menu loads `modstory`; its
+`module_start` runs, requests `libfield.prx` through ModuleMgr, and
+`modfield`'s `module_start` runs. The game then renders the first story-mode
+scene: the HUD (`1st May`, `7:30 AM`, `0 DP`, `92 Days Until Tournament`), a
+character portrait and the message window. The D-pad moves the player (free
+roam) and START fades the scene. `build/s93-story15.ppm` / `s95-story15.png`
+are the captured frame.
+
+**Validation.** A clean headless run reaches `story: entered`, `field: entered`
+and the scene above with **0 bad accesses, 0 traps**, 2,403 vblanks and 8,605
+unimplemented calls (Atrac plus `sceReg`). The story message files
+(`ImpChrMsgIe.bin`, `script/st01_t01_*`) are opened and read from the ISO.
+
+**Gap.** The message window is drawn but its text is not: no glyph quads reach
+the GE for the dialogue, while the HUD text renders. No duel has been reached;
+the story starts in free roam and the dialogue cannot be read.
+
 ## Limitations
 
 - `sceReg` is not implemented: the font library's registry reads return 0 and
-  it uses defaults. `GetCharInfo`/`GetCharGlyphImage` and text rendering are not
-  reached yet.
-- Only `libtitle.prx` is integrated; the other game PRXs are not recompiled.
-  S8 reaches the title menu; the `modduel_mgr` load is reached only by the idle
-  path. That module needs `libduel_eng`, `libduel_draw`, `libdeck_swap` and
-  `libtutorial`, which are not integrated.
+  it uses defaults. `GetCharInfo`/`GetCharGlyphImage` are now reached, but the
+  story dialogue text still does not reach the GE; HUD text renders.
+- `libtitle.prx`, `libstory.prx` and `libfield.prx` are integrated; `libdeck`,
+  `libcharalist` and the duel modules are not. The duel path is still blocked
+  before a battle.
 - The rebased corpus relocates the EBOOT into the PSP user RAM window. The host
   refuses the unrelocated image instead of guessing its base.
-- Audio is paced by the runtime but not played. Only START is mapped; D-Pad,
-  CROSS and CIRCLE are not.
-- 270 VFPU + 16 `vcmov` instructions remain traps in the rebased EBOOT corpus;
-  none were reached by this run. The title corpus has 22 VFPU traps, also
-  unreached.
+- Audio is paced by the runtime but not played; the Atrac stream calls remain
+  unimplemented. START, the D-pad, CROSS and CIRCLE are mapped.
+- `vcmov` is implemented; 270 other VFPU instructions remain traps in the
+  rebased EBOOT corpus (0.25%), unreached by the story run. The title corpus has
+  22 VFPU traps, also unreached.
 - 2,889 functions without `jr $ra` and 176 `scattered` functions remain discovery
   caveats; they did not affect the EBOOT run.
 - No window; the goal is the real code path, not play.
@@ -853,6 +910,6 @@ the module(s) it requests.
 
 Tracked: this README, `.gitignore`, `host.c`, `umd.c`, `fpl.c`, `font_prx.c`,
 `title_prx.c`, `scripts/relocate_prx.py`, `CMakeLists.txt`, `tests/lbn_seek.c`,
-and twelve small patches against the pinned psprecomp. `build/` (tool clone, generated C,
+and thirteen small patches against the pinned psprecomp. `build/` (tool clone, generated C,
 relocated ELF, objects, executable) and `private/` (decrypted EBOOT, ISO) are
 ignored.

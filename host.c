@@ -27,6 +27,14 @@ int  psp_font_bind(void);
 #ifdef HAVE_FONT_CORPUS
 void font_psp_recomp_register(void);   /* relocated PRX corpus */
 #endif
+#ifdef HAVE_STORY_CORPUS
+int  psp_story_image_load(const char *path, uint32_t eboot_info);
+int  psp_story_started(void);
+#endif
+#ifdef HAVE_FIELD_CORPUS
+int  psp_field_image_load(const char *path, uint32_t eboot_info);
+int  psp_field_started(void);
+#endif
 #ifdef HAVE_TITLE_CORPUS
 int  psp_title_image_load(const char *path, uint32_t eboot_info);
 int  psp_title_menu_ready(void);
@@ -37,6 +45,7 @@ int  psp_title_scene_state(void);
 int  psp_title_scene_phase(void);
 int  psp_title_scene_cursor(void);
 void psp_title_menu_request(uint32_t mask);
+void psp_title_pad_request(uint32_t mask);
 #endif
 
 /* The EBOOT's single PT_LOAD has memsz 0x631A80; .bss runs to there. */
@@ -127,6 +136,15 @@ static DWORD WINAPI bringup_cap(LPVOID unused) {
 #ifdef HAVE_TITLE_CORPUS
 /* Send one menu button until the guest changes the observed cursor or scene
  * state, or a short timeout expires. The title input update supplies the edge. */
+static void auto_press(uint32_t mask) {
+    /* The title's vblank hook consumes the one-shot; scenes that run without
+     * that hook read the direct state, which is held here for 100 ms. */
+    psp_title_pad_request(mask);
+    psp_ctrl_set(mask, 128, 128);
+    Sleep(100);
+    psp_ctrl_set(0, 128, 128);
+}
+
 static void auto_menu(uint32_t mask, int by_cursor) {
     const int c0 = psp_title_scene_cursor();
     const int s0 = psp_title_scene_state();
@@ -185,69 +203,61 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                 psp_title_scene_phase(), psp_title_scene_state());
                         if (psp_display_capture("build/s92-after.ppm") == 0)
                             fprintf(stderr, "capture: build/s92-after.ppm\n");
-                        fprintf(stderr, "input: auto name CROSS test\n");
-                        for (int i = 0; i < 50; i++) {
-                            psp_ctrl_set(0x00004000u, 128, 128);
-                            Sleep(20);
-                            psp_ctrl_set(0, 128, 128);
-                            Sleep(20);
+                        fprintf(stderr, "input: auto name advance\n");
+                        for (int i = 0; i < 80 && psp_title_scene_state() == 4 &&
+                                           !psp_story_started(); i++) {
+                            auto_press((i & 1) ? 0x00000008u : 0x00004000u);
+                            Sleep(300);
                         }
-                        fprintf(stderr, "input: auto name after CROSS state=%d phase=%d\n",
-                                psp_title_scene_state(), psp_title_scene_phase());
-                        Sleep(5000);
-                        fprintf(stderr, "input: auto name settled state=%d phase=%d\n",
-                                psp_title_scene_state(), psp_title_scene_phase());
-                        fprintf(stderr, "input: auto name confirm CROSS\n");
-                        for (int i = 0; i < 50; i++) {
-                            psp_ctrl_set(0x00004000u, 128, 128);
-                            Sleep(20);
-                            psp_ctrl_set(0, 128, 128);
-                            Sleep(20);
-                        }
-                        Sleep(5000);
-                        fprintf(stderr, "input: auto name confirmed state=%d phase=%d\n",
-                                psp_title_scene_state(), psp_title_scene_phase());
-                        fprintf(stderr, "input: auto name final START\n");
-                        for (int i = 0; i < 50; i++) {
-                            psp_ctrl_set(0x00000008u, 128, 128);
-                            Sleep(20);
-                            psp_ctrl_set(0, 128, 128);
-                            Sleep(20);
-                        }
-                        Sleep(2000);
-                        fprintf(stderr, "input: auto name final state=%d phase=%d\n",
-                                psp_title_scene_state(), psp_title_scene_phase());
-                        fprintf(stderr, "input: auto name dialog CROSS\n");
-                        for (int i = 0; i < 50; i++) {
-                            psp_ctrl_set(0x00004000u, 128, 128);
-                            Sleep(20);
-                            psp_ctrl_set(0, 128, 128);
-                            Sleep(20);
-                        }
-                        Sleep(5000);
-                        fprintf(stderr, "input: auto name dialog state=%d phase=%d\n",
-                                psp_title_scene_state(), psp_title_scene_phase());
-                        fprintf(stderr, "input: auto main menu DOWN x5\n");
-                        for (int i = 0; i < 5; i++) {
-                            psp_ctrl_set(0x00000040u, 128, 128);
+                        fprintf(stderr, "input: auto name dialog state=%d phase=%d cursor=%d story=%d\n",
+                                psp_title_scene_state(), psp_title_scene_phase(),
+                                psp_title_scene_cursor(), psp_story_started());
+                        int last_state = psp_title_scene_state();
+                        for (int i = 0; i < 150 && !psp_story_started(); i++) {
                             Sleep(100);
-                            psp_ctrl_set(0, 128, 128);
-                            Sleep(600);
+                            const int s = psp_title_scene_state();
+                            if (s != last_state) {
+                                fprintf(stderr, "input: auto state %d->%d phase=%d story=%d\n",
+                                        last_state, s, psp_title_scene_phase(),
+                                        psp_story_started());
+                                last_state = s;
+                            }
                         }
                         if (psp_display_capture("build/s92-menu2.ppm") == 0)
                             fprintf(stderr, "capture: build/s92-menu2.ppm\n");
-                        fprintf(stderr, "input: auto main menu CROSS\n");
-                        for (int i = 0; i < 50; i++) {
-                            psp_ctrl_set(0x00004000u, 128, 128);
-                            Sleep(20);
-                            psp_ctrl_set(0, 128, 128);
-                            Sleep(20);
+                        if (!psp_story_started() && psp_title_scene_state() == 3) {
+                            Sleep(1500);
+                            fprintf(stderr, "input: auto main menu cursor=%d\n",
+                                    psp_title_scene_cursor());
+                            auto_press(0x00004000u);
+                            for (int i = 0; i < 30 && !psp_story_started(); i++) {
+                                auto_press((i & 1) ? 0x00004000u : 0x00000008u);
+                                Sleep(400);
+                            }
+                            fprintf(stderr, "input: auto main menu state=%d phase=%d story=%d\n",
+                                    psp_title_scene_state(), psp_title_scene_phase(),
+                                    psp_story_started());
                         }
-                        Sleep(5000);
-                        fprintf(stderr, "input: auto main menu state=%d phase=%d\n",
-                                psp_title_scene_state(), psp_title_scene_phase());
                         if (psp_display_capture("build/s92-name.ppm") == 0)
                             fprintf(stderr, "capture: build/s92-name.ppm\n");
+                        if (psp_story_started()) {
+                            for (int i = 0; i < 200 && !psp_field_started(); i++)
+                                Sleep(100);
+                            fprintf(stderr, "input: auto story advance field=%d\n",
+                                    psp_field_started());
+                            for (int i = 0; i < 20; i++) {
+                                auto_press(0x00004000u);
+                                Sleep(800);
+                                if (i == 5 || i == 15) {
+                                    char path[64];
+                                    snprintf(path, sizeof path, "build/s93-story%d.ppm", i);
+                                    if (psp_display_capture(path) == 0)
+                                        fprintf(stderr, "capture: story frame %d\n", i);
+                                }
+                            }
+                            fprintf(stderr, "input: auto story done state=%d phase=%d\n",
+                                    psp_title_scene_state(), psp_title_scene_phase());
+                        }
                     }
                 } else {
                     Sleep(1);
@@ -375,6 +385,8 @@ int main(int argc, char **argv) {
     const char *iso = argc > 2 ? argv[2] : "private/TF1.iso";
     const char *font = argc > 3 ? argv[3] : NULL;
     const char *title = argc > 4 ? argv[4] : NULL;
+    const char *story = argc > 5 ? argv[5] : NULL;
+    const char *field = argc > 6 ? argv[6] : NULL;
 
     if (psp_mem_init() != 0) { fprintf(stderr, "memory init failed\n"); return 1; }
 
@@ -421,6 +433,22 @@ int main(int argc, char **argv) {
         return 1;
     }
 #endif
+#ifdef HAVE_STORY_CORPUS
+    if (story && psp_story_image_load(story, m.info) != 0) return 1;
+#else
+    if (story) {
+        fprintf(stderr, "story PRX: this build has no story corpus (build/s93-story-reloc)\n");
+        return 1;
+    }
+#endif
+#ifdef HAVE_FIELD_CORPUS
+    if (field && psp_field_image_load(field, m.info) != 0) return 1;
+#else
+    if (field) {
+        fprintf(stderr, "field PRX: this build has no field corpus (build/s93-field-reloc)\n");
+        return 1;
+    }
+#endif
 
     /* This EBOOT has no .ctors section. The upstream heuristic scans the last
      * 64 KB of the image for a run of pointers into that same window and here
@@ -433,6 +461,8 @@ int main(int argc, char **argv) {
     printf("disc    \"%s\"\n", iso);
     if (font) printf("font    \"%s\"\n", font);
     if (title) printf("title   \"%s\"\n", title);
+    if (story) printf("story   \"%s\"\n", story);
+    if (field) printf("field   \"%s\"\n", field);
     printf("image   0x%08X..0x%08X  entry 0x%08X  gp 0x%08X  ctors %d\n",
            m.base, m.image_end, m.entry, m.gp, m.nctors);
     printf("dispatch %u functions/labels registered\n", psp_dispatch_count());

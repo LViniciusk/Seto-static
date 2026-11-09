@@ -23,6 +23,10 @@
 #ifdef HAVE_TITLE_CORPUS
 int psp_title_load_uid(const char *path, uint32_t *uid);
 int psp_title_start(uint32_t uid, uint32_t status_ptr);
+int psp_story_load_uid(const char *path, uint32_t *uid);
+int psp_story_start(uint32_t uid, uint32_t status_ptr);
+int psp_field_load_uid(const char *path, uint32_t *uid);
+int psp_field_start(uint32_t uid, uint32_t status_ptr);
 #endif
 
 static uint16_t rd16(const uint8_t *p) {
@@ -243,6 +247,20 @@ static void hle_LoadModule(void) {
         return;
     }
 #endif
+#ifdef HAVE_STORY_CORPUS
+    uint32_t suid;
+    if (psp_story_load_uid(path, &suid)) {
+        psp_ret(suid);
+        return;
+    }
+#endif
+#ifdef HAVE_FIELD_CORPUS
+    uint32_t fuid;
+    if (psp_field_load_uid(path, &fuid)) {
+        psp_ret(fuid);
+        return;
+    }
+#endif
     if (!g_font_loaded || strcmp(path, FONT_LBN_PATH) != 0) {
         /* A module the game loads at run time and this host does not carry.
          * Naming it is the difference between "the scene is stuck" and why. */
@@ -258,6 +276,12 @@ static void hle_LoadModule(void) {
 static void hle_StartModule(void) {
 #ifdef HAVE_TITLE_CORPUS
     if (psp_title_start(psp_arg(0), psp_arg(3))) return;
+#endif
+#ifdef HAVE_STORY_CORPUS
+    if (psp_story_start(psp_arg(0), psp_arg(3))) return;
+#endif
+#ifdef HAVE_FIELD_CORPUS
+    if (psp_field_start(psp_arg(0), psp_arg(3))) return;
 #endif
     if (psp_arg(0) != g_font_uid) {
         psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID);

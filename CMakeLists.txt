@@ -43,9 +43,41 @@ if(TITLE_SOURCES)
     target_link_libraries(titleprx PRIVATE psprecomp)
 endif()
 
+# S9.3: the relocated modstory corpus, loaded when the game asks for
+# libstory.prx. Its imports are EBOOT libehsys/libfield exports.
+file(GLOB STORY_SOURCES CONFIGURE_DEPENDS
+     ${CMAKE_CURRENT_SOURCE_DIR}/build/s93-story-reloc/*.c)
+if(STORY_SOURCES)
+    add_library(storyprx OBJECT ${STORY_SOURCES})
+    target_compile_definitions(storyprx PRIVATE
+        PSPRECOMP_NAMESPACE=story_ PSPRECOMP_TRACE
+        psp_hle_call=story_import_forward)
+    target_include_directories(storyprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s93-story-reloc)
+    target_link_libraries(storyprx PRIVATE psprecomp)
+endif()
+
+# S9.3: the relocated modfield corpus, loaded when modstory asks for the
+# field module. Its imports are libehsys EBOOT exports.
+file(GLOB FIELD_SOURCES CONFIGURE_DEPENDS
+     ${CMAKE_CURRENT_SOURCE_DIR}/build/s93-field-reloc/*.c)
+if(FIELD_SOURCES)
+    add_library(fieldprx OBJECT ${FIELD_SOURCES})
+    target_compile_definitions(fieldprx PRIVATE
+        PSPRECOMP_NAMESPACE=field_ PSPRECOMP_TRACE
+        psp_hle_call=field_import_forward)
+    target_include_directories(fieldprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s93-field-reloc)
+    target_link_libraries(fieldprx PRIVATE psprecomp)
+endif()
+
 set(SETO_SOURCES host.c host_window.c umd.c fpl.c font_prx.c)
 if(TITLE_SOURCES)
     list(APPEND SETO_SOURCES title_prx.c)
+endif()
+if(STORY_SOURCES)
+    list(APPEND SETO_SOURCES story_prx.c)
+endif()
+if(FIELD_SOURCES)
+    list(APPEND SETO_SOURCES field_prx.c)
 endif()
 add_executable(Seto-static ${SETO_SOURCES})
 if(FONT_SOURCES)
@@ -59,6 +91,18 @@ if(TITLE_SOURCES)
     target_compile_definitions(Seto-static PRIVATE HAVE_TITLE_CORPUS)
 else()
     message(STATUS "S6 title corpus not found under build/s6-title-reloc; building without modtitle")
+endif()
+if(STORY_SOURCES)
+    target_sources(Seto-static PRIVATE $<TARGET_OBJECTS:storyprx>)
+    target_compile_definitions(Seto-static PRIVATE HAVE_STORY_CORPUS)
+else()
+    message(STATUS "S9.3 story corpus not found under build/s93-story-reloc; building without modstory")
+endif()
+if(FIELD_SOURCES)
+    target_sources(Seto-static PRIVATE $<TARGET_OBJECTS:fieldprx>)
+    target_compile_definitions(Seto-static PRIVATE HAVE_FIELD_CORPUS)
+else()
+    message(STATUS "S9.3 field corpus not found under build/s93-field-reloc; building without modfield")
 endif()
 target_link_libraries(Seto-static PRIVATE tagforce gdi32)
 

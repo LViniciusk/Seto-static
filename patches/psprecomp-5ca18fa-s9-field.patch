@@ -1,0 +1,99 @@
+diff --git a/include/psprecomp/vfpu.h b/include/psprecomp/vfpu.h
+index 9ed6d54..0985dfc 100644
+--- a/include/psprecomp/vfpu.h
++++ b/include/psprecomp/vfpu.h
+@@ -63,6 +63,8 @@ void psp_vscl(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+ 
+ /* Comparison, writing the VFPU condition codes. */
+ void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size);
++/* Conditional move: copy vs to vd when the selected condition bit passes. */
++void psp_vcmov(uint32_t vd, uint32_t vs, int size, int imm);
+ 
+ /* Per-lane comparisons that produce numbers: 1.0 / 0.0, or -1, 0, 1. */
+ void psp_vsge(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+diff --git a/src/hle/display.c b/src/hle/display.c
+index 73f6653..39596b3 100644
+--- a/src/hle/display.c
++++ b/src/hle/display.c
+@@ -115,9 +115,21 @@ static void hle_WaitVblank(void) {
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ 
++static void hle_GetVcount(void) {
++    psp_ret((uint32_t)g_vblank_count);
++}
++
++static void hle_GetAccumulatedHcount(void) {
++    /* No scanout, so the beam never advances within a frame. */
++    psp_ret(0);
++}
++
+ void psp_display_register(void) {
+     psp_hle_register(0x0E20F177, "sceDisplay", "sceDisplaySetMode",           hle_SetMode);
+     psp_hle_register(0x289D82FE, "sceDisplay", "sceDisplaySetFrameBuf",       hle_SetFrameBuf);
+     psp_hle_register(0x36CDFADE, "sceDisplay", "sceDisplayWaitVblank",        hle_WaitVblank);
+     psp_hle_register(0x46F186C3, "sceDisplay", "sceDisplayWaitVblankStartCB", hle_WaitVblank);
++    psp_hle_register(0x9C6EAAD7, "sceDisplay", "sceDisplayGetVcount",         hle_GetVcount);
++    psp_hle_register(0x210EAB3A, "sceDisplay", "sceDisplayGetAccumulatedHcount",
++                     hle_GetAccumulatedHcount);
+ }
+diff --git a/src/hle/sysmem.c b/src/hle/sysmem.c
+index b084e6e..ed73de6 100644
+--- a/src/hle/sysmem.c
++++ b/src/hle/sysmem.c
+@@ -42,7 +42,7 @@ static uint32_t  g_heap_lo, g_heap_hi;
+ /* Default user heap. Modules load at 0x08800000 and are a few megabytes, so
+  * starting above them keeps the allocator from handing out memory the module
+  * itself occupies. A host that knows its real layout should narrow this. */
+-#define DEFAULT_HEAP_LO 0x08C00000u
++#define DEFAULT_HEAP_LO 0x09600000u
+ #define DEFAULT_HEAP_HI (PSP_RAM_BASE + PSP_RAM_SIZE)
+ 
+ void psp_sysmem_reset(void) {
+diff --git a/src/vfpu.c b/src/vfpu.c
+index 077f80b..04af528 100644
+--- a/src/vfpu.c
++++ b/src/vfpu.c
+@@ -732,6 +732,25 @@ void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
+     end_op();
+ }
+ 
++/* vcmovt.v / vcmovf.v -- conditional move. `imm` is the instruction's 4-bit
++ * selector (rt bits 16..19): 0..3 pick the per-lane compare bits, 4 the "any"
++ * bit, 5 the "all" bit, 6/7 are the constant false/true, and bit 3 inverts
++ * (the vcmovf form). Nothing is written when the condition fails, which is
++ * what makes it a conditional move rather than a blend. */
++void psp_vcmov(uint32_t vd, uint32_t vs, int size, int imm) {
++    const int bit = imm & 7;
++    int take;
++    if (bit < 6) take = (int)((psp_cpu.vfpu_cc >> bit) & 1u);
++    else         take = bit == 7;
++    if (imm & 8) take = !take;
++    if (take) {
++        float s[4];
++        read_src(0, vs, size, s);
++        write_dst(vd, size, s);
++    }
++    end_op();
++}
++
+ /* viim / vfim -- write a single lane from an immediate encoded in the
+  * instruction. No prefixes apply: there is no source operand to rewrite. */
+ void psp_vimm(uint32_t vd, float value) {
+diff --git a/tools/allegrexrecomp/emit.c b/tools/allegrexrecomp/emit.c
+index 0bf4678..9d0ab41 100644
+--- a/tools/allegrexrecomp/emit.c
++++ b/tools/allegrexrecomp/emit.c
+@@ -511,6 +511,12 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+         fprintf(f, "%spsp_vcst(%u, %u, %u);\n", ind, in->vd, in->vs, in->vsize);
+         return;
+ 
++    /* vcmovt/vcmovf: the condition selector is the rt field (bits 16..19). */
++    case A_VCMOV:
++        fprintf(f, "%spsp_vcmov(%u, %u, %u, %u);\n",
++                ind, in->vd, in->vs, in->vsize, in->rt);
++        return;
++
+     /* Immediate loads: the value is in the instruction, not a register. */
+     case A_VIIM:
+         fprintf(f, "%spsp_vimm(%u, %.1ff);\n", ind, in->vd, (double)in->imm);
