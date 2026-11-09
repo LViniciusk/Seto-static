@@ -158,6 +158,15 @@ static int box_up(void) {
     return light * 4 > total * 3;
 }
 
+static void field_press(uint32_t mask) {
+    psp_title_walk(mask, 128, 128);
+    psp_ctrl_set(mask, 128, 128);
+    Sleep(300);
+    psp_title_walk(0, 128, 128);
+    psp_ctrl_set(0, 128, 128);
+    Sleep(120);
+}
+
 static int screen_black(void) {
     static uint32_t px[480 * 272];
     if (psp_display_read(px) != 0) return 0;
@@ -337,6 +346,69 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                             }
                             fprintf(stderr, "input: auto advance guard=%d box=%d\n",
                                     guard, box_up());
+                            /* The command menu opens after an analog
+                             * down-right walk (255,255) followed by CROSS. */
+                            int menu = 0, seen_script = 0;
+                            for (int i = 0; i < 1500 && !menu; i++) {
+                                const uint32_t st = psp_read32(0x093CDAFCu);
+                                if (st == 5u || st == 6u || st == 23u) seen_script = 1;
+                                if (st == 1u && seen_script) {
+                                    for (int pass = 0; pass < 2 && box_up(); pass++) {
+                                        psp_title_walk(0, 255, 255);
+                                        psp_ctrl_set(0, 255, 255);
+                                        Sleep(1500);
+                                        psp_title_walk(0, 128, 128);
+                                        psp_ctrl_set(0, 128, 128);
+                                        Sleep(500);
+                                    }
+                                    for (int g = 0; g < 20 && box_up(); g++) {
+                                        auto_press(0x00004000u);
+                                        Sleep(250);
+                                    }
+                                    psp_title_walk(0, 255, 255);
+                                    psp_ctrl_set(0, 255, 255);
+                                    Sleep(2800);
+                                    psp_title_walk(0, 128, 128);
+                                    psp_ctrl_set(0, 128, 128);
+                                    Sleep(800);
+                                    field_press(0x00004000u);
+                                    Sleep(1500);
+                                    psp_display_capture("build/s93-menu-open.ppm");
+                                    fprintf(stderr, "input: auto menu-open state=%u\n",
+                                            psp_read32(0x093CDAFCu));
+                                    for (int d = 0; d < 4; d++) {
+                                        field_press(0x00000040u);
+                                        Sleep(600);
+                                    }
+                                    psp_display_capture("build/s93-map-sel.ppm");
+                                    field_press(0x00004000u);
+                                    Sleep(5000);
+                                    psp_display_capture("build/s93-map.ppm");
+                                    field_press(0x00004000u);
+                                    Sleep(4000);
+                                    psp_display_capture("build/s93-exit-yes.ppm");
+                                    /* Confirm the highlighted destination on
+                                     * the world map, then let the travel and
+                                     * the story request their modules. */
+                                    for (int k = 0; k < 20; k++) {
+                                        auto_press(0x00004000u);
+                                        Sleep(800);
+                                        if (k == 10) {
+                                            psp_display_capture("build/s93-map-confirm.ppm");
+                                        }
+                                    }
+                                    for (int k = 0; k < 8; k++) Sleep(1000);
+                                    psp_display_capture("build/s93-map-after.ppm");
+                                    menu = 1;
+                                    break;
+                                }
+                                auto_press(0x00004000u);
+                                Sleep(150);
+                            }
+                            if (menu) {
+                                fprintf(stderr, "input: auto menu path done\n");
+                                return 0;
+                            }
                             static const struct { int ax, ay; const char *name; }
                             dirs[] = {
                                 { 128, 255, "up" }, { 0, 128, "left" },

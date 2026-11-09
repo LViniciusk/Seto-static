@@ -1091,6 +1091,28 @@ which is why no single raw pad bit opens the command menu.
 **Next target.** Reproduce the field command menu, choose Map → “Exit from this
 spot?” YES, and follow the story into the classroom to the first scripted duel.
 
+## S9.8 results — field command menu and world map
+
+**The command menu is now opened deterministically.** In field state 1 (free
+roam, after a script state 5/6/23), the host holds the analog stick down-right
+(`(255,255)`) for ~2.8 s, stops, and presses CROSS. The original game draws the
+Talk/Duel/Item/PDA/Map menu (`build/s93-menu-open.ppm`, reproduced in every run
+since the discovery). Four D-pad DOWNs move the highlight to **Map**
+(`build/s93-map-sel.ppm`); CROSS opens “Exit from this spot?” with YES/NO
+(`build/s93-map.ppm`); CROSS confirms YES and the game plays the story
+transition into the **Duel Academy world map**
+(`build/s93-exit-yes.ppm`).
+
+The earlier failures are explained: START does not open the menu, and the
+trigger is the analog down-right walk + CROSS in real free roam, not a raw pad
+bit handled by `modfield`/the pad consumers.
+
+**Next target.** Confirm a destination on the world map (the first probes
+opened a Save Point dialog; the destination list seen in `s200-wait` is the
+travel selection), then follow the story to the first scripted duel and capture
+the ModuleMgr requests for the duel PRXs. `moddeck` (LBN `0x56f0`) and
+`moddeck_tutorial` (LBN `0x5790`) are already loadable.
+
 ## Limitations
 
 - `sceReg` serves only the `/DATA/FONT` and `/SYSPROFILE/RESOLUTION` subtrees
