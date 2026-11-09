@@ -257,6 +257,17 @@ void psp_title_pad_request(uint32_t mask) {
     atomic_store(&g_pad_request, mask);
 }
 
+/* Held analog/button state, applied every vblank until cleared. Used for
+ * movement, where a one-frame press is not enough. */
+static _Atomic uint32_t g_walk_mask;
+static _Atomic int g_walk_x = 128, g_walk_y = 128;
+
+void psp_title_walk(uint32_t mask, int ax, int ay) {
+    atomic_store(&g_walk_x, ax);
+    atomic_store(&g_walk_y, ay);
+    atomic_store(&g_walk_mask, mask);
+}
+
 void psp_title_start_request(int on) {
     if (on) {
         atomic_store(&g_start_done, 0);
@@ -287,6 +298,13 @@ static void title_input_update(uint32_t addr) {
         return;
     }
     if (g_menu_on) { psp_ctrl_set(0, 128, 128); g_menu_on = 0; }
+
+    const int wx = atomic_load(&g_walk_x), wy = atomic_load(&g_walk_y);
+    const uint32_t walk = atomic_load(&g_walk_mask);
+    if (walk || wx != 128 || wy != 128) {
+        psp_ctrl_set(walk, (uint8_t)wx, (uint8_t)wy);
+        return;
+    }
 
     uint32_t pad = atomic_exchange(&g_pad_request, 0);
     if (pad) {

@@ -49,6 +49,7 @@ int  psp_title_scene_phase(void);
 int  psp_title_scene_cursor(void);
 void psp_title_menu_request(uint32_t mask);
 void psp_title_pad_request(uint32_t mask);
+void psp_title_walk(uint32_t mask, int ax, int ay);
 #endif
 
 /* The EBOOT's single PT_LOAD has memsz 0x631A80; .bss runs to there. */
@@ -139,6 +140,35 @@ static DWORD WINAPI bringup_cap(LPVOID unused) {
 #ifdef HAVE_TITLE_CORPUS
 /* Send one menu button until the guest changes the observed cursor or scene
  * state, or a short timeout expires. The title input update supplies the edge. */
+static int box_up(void) {
+    static uint32_t px[480 * 272];
+    if (psp_display_read(px) != 0) return 0;
+    int light = 0, total = 0;
+    for (int y = 210; y < 262; y += 8)
+        for (int x = 60; x < 420; x += 15) {
+            const uint32_t c = px[y * 480 + x];
+            const int r = (int)(c & 0xFF), g = (int)((c >> 8) & 0xFF),
+                      b = (int)((c >> 16) & 0xFF);
+            if (r > 140 && g > 130 && b > 115) light++;
+            total++;
+        }
+    return light * 4 > total * 3;
+}
+
+static int screen_black(void) {
+    static uint32_t px[480 * 272];
+    if (psp_display_read(px) != 0) return 0;
+    int bright = 0;
+    for (int y = 20; y < 250; y += 10)
+        for (int x = 20; x < 460; x += 10) {
+            const uint32_t c = px[y * 480 + x];
+            const int r = (int)(c & 0xFF), g = (int)((c >> 8) & 0xFF),
+                      b = (int)((c >> 16) & 0xFF);
+            if (r + g + b > 40) bright++;
+        }
+    return bright < 40;
+}
+
 static void auto_press(uint32_t mask) {
     /* The title's vblank hook consumes the one-shot; scenes that run without
      * that hook read the direct state, which is held here for 100 ms. */
@@ -276,16 +306,63 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                 Sleep(100);
                             fprintf(stderr, "input: auto story advance field=%d\n",
                                     psp_field_started());
-                            for (int i = 0; i < 40; i++) {
+                            for (int i = 0; i < 100 && !box_up(); i++)
+                                Sleep(100);
+                            int guard = 0;
+                            for (; guard < 300 && box_up(); guard++) {
                                 auto_press(0x00004000u);
-                                Sleep(600);
-                                if (i == 5 || i == 20) {
+                                Sleep(200);
+                            }
+                            fprintf(stderr, "input: auto advance guard=%d box=%d\n",
+                                    guard, box_up());
+                            static const struct { int ax, ay; const char *name; }
+                            dirs[] = {
+                                { 128, 255, "up" }, { 0, 128, "left" },
+                                { 255, 128, "right" }, { 128, 0, "down" },
+                            };
+                            for (int d = 0; d < 4; d++) {
+                                for (int g = 0; g < 80 && box_up(); g++) {
+                                    auto_press(0x00004000u);
+                                    Sleep(250);
+                                }
+                                psp_title_walk(0, dirs[d].ax, dirs[d].ay);
+                                Sleep(4000);
+                                psp_title_walk(0, 128, 128);
+                                Sleep(1200);
+                                if (strcmp(dirs[d].name, "left") == 0 ||
+                                    strcmp(dirs[d].name, "right") == 0) {
+                                    auto_press(0x00004000u);
+                                    Sleep(1500);
+                                }
+                                char path[64];
+                                snprintf(path, sizeof path, "build/s93-dir-%s.ppm",
+                                         dirs[d].name);
+                                psp_display_capture(path);
+                                fprintf(stderr, "input: auto dir %s box=%d\n",
+                                        dirs[d].name, box_up());
+                            }
+                            auto_press(0x00000008u);
+                            Sleep(5000);
+                            psp_display_capture("build/s93-pause.ppm");
+                            fprintf(stderr, "input: auto pause box=%d black=%d\n",
+                                    box_up(), screen_black());
+                            auto_press(0x00000040u);
+                            Sleep(900);
+                            psp_display_capture("build/s93-pause2.ppm");
+                            auto_press(0x00004000u);
+                            Sleep(3000);
+                            psp_display_capture("build/s93-duel-start.ppm");
+                            for (int i = 0; i < 30; i++) {
+                                auto_press(0x00004000u);
+                                Sleep(900);
+                                if (i == 5 || i == 15 || i == 25) {
                                     char path[64];
-                                    snprintf(path, sizeof path, "build/s93-story%d.ppm", i);
-                                    if (psp_display_capture(path) == 0)
-                                        fprintf(stderr, "capture: story frame %d\n", i);
+                                    snprintf(path, sizeof path, "build/s93-pduel%d.ppm", i);
+                                    psp_display_capture(path);
                                 }
                             }
+                            fprintf(stderr, "input: auto after duel state=%d phase=%d box=%d\n",
+                                    psp_title_scene_state(), psp_title_scene_phase(), box_up());
                             fprintf(stderr, "input: auto story done state=%d phase=%d\n",
                                     psp_title_scene_state(), psp_title_scene_phase());
                         }

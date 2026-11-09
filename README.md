@@ -48,6 +48,12 @@ the Story/Deck/Character List modules, and renders the Group List screen. A
 title-menu option for a duel has not yet been driven to a battle (see
 [S9.3 results](#s93-results--story-name-menu)).
 
+**S9.6 — field action menu: PASS (menu), PARTIAL (duel).** START opens the
+field Talk/Duel/Item/PDA/Map menu at the idle state; DOWN selects Duel and
+CROSS starts the pre-duel conversation. Following the exit hint and loading
+`moddeck`/the duel PRXs is the next step (see
+[S9.6 results](#s96-results--field-action-menu-and-duel)).
+
 **S9.5 — readable text and moddeck: PARTIAL.** A small `sceReg` HLE plus a
 `flash0:` mapping lets the real font library open the system PGF, so menus and
 story dialogue now render and the opening conversation advances. `moddeck`
@@ -947,6 +953,36 @@ route to a first duel.
 **Gap.** No duel has been started. The story conversation is long and the
 player has not yet left the Chancellor's Office; Free Duel selection needs a
 reliable single-step menu input.
+
+## S9.6 results — field action menu and Duel
+
+**The field action menu opens with START.** At the field idle state (after the
+office conversation, no dialogue box up), pressing START (`0x00000008`) draws
+the NPC action menu:
+
+```text
+Talk
+Duel
+Item
+PDA
+Map
+```
+
+Earlier probes missed it because they pressed START during a dialogue or a
+fade (which triggers a scene wipe instead). With the menu up, one D-pad DOWN
+moves the highlight from Talk to **Duel** (`build/s181-pause2.ppm`), and CROSS
+starts the pre-duel conversation. Sheppard then gives the route hint: “The exit
+is at the bottom right hand of this room.” (`build/s181-pduel25.ppm`).
+
+**Deck request observed.** Navigating the menu also made the story request
+`libdeck.prx` (LBN `0x56f0`). In story mode the host does not load moddeck:
+story (`0x08910000`), field (`0x08C00000`) and the 13.8 MB deck `.bss` do not
+fit the current RAM windows together, so the request fails with ENOENT. This is
+the next memory-layout blocker, not a missing game call.
+
+**Next target.** Follow the bottom-right exit to the classroom and reach the
+first scripted duel; free or reuse a module window so `moddeck` and the duel
+PRXs can load while story/field are resident.
 
 ## Limitations
 
