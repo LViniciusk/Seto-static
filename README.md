@@ -1107,11 +1107,18 @@ The earlier failures are explained: START does not open the menu, and the
 trigger is the analog down-right walk + CROSS in real free roam, not a raw pad
 bit handled by `modfield`/the pad consumers.
 
-**Next target.** Confirm a destination on the world map (the first probes
-opened a Save Point dialog; the destination list seen in `s200-wait` is the
-travel selection), then follow the story to the first scripted duel and capture
-the ModuleMgr requests for the duel PRXs. `moddeck` (LBN `0x56f0`) and
-`moddeck_tutorial` (LBN `0x5790`) are already loadable.
+**Destination list opens.** On the world map, four D-pad moves (right, up,
+left, down) followed by CROSS open the travel destination list: Main Gate
+(highlighted), Classroom, Store, Duel Field, Chancellor's Office
+(`build/s93-map-cross.ppm`). The host now sends DOWN (Classroom) and CROSS to
+travel. The emulator slowed to ~2 vblanks/s after hours of runs, so the
+confirmation itself has not yet completed inside the bring-up cap; the list
+itself is reproduced.
+
+**Next target.** Complete the Classroom travel (DOWN + CROSS) and follow the
+story to the first scripted duel, capturing the ModuleMgr requests for the duel
+PRXs. `moddeck` (LBN `0x56f0`) and `moddeck_tutorial` (LBN `0x5790`) are already
+loadable.
 
 ## Limitations
 

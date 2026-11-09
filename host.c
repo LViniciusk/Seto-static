@@ -390,15 +390,45 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                     /* Confirm the highlighted destination on
                                      * the world map, then let the travel and
                                      * the story request their modules. */
-                                    for (int k = 0; k < 20; k++) {
+                                    /* The map cursor sits on a location; the
+                                     * D-pad should move it between nodes and
+                                     * CROSS opens that location's menu. */
+                                    static const struct { uint32_t m; const char *n; }
+                                    mdirs[] = {
+                                        { 0x00000020u, "right" }, { 0x00000010u, "up" },
+                                        { 0x00000080u, "left" },  { 0x00000040u, "down" },
+                                    };
+                                    for (int d = 0; d < 4; d++) {
+                                        auto_press(mdirs[d].m);
+                                        Sleep(1500);
+                                        char path[64];
+                                        snprintf(path, sizeof path, "build/s93-map-%s.ppm",
+                                                 mdirs[d].n);
+                                        psp_display_capture(path);
+                                    }
+                                    auto_press(0x00004000u);
+                                    Sleep(2500);
+                                    psp_display_capture("build/s93-map-cross.ppm");
+                                    /* Destination list: Main Gate is first,
+                                     * Classroom second. Go to the classroom. */
+                                    auto_press(0x00000040u);
+                                    Sleep(1200);
+                                    psp_display_capture("build/s93-travel-class.ppm");
+                                    auto_press(0x00004000u);
+                                    Sleep(4000);
+                                    psp_display_capture("build/s93-travel0.ppm");
+                                    for (int k = 0; k < 15; k++) {
                                         auto_press(0x00004000u);
-                                        Sleep(800);
-                                        if (k == 10) {
-                                            psp_display_capture("build/s93-map-confirm.ppm");
+                                        Sleep(1000);
+                                        if (k == 5 || k == 10) {
+                                            char path[64];
+                                            snprintf(path, sizeof path,
+                                                     "build/s93-travel%d.ppm", k);
+                                            psp_display_capture(path);
                                         }
                                     }
-                                    for (int k = 0; k < 8; k++) Sleep(1000);
-                                    psp_display_capture("build/s93-map-after.ppm");
+                                    for (int k = 0; k < 10; k++) Sleep(1000);
+                                    psp_display_capture("build/s93-travel-after.ppm");
                                     menu = 1;
                                     break;
                                 }
