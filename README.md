@@ -1044,12 +1044,12 @@ for the room exit.
 
 **Pad pipeline (static analysis).** The EBOOT updates the pad in
 `psp_func_08035AC8` (calls `sceCtrlPeekBufferPositive`, 0x3A622550) and keeps
-the processed snapshot at `0x0810152C` (getter `0x08035CFC`, libehsys export
+the processed snapshot at `0x08101534` (getter `0x08035CFC`, libehsys export
 NID `0xF5E3080C`). `modstory` imports 95 libehsys exports and none of them is
 that getter; the field pad handler `0x08C0D4E8` receives the state pointer in
 `a0` and writes only TRIANGLE -> state 23 and SQUARE -> state 5. CROSS and
 START never reach either handler, so the field command menu is owned by the
-EBOOT/story UI code that consumes the snapshot from `0x0810152C`.
+EBOOT/story UI code that consumes the snapshot from `0x08101534`.
 
 **START in the actual free-roam state.** The host now waits for field state 1
 (free roam, after a script state 5/6/23 occurred) and presses START there.
