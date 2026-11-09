@@ -48,6 +48,12 @@ the Story/Deck/Character List modules, and renders the Group List screen. A
 title-menu option for a duel has not yet been driven to a battle (see
 [S9.3 results](#s93-results--story-name-menu)).
 
+**S9.5 — readable text and moddeck: PARTIAL.** A small `sceReg` HLE plus a
+`flash0:` mapping lets the real font library open the system PGF, so menus and
+story dialogue now render and the opening conversation advances. `moddeck`
+runs and its Deck Editor renders; no duel has been started yet (see
+[S9.5 results](#s95-results--system-fonts-readable-text-and-moddeck)).
+
 **S9.4 — modstory/modfield: PARTIAL.** The real `libstory.prx` and
 `libfield.prx` images are relocated and executed. `modstory`'s `module_start`
 runs, requests `libfield.prx` through ModuleMgr, and `modfield`'s
@@ -109,6 +115,7 @@ git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s8-input.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s8-wakeup-yield.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s9-mailbox.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s9-field.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s9-font.patch
 
 cmake -S build/psprecomp -B build/psprecomp-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build/psprecomp-build -j 8
@@ -644,7 +651,7 @@ request, during the title load. That is the pre-existing `ehfile_queue` race,
 not caused by START and not blocking the transition. The same race appeared
 before START in earlier runs. A 6 s physical Enter test produced exactly one
 `input: START press`, one release, and scene state 3 with zero bad accesses.
-Upstream tests 21/21; LBN seek PASS; all thirteen psprecomp patches apply to
+Upstream tests 21/21; LBN seek PASS; all fourteen psprecomp patches apply to
 `5ca18fa` and the clean tree passes 21/21.
 
 To reproduce: `SETO_BRINGUP_CAP=60` and `SETO_AUTO_START=1` (request at step 1,
@@ -898,14 +905,52 @@ unimplemented calls (Atrac plus `sceReg`). The story message files
 the GE for the dialogue, while the HUD text renders. No duel has been reached;
 the story starts in free roam and the dialogue cannot be read.
 
+## S9.5 results — system fonts, readable text and moddeck
+
+**Root cause of the missing text.** `sceFontOpen` always returned handle 0 and
+`sceFontGetCharInfo`/`GetCharGlyphImage` failed with `0x80460003`. The font
+library asks the registry for its font list (`/DATA/FONT`: `path_name`,
+`num_fonts`, `/DATA/FONT/PROPERTY/INFO0...`), then opens
+`flash0:/font/ltn0.pgf`. `sceReg` was unimplemented and the host had no flash0,
+so no font was ever loaded. The HUD draws with the game's own bitmap font,
+which is why it worked while every `sceFont` string was blank.
+
+**Fix.** `sceReg` now serves the `/DATA/FONT` and `/SYSPROFILE/RESOLUTION`
+subtrees with the PSP-3000 values (Latin regular font = `ltn0.pgf`), and the
+file HLE maps `flash0:/...` under `PSPRECOMP_FLASH0`. The font assets come from
+a local PSP flash0 dump (the PPSSPP asset tree also carries them); they are
+Sony firmware data and are **not** versioned here. With
+`PSPRECOMP_FLASH0=<flash0 root>` the real font library opens the PGF, and
+`GetCharInfo` returns real metrics.
+
+**Result.** Text now renders everywhere: the title/menu labels, the main menu
+(`Story Mode`, `Free Duel`, `Deck Menu`, ...), the story location
+(`Chancellor's Office`), speaker names and dialogue. The opening conversation
+advances with CROSS (`We aim to create the next generation of duelists.`,
+`Study hard to become the next King of Games.`, `Leave here and get to the
+Classroom at once.`). A clean run reaches the story scene with **0 bad
+accesses** (`build/s124-story20.ppm`).
+
+**moddeck.** Free Duel/Deck Menu requests `libdeck.prx` (LBN `0x56f0`). The
+13.8 MB `.bss` image is relocated to `0x08910000` (Free Duel mode does not load
+story/field) and its `module_start` runs; the real Deck Editor renders
+(`build/s105-duel15.png`). The synthetic main-menu navigation still moves more
+than one entry per injected press, so selecting Free Duel deterministically is
+an open issue; the deck path was reached through the neighbouring Deck Menu.
+
+**Gap.** No duel has been started. The story conversation is long and the
+player has not yet left the Chancellor's Office; Free Duel selection needs a
+reliable single-step menu input.
+
 ## Limitations
 
-- `sceReg` is not implemented: the font library's registry reads return 0 and
-  it uses defaults. `GetCharInfo`/`GetCharGlyphImage` are now reached, but the
-  story dialogue text still does not reach the GE; HUD text renders.
-- `libtitle.prx`, `libstory.prx` and `libfield.prx` are integrated; `libdeck`,
-  `libcharalist` and the duel modules are not. The duel path is still blocked
-  before a battle.
+- `sceReg` serves only the `/DATA/FONT` and `/SYSPROFILE/RESOLUTION` subtrees
+  the font library reads; other categories return not-found and the library
+  uses defaults. Fonts need a flash0 tree via `PSPRECOMP_FLASH0`; without it the
+  game runs but `sceFont` strings are blank.
+- `libtitle.prx`, `libstory.prx`, `libfield.prx` and `libdeck.prx` are
+  integrated; `libcharalist`, the deck-tutorial/recipe viewers and the duel
+  modules are not. The duel path is still blocked before a battle.
 - The rebased corpus relocates the EBOOT into the PSP user RAM window. The host
   refuses the unrelocated image instead of guessing its base.
 - Audio is paced by the runtime but not played; the Atrac stream calls remain
@@ -921,6 +966,6 @@ the story starts in free roam and the dialogue cannot be read.
 
 Tracked: this README, `.gitignore`, `host.c`, `umd.c`, `fpl.c`, `font_prx.c`,
 `title_prx.c`, `scripts/relocate_prx.py`, `CMakeLists.txt`, `tests/lbn_seek.c`,
-and thirteen small patches against the pinned psprecomp. `build/` (tool clone, generated C,
+and fourteen small patches against the pinned psprecomp. `build/` (tool clone, generated C,
 relocated ELF, objects, executable) and `private/` (decrypted EBOOT, ISO) are
 ignored.

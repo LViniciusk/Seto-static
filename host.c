@@ -35,6 +35,9 @@ int  psp_story_started(void);
 int  psp_field_image_load(const char *path, uint32_t eboot_info);
 int  psp_field_started(void);
 #endif
+#ifdef HAVE_DECK_CORPUS
+int  psp_deck_image_load(const char *path, uint32_t eboot_info);
+#endif
 #ifdef HAVE_TITLE_CORPUS
 int  psp_title_image_load(const char *path, uint32_t eboot_info);
 int  psp_title_menu_ready(void);
@@ -145,6 +148,18 @@ static void auto_press(uint32_t mask) {
     psp_ctrl_set(0, 128, 128);
 }
 
+/* One press of a state-3 menu key: the vblank hook applies it for exactly one
+ * frame. The direct pad path is not used here because it would produce a
+ * second edge and the cursor would skip an entry. */
+static void menu_step(uint32_t mask) {
+    const int c0 = psp_title_scene_cursor();
+    psp_title_menu_request(mask);
+    for (int i = 0; i < 3000 && psp_title_scene_cursor() == c0; i++)
+        Sleep(1);
+    psp_title_menu_request(0);
+    Sleep(150);
+}
+
 static void auto_menu(uint32_t mask, int by_cursor) {
     const int c0 = psp_title_scene_cursor();
     const int s0 = psp_title_scene_state();
@@ -229,6 +244,21 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                             Sleep(1500);
                             fprintf(stderr, "input: auto main menu cursor=%d\n",
                                     psp_title_scene_cursor());
+                            if (getenv("SETO_FREE_DUEL")) {
+                                menu_step(0x00000040u);
+                                psp_display_capture("build/s93-free-menu.ppm");
+                                menu_step(0x00004000u);
+                                for (int i = 0; i < 15; i++) {
+                                    Sleep(1000);
+                                    if (i == 5 || i == 10) {
+                                        char path[64];
+                                        snprintf(path, sizeof path, "build/s93-duel%d.ppm", i);
+                                        psp_display_capture(path);
+                                    }
+                                }
+                                fprintf(stderr, "input: auto duel state=%d phase=%d\n",
+                                        psp_title_scene_state(), psp_title_scene_phase());
+                            } else {
                             auto_press(0x00004000u);
                             for (int i = 0; i < 30 && !psp_story_started(); i++) {
                                 auto_press((i & 1) ? 0x00004000u : 0x00000008u);
@@ -237,6 +267,7 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                             fprintf(stderr, "input: auto main menu state=%d phase=%d story=%d\n",
                                     psp_title_scene_state(), psp_title_scene_phase(),
                                     psp_story_started());
+                            }
                         }
                         if (psp_display_capture("build/s92-name.ppm") == 0)
                             fprintf(stderr, "capture: build/s92-name.ppm\n");
@@ -245,10 +276,10 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                 Sleep(100);
                             fprintf(stderr, "input: auto story advance field=%d\n",
                                     psp_field_started());
-                            for (int i = 0; i < 20; i++) {
+                            for (int i = 0; i < 40; i++) {
                                 auto_press(0x00004000u);
-                                Sleep(800);
-                                if (i == 5 || i == 15) {
+                                Sleep(600);
+                                if (i == 5 || i == 20) {
                                     char path[64];
                                     snprintf(path, sizeof path, "build/s93-story%d.ppm", i);
                                     if (psp_display_capture(path) == 0)
@@ -387,6 +418,8 @@ int main(int argc, char **argv) {
     const char *title = argc > 4 ? argv[4] : NULL;
     const char *story = argc > 5 ? argv[5] : NULL;
     const char *field = argc > 6 ? argv[6] : NULL;
+    const char *deck = argc > 7 ? argv[7] : NULL;
+    const int free_duel = getenv("SETO_FREE_DUEL") != NULL;
 
     if (psp_mem_init() != 0) { fprintf(stderr, "memory init failed\n"); return 1; }
 
@@ -433,19 +466,31 @@ int main(int argc, char **argv) {
         return 1;
     }
 #endif
+    /* Story mode and Free Duel use the same guest window (0x08910000), so the
+     * host loads only the image set the selected mode will ask for. */
+    if (!free_duel) {
 #ifdef HAVE_STORY_CORPUS
-    if (story && psp_story_image_load(story, m.info) != 0) return 1;
+        if (story && psp_story_image_load(story, m.info) != 0) return 1;
 #else
-    if (story) {
-        fprintf(stderr, "story PRX: this build has no story corpus (build/s93-story-reloc)\n");
-        return 1;
-    }
+        if (story) {
+            fprintf(stderr, "story PRX: this build has no story corpus (build/s93-story-reloc)\n");
+            return 1;
+        }
 #endif
 #ifdef HAVE_FIELD_CORPUS
-    if (field && psp_field_image_load(field, m.info) != 0) return 1;
+        if (field && psp_field_image_load(field, m.info) != 0) return 1;
 #else
-    if (field) {
-        fprintf(stderr, "field PRX: this build has no field corpus (build/s93-field-reloc)\n");
+        if (field) {
+            fprintf(stderr, "field PRX: this build has no field corpus (build/s93-field-reloc)\n");
+            return 1;
+        }
+#endif
+    }
+#ifdef HAVE_DECK_CORPUS
+    if (free_duel && deck && psp_deck_image_load(deck, m.info) != 0) return 1;
+#else
+    if (free_duel && deck) {
+        fprintf(stderr, "deck PRX: this build has no deck corpus (build/s93-deck2-reloc)\n");
         return 1;
     }
 #endif
@@ -463,6 +508,7 @@ int main(int argc, char **argv) {
     if (title) printf("title   \"%s\"\n", title);
     if (story) printf("story   \"%s\"\n", story);
     if (field) printf("field   \"%s\"\n", field);
+    if (deck) printf("deck    \"%s\"\n", deck);
     printf("image   0x%08X..0x%08X  entry 0x%08X  gp 0x%08X  ctors %d\n",
            m.base, m.image_end, m.entry, m.gp, m.nctors);
     printf("dispatch %u functions/labels registered\n", psp_dispatch_count());
