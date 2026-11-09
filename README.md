@@ -1051,6 +1051,15 @@ that getter; the field pad handler `0x08C0D4E8` receives the state pointer in
 START never reach either handler, so the field command menu is owned by the
 EBOOT/story UI code that consumes the snapshot from `0x0810152C`.
 
+**START in the actual free-roam state.** The host now waits for field state 1
+(free roam, after a script state 5/6/23 occurred) and presses START there.
+Result: `free-start menu=0 state=1` — START does nothing even in the real
+free-roam state with Sheppard's empty target plate up. A held CROSS in the same
+state moves the field to state 6 (dialogue) and a tap to state 23 (script), so
+CROSS is the conversation button, not the command-menu button. The Talk/Duel/
+Item/PDA/Map menu therefore does not come from a raw pad bit handled by the
+field or by the four observed EBOOT pad consumers.
+
 **Live tracing.** `SETO_TRACE_FIELD=1` logs the field state word
 (`0x093CDAFC`) on every change and every `story -> field` command dispatch
 (export `0x86220A06`). A headless story run shows the field cycling
