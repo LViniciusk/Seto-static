@@ -54,6 +54,15 @@ requested `libdeck_tutorial.prx` (LBN `0x5790`); the module is recompiled at
 `0x093E0000` and its image/exports load, but its start was not yet reproduced
 (see [S9.7 results](#s97-results--office-exit-and-moddeck_tutorial)).
 
+**S9.9 — duel subsystem integrated: PARTIAL.** The six PRXs behind the first
+scripted duel are discovered from the ISO (`modduel_mgr`, LBN `0x5c20`, plus
+`modduel_eng`, `modduel_draw`, `moddeck_swap`, `modtutorial`,
+`modduelrecord`), recompiled, and loaded into the low window
+(`0x02200000`–`0x03556890`) with their imports resolved. The runtime now maps
+multiple low-window PRX images. A duel has not started yet; the trip to the
+Classroom and its dialogue are the last reproduced story steps (see
+[S9.9 results](#s99-results--duel-subsystem-integrated)).
+
 **S9.6 — field action menu: PASS (menu), PARTIAL (duel).** START opens the
 field Talk/Duel/Item/PDA/Map menu at the idle state; DOWN selects Duel and
 CROSS starts the pre-duel conversation. Following the exit hint and loading
@@ -128,6 +137,7 @@ git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s8-wakeup-yield.pat
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s9-mailbox.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s9-field.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s9-font.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s9-duel.patch
 
 cmake -S build/psprecomp -B build/psprecomp-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build/psprecomp-build -j 8
@@ -1120,15 +1130,119 @@ story to the first scripted duel, capturing the ModuleMgr requests for the duel
 PRXs. `moddeck` (LBN `0x56f0`) and `moddeck_tutorial` (LBN `0x5790`) are already
 loadable.
 
+## S9.9 results — duel subsystem integrated
+
+**The duel PRX set.** The EBOOT's module table (ISO offset `0x13100`) names the
+`lib*.prx` aliases; scanning the ISO for `SceModuleInfo` matched them to the
+real files. The first scripted duel's manager is `modduel_mgr` (LBN `0x5c20`,
+`0x1f6f2` bytes). Its import table names the dependencies and their function
+counts: libehsys 1,245; libduel_eng 143; libduel_draw 38; libdeck_swap 3;
+libtutorial 7. Matching the ELF headers gives:
+
+| module | LBN | file bytes | memsz | imports |
+| --- | --- | --- | --- | --- |
+| `modduel_mgr` | `0x5c20` | `0x1f6f2` | `0xB18610` | libehsys, libduel_eng, libduel_draw, libdeck_swap, libtutorial |
+| `modduel_eng` | `0x5940` | `0x16cc7a` | `0x116210` | libehsys |
+| `modduel_draw` | `0x5800` | `0x9d22a` | `0x457A20` | libduel_eng, libehsys |
+| `moddeck_swap` | `0x5750` | `0x1d212` | `0x17290` | libehsys, libduel_draw |
+| `modtutorial` | `0x5ef0` | `0xfdba` | `0x13B10` | libehsys, libduel_draw, libduel_eng |
+| `modduelrecord` | `0x57f0` | `0x7da2` | `0x6890` | libehsys |
+
+None of their export NIDs collide with libehsys, so the import forwarder can
+resolve by NID alone.
+
+Reproduction (slice by LBN, then relocate and emit each corpus):
+
+```powershell
+$iso = 'C:\Users\Vinicius\Documents\Github\Seto\TF1.iso'
+$fs = [IO.File]::OpenRead($iso)
+foreach ($e in @(@(0x5c20, 0x1f6f2, 'build\libduel_mgr.prx'),
+                 @(0x5940, 0x16cc7a, 'build\libduel_eng.prx'),
+                 @(0x5800, 0x9d22a, 'build\libduel_draw.prx'),
+                 @(0x5750, 0x1d212, 'build\libdeck_swap.prx'),
+                 @(0x5ef0, 0xfdba, 'build\libtutorial.prx'),
+                 @(0x57f0, 0x7da2, 'build\libduelrecord.prx'))) {
+    $fs.Position = [int64]$e[0] * 2048
+    $buf = New-Object byte[] $e[1]
+    [void]$fs.Read($buf, 0, $e[1])
+    [IO.File]::WriteAllBytes($e[2], $buf)
+}
+$fs.Close()
+python scripts\relocate_prx.py build\libduel_mgr.prx   build\s9duel-mgr-reloc.elf  --base 0x02200000
+python scripts\relocate_prx.py build\libduel_eng.prx   build\s9duel-eng-reloc.elf  --base 0x02E00000
+python scripts\relocate_prx.py build\libduel_draw.prx  build\s9duel-draw-reloc.elf --base 0x03000000
+python scripts\relocate_prx.py build\libdeck_swap.prx  build\s9duel-swap-reloc.elf --base 0x03500000
+python scripts\relocate_prx.py build\libtutorial.prx   build\s9duel-tut-reloc.elf  --base 0x03530000
+python scripts\relocate_prx.py build\libduelrecord.prx build\s9duel-rec-reloc.elf  --base 0x03550000
+& $tool emit build\s9duel-mgr-reloc.elf  build\s9duel-mgr-reloc  duelmgr
+& $tool emit build\s9duel-eng-reloc.elf  build\s9duel-eng-reloc  dueleng
+& $tool emit build\s9duel-draw-reloc.elf build\s9duel-draw-reloc dueldraw
+& $tool emit build\s9duel-swap-reloc.elf build\s9duel-swap-reloc duelswap
+& $tool emit build\s9duel-tut-reloc.elf  build\s9duel-tut-reloc  dueltut
+& $tool emit build\s9duel-rec-reloc.elf  build\s9duel-rec-reloc  duelrec
+```
+
+**Integration.** Six corpora are emitted from the relocated images and loaded
+at `0x02200000`, `0x02E00000`, `0x03000000`, `0x03500000`, `0x03530000` and
+`0x03550000` — above moddeck's window (`0x01400000`–`0x021CEE10`), so a deck
+request cannot overwrite the duel manager. `duel_prx.c` loads them, builds one
+export table per module (each entry carries that module's `$gp`), forwards
+imports at call time, and answers ModuleMgr Load/Start for the six LBN paths
+and their `lib*.prx` basenames.
+
+**Runtime mapping.** The pinned psprecomp had a single "extra" low-window
+mapping, already used by libtitle and moddeck, so a second PRX set could not be
+placed. `patches/psprecomp-5ca18fa-s9-duel.patch` turns it into a 12-slot table
+and matches each range in order. The patch applies on top of the previous
+fourteen (`git apply --check` exits 0).
+
+**Evidence (headless).** Before the guest runs, the host loads all six images:
+
+```text
+duel PRX modduel_mgr 0x02200000..0x02D18610 (11536752 bytes .bss), gp 0x0221FC80, 0 exports, entry 0x02200000
+duel PRX modduel_eng 0x02E00000..0x02F16210 (26656 bytes .bss), gp 0x02F179D0, 143 exports, entry 0x02E00000
+duel PRX modduel_draw 0x03000000..0x03457A20 (4057616 bytes .bss), gp 0x030807E0, 38 exports, entry 0x03001BF4
+duel PRX moddeck_swap 0x03500000..0x03517290 (3728 bytes .bss), gp 0x0351E3E0, 3 exports, entry 0x035117E0
+duel PRX modtutorial 0x03530000..0x03543B10 (31568 bytes .bss), gp 0x03543FA0, 7 exports, entry 0x035302CC
+duel PRX modduelrecord 0x03550000..0x03556890 (192 bytes .bss), gp 0x0355E7B0, 3 exports, entry 0x03550000
+```
+
+`modduel_mgr` reports zero function exports because it exports no callable
+functions; no other module imports it, so that is expected.
+
+**Travel and input.** The host now keeps the scheduler turning until its
+scripted input finishes (plus a 5,000-yield grace slice) instead of stopping
+5,000 yields after `module_start`; that fixed the runs that ended in the middle
+of the Classroom conversation. The exact travel nondeterminism is understood:
+the destination list opens only after the map CROSS's fade ends. When that
+takes longer than 2.5 s, the old DOWN landed on the map and the list later
+opened on Main Gate, where every following CROSS was ignored. The host now
+waits for the list and for the orange highlight to reach Classroom before it
+confirms. The title name entry likewise keeps confirming while the scene is
+still state 4 instead of a fixed 80-press burst. The last headless run with
+that change still stopped at `state=4 phase=3` after the 600 CROSSes, so the
+name-entry flakiness is reduced but not eliminated.
+
+The Classroom conversation itself is reproduced (`build/s282-class25.ppm` …
+`s282-class300.ppm`: Crowler “I'm by far the top teacher in the entire
+Academy.”, “Yeah! I beat you here!”, “No, not that!”). The live Win32 window run
+(`s281`) showed the command menu, Map highlight, exit dialog, world map and
+destination list frame-by-frame.
+
+**Next target.** Confirm the Classroom travel deterministically with the final
+code, capture the ModuleMgr request for `modduel_mgr`, and drive the first duel
+to a processed result.
+
 ## Limitations
 
 - `sceReg` serves only the `/DATA/FONT` and `/SYSPROFILE/RESOLUTION` subtrees
   the font library reads; other categories return not-found and the library
   uses defaults. Fonts need a flash0 tree via `PSPRECOMP_FLASH0`; without it the
   game runs but `sceFont` strings are blank.
-- `libtitle.prx`, `libstory.prx`, `libfield.prx` and `libdeck.prx` are
-  integrated; `libcharalist`, the deck-tutorial/recipe viewers and the duel
-  modules are not. The duel path is still blocked before a battle.
+- `libtitle.prx`, `libstory.prx`, `libfield.prx`, `libdeck.prx`,
+  `libdeck_tutorial.prx` and the six duel PRXs are integrated; `libcharalist`
+  and the recipe viewers are not. The duel images load, but no duel has started
+  yet.
 - The rebased corpus relocates the EBOOT into the PSP user RAM window. The host
   refuses the unrelocated image instead of guessing its base.
 - Audio is paced by the runtime but not played; the Atrac stream calls remain
@@ -1143,7 +1257,8 @@ loadable.
 ## Repo contents
 
 Tracked: this README, `.gitignore`, `host.c`, `umd.c`, `fpl.c`, `font_prx.c`,
-`title_prx.c`, `scripts/relocate_prx.py`, `CMakeLists.txt`, `tests/lbn_seek.c`,
-and fourteen small patches against the pinned psprecomp. `build/` (tool clone, generated C,
+`title_prx.c`, `story_prx.c`, `field_prx.c`, `deck_prx.c`, `decktut_prx.c`,
+`duel_prx.c`, `scripts/relocate_prx.py`, `CMakeLists.txt`, `tests/lbn_seek.c`,
+and fifteen small patches against the pinned psprecomp. `build/` (tool clone, generated C,
 relocated ELF, objects, executable) and `private/` (decrypted EBOOT, ISO) are
 ignored.
