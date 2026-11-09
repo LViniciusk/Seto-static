@@ -11,6 +11,7 @@
 #include <psprecomp/dispatch.h>
 #include <psprecomp/recomp_rt.h>
 
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,6 +62,11 @@ static struct { uint32_t nid, addr; } g_eboot_exports[MAX_EXPORTS];
 static int g_eboot_nexports;
 static uint32_t g_eboot_gp;
 static int g_duel_ready;
+static _Atomic int g_duel_mgr_start_requested;
+
+int psp_duel_manager_start_requested(void) {
+    return atomic_load(&g_duel_mgr_start_requested);
+}
 
 static uint16_t rd16(const uint8_t *p) {
     return (uint16_t)(p[0] | (p[1] << 8));
@@ -282,7 +288,16 @@ int psp_duel_start(uint32_t uid, uint32_t status_ptr) {
         psp_cpu.r[PSP_REG_A1] = psp_arg(2);
         if (m->entry < 0x80000000u) {
             psp_cpu.r[PSP_REG_GP] = m->gp;
+            if (m == &g_duel[0]) {
+                atomic_store(&g_duel_mgr_start_requested, 1);
+                if (getenv("SETO_TRACE_MODULE"))
+                    fprintf(stderr, "module: start '%s' entry=0x%08X\n",
+                            m->name, m->entry);
+            }
             psp_call_from_host(m->entry);
+            if (getenv("SETO_TRACE_MODULE"))
+                fprintf(stderr, "module: start '%s' entry=0x%08X returned 0x%08X\n",
+                        m->name, m->entry, psp_cpu.r[PSP_REG_V0]);
         }
         psp_cpu.r[PSP_REG_GP] = caller_gp;
         if (status_ptr) psp_write32(status_ptr, 0);

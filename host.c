@@ -43,6 +43,9 @@ int  psp_decktut_image_load(const char *path, uint32_t eboot_info);
 #endif
 #ifdef HAVE_DUEL_CORPUS
 int  psp_duel_images_load(const char *const *paths, uint32_t eboot_info);
+int  psp_duel_manager_start_requested(void);
+#elif defined(HAVE_TITLE_CORPUS)
+static int psp_duel_manager_start_requested(void) { return 0; }
 #endif
 #ifdef HAVE_TITLE_CORPUS
 int  psp_title_image_load(const char *path, uint32_t eboot_info);
@@ -158,7 +161,8 @@ static int box_up(void) {
             if (r > 140 && g > 130 && b > 115) light++;
             total++;
         }
-    return light * 4 > total * 3;
+    /* The title name-confirm panel is shorter than field dialogue boxes. */
+    return light * 5 > total * 3;
 }
 
 static int menu_panel(void) {
@@ -309,14 +313,20 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                             Sleep(10);
                         fprintf(stderr, "input: auto name phase=%d state=%d\n",
                                 psp_title_scene_phase(), psp_title_scene_state());
+                        for (int i = 0; i < 100 && psp_title_scene_state() == 4 &&
+                                            !box_up(); i++)
+                            Sleep(100);
+                        fprintf(stderr, "input: auto name prompt=%d phase=%d state=%d\n",
+                                box_up(), psp_title_scene_phase(),
+                                psp_title_scene_state());
                         if (psp_display_capture("build/s92-after.ppm") == 0)
                             fprintf(stderr, "capture: build/s92-after.ppm\n");
                         fprintf(stderr, "input: auto name advance\n");
                         int last_state = psp_title_scene_state();
-                        for (int i = 0; i < 600 && psp_title_scene_state() == 4 &&
+                        for (int i = 0; i < 80 && psp_title_scene_state() == 4 &&
                                            !psp_story_started(); i++) {
-                            auto_press(0x00004000u);
-                            Sleep(250);
+                            auto_press((i & 1) ? PSP_CTRL_START : PSP_CTRL_CROSS);
+                            Sleep(300);
                             const int s = psp_title_scene_state();
                             if (s != last_state) {
                                 fprintf(stderr, "input: auto state %d->%d phase=%d story=%d\n",
@@ -495,20 +505,68 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                             psp_display_capture(path);
                                         }
                                     }
-                                    /* Classroom: advance the story towards
-                                     * the first duel and watch ModuleMgr. */
-                                    for (int k = 0; k < 300; k++) {
-                                        auto_press(0x00004000u);
-                                        Sleep(800);
-                                        if (k % 25 == 24) {
-                                            char path[64];
-                                            snprintf(path, sizeof path,
-                                                     "build/s93-class%d.ppm", k + 1);
-                                            psp_display_capture(path);
+                                    /* Advance the Classroom dialogue only while
+                                     * its box is visible, then choose Duel in
+                                     * free roam. Brief state-1 gaps separate
+                                     * beats of the original script. */
+                                    int seen_class_box = 0, quiet = 0, class_done = 0;
+                                    for (int k = 0; k < 600 && !class_done &&
+                                            !psp_duel_manager_start_requested(); k++) {
+                                        const int box = box_up();
+                                        const uint32_t st = psp_read32(0x093CDAFCu);
+                                        if (box) {
+                                            seen_class_box = 1;
+                                            quiet = 0;
+                                            auto_press(PSP_CTRL_CROSS);
+                                            Sleep(800);
+                                            if (k % 25 == 24) {
+                                                char path[64];
+                                                snprintf(path, sizeof path,
+                                                         "build/s93-class%d.ppm", k + 1);
+                                                psp_display_capture(path);
+                                            }
+                                        } else if (seen_class_box && st == 1u) {
+                                            if (++quiet >= 30) class_done = 1;
+                                            Sleep(100);
+                                        } else {
+                                            quiet = 0;
+                                            Sleep(100);
                                         }
                                     }
-                                    for (int k = 0; k < 10; k++) Sleep(1000);
-                                    psp_display_capture("build/s93-travel-after.ppm");
+                                    fprintf(stderr, "input: classroom done=%d state=%u duel-start=%d\n",
+                                            class_done, psp_read32(0x093CDAFCu),
+                                            psp_duel_manager_start_requested());
+#ifdef HAVE_DUEL_CORPUS
+                                    if (class_done && psp_read32(0x093CDAFCu) == 1u) {
+                                        psp_title_walk(0, 255, 255);
+                                        psp_ctrl_set(0, 255, 255);
+                                        Sleep(2800);
+                                        psp_title_walk(0, 128, 128);
+                                        psp_ctrl_set(0, 128, 128);
+                                        Sleep(800);
+                                        field_press(PSP_CTRL_CROSS);
+                                        Sleep(1500);
+                                        psp_display_capture("build/s93-class-duel-menu.ppm");
+                                        field_press(PSP_CTRL_DOWN);
+                                        Sleep(600);
+                                        psp_display_capture("build/s93-class-duel-select.ppm");
+                                        field_press(PSP_CTRL_CROSS);
+                                        for (int k = 0; k < 600 &&
+                                                !psp_duel_manager_start_requested(); k++) {
+                                            if (box_up()) {
+                                                auto_press(PSP_CTRL_CROSS);
+                                                Sleep(800);
+                                            } else {
+                                                Sleep(100);
+                                            }
+                                        }
+                                        fprintf(stderr, "input: duel start requested=%d field=%u\n",
+                                                psp_duel_manager_start_requested(),
+                                                psp_read32(0x093CDAFCu));
+                                        Sleep(2000);
+                                        psp_display_capture("build/s93-first-duel.ppm");
+                                    }
+#endif
                                     menu = 1;
                                     break;
                                 }

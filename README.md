@@ -58,10 +58,10 @@ requested `libdeck_tutorial.prx` (LBN `0x5790`); the module is recompiled at
 scripted duel are discovered from the ISO (`modduel_mgr`, LBN `0x5c20`, plus
 `modduel_eng`, `modduel_draw`, `moddeck_swap`, `modtutorial`,
 `modduelrecord`), recompiled, and loaded into the low window
-(`0x02200000`–`0x03556890`) with their imports resolved. The runtime now maps
-multiple low-window PRX images. A duel has not started yet; the trip to the
-Classroom and its dialogue are the last reproduced story steps (see
-[S9.9 results](#s99-results--duel-subsystem-integrated)).
+(`0x02200000`–`0x03556890`) with their imports resolved. The s292 run completes
+the Classroom dialogue and reaches Duel in the original field menu, but the
+duel manager has not started (see
+[S9.10 results](#s910-results--classroom-and-duel-command)).
 
 **S9.6 — field action menu: PASS (menu), PARTIAL (duel).** START opens the
 field Talk/Duel/Item/PDA/Map menu at the idle state; DOWN selects Duel and
@@ -1218,10 +1218,10 @@ the destination list opens only after the map CROSS's fade ends. When that
 takes longer than 2.5 s, the old DOWN landed on the map and the list later
 opened on Main Gate, where every following CROSS was ignored. The host now
 waits for the list and for the orange highlight to reach Classroom before it
-confirms. The title name entry likewise keeps confirming while the scene is
-still state 4 instead of a fixed 80-press burst. The last headless run with
-that change still stopped at `state=4 phase=3` after the 600 CROSSes, so the
-name-entry flakiness is reduced but not eliminated.
+confirms. Title name input now waits for the visible prompt panel before
+alternating the original CROSS/START controls; the s292 log showed
+`state=4 phase=4` with the prompt visible, then `state 4->1->2->3` and
+`story=1`.
 
 The Classroom conversation itself is reproduced (`build/s282-class25.ppm` …
 `s282-class300.ppm`: Crowler “I'm by far the top teacher in the entire
@@ -1229,9 +1229,22 @@ Academy.”, “Yeah! I beat you here!”, “No, not that!”). The live Win32 
 (`s281`) showed the command menu, Map highlight, exit dialog, world map and
 destination list frame-by-frame.
 
-**Next target.** Confirm the Classroom travel deterministically with the final
-code, capture the ModuleMgr request for `modduel_mgr`, and drive the first duel
-to a processed result.
+## S9.10 results — Classroom and Duel command
+
+**Headless evidence (s292).** The original story reached the Classroom, rendered
+Crowler's “There's a new student coming today” dialogue, and returned to free
+roam (`classroom done=1 state=1`). The existing down-right walk + CROSS opened
+the original Talk/Duel/Item/PDA menu; DOWN highlighted Duel, and CROSS drove the
+field through states `5 -> 6 -> 23 -> 1`. Captures:
+`build/s93-travel10.ppm`, `build/s93-class-duel-menu.ppm`,
+`build/s93-class-duel-select.ppm`, `build/s93-first-duel.ppm`.
+
+**Still blocked.** No duel ModuleMgr load or `modduel_mgr` start occurred
+(`duel start requested=0`). The run returned to free roam after selection. The
+host now logs the real manager `module_start` request/return and stops its
+dialogue input when that request occurs. Next inspect the first frame after
+selecting Duel and reproduce the actual pre-duel/confirmation path without
+pressing through an unseen choice.
 
 ## Limitations
 
