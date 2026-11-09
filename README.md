@@ -1042,6 +1042,17 @@ button press in the current free-roam state; the one capture that showed it
 (`s200-menu2`) came after the talk + walk prelude. This is the immediate blocker
 for the room exit.
 
+**Where the field logic lives (static analysis).** The field state machine is
+`psp_func_08C0C814`; its 24-entry jump table is at `0x08C34890` and the state
+word is `[0x093CDAFC]` (setter `0x08C0D464` writes state 21 with two words from
+its argument). The story→field command API is the export `0x86220A06`
+(`psp_func_08C0C008`): it indexes a 20-entry table at `0x08C38640`
+(12-byte entries: start, query, busy) and calls `entry.start(arg)`.
+`psp_func_08C0C088` is the matching query/“command done” entry. The pad handler
+`0x08C0D4E8` only consumes R (camera), TRIANGLE (state 23, Top Menu) and
+SQUARE (state 5); CROSS/START are handled by the field/story UI elsewhere,
+which is why no single raw pad bit opens the command menu.
+
 **Next target.** Reproduce the field command menu, choose Map → “Exit from this
 spot?” YES, and follow the story into the classroom to the first scripted duel.
 
