@@ -36,7 +36,7 @@ int  psp_field_image_load(const char *path, uint32_t eboot_info);
 int  psp_field_started(void);
 #endif
 #ifdef HAVE_DECK_CORPUS
-int  psp_deck_image_load(const char *path, uint32_t eboot_info);
+void psp_deck_prepare(const char *path, uint32_t eboot_info);
 #endif
 #ifdef HAVE_DECKTUT_CORPUS
 int  psp_decktut_image_load(const char *path, uint32_t eboot_info);
@@ -619,10 +619,13 @@ int main(int argc, char **argv) {
 #endif
     }
 #ifdef HAVE_DECK_CORPUS
-    if (free_duel && deck && psp_deck_image_load(deck, m.info) != 0) return 1;
+    /* moddeck is 13.8 MB of .bss and does not fit next to story/field in main
+     * RAM. It loads into the low window (0x01400000) when the game asks for
+     * it, after libtitle has been stopped and unloaded. */
+    if (deck) psp_deck_prepare(deck, m.info);
 #else
-    if (free_duel && deck) {
-        fprintf(stderr, "deck PRX: this build has no deck corpus (build/s93-deck2-reloc)\n");
+    if (deck) {
+        fprintf(stderr, "deck PRX: this build has no deck corpus (build/s93-deck-reloc)\n");
         return 1;
     }
 #endif

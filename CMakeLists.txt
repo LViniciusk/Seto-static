@@ -71,13 +71,13 @@ endif()
 
 # S9.5: the relocated moddeck corpus, loaded when Free Duel asks for it.
 file(GLOB DECK_SOURCES CONFIGURE_DEPENDS
-     ${CMAKE_CURRENT_SOURCE_DIR}/build/s93-deck2-reloc/*.c)
+     ${CMAKE_CURRENT_SOURCE_DIR}/build/s93-deck-reloc/*.c)
 if(DECK_SOURCES)
     add_library(deckprx OBJECT ${DECK_SOURCES})
     target_compile_definitions(deckprx PRIVATE
         PSPRECOMP_NAMESPACE=deck_ PSPRECOMP_TRACE
         psp_hle_call=deck_import_forward)
-    target_include_directories(deckprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s93-deck2-reloc)
+    target_include_directories(deckprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s93-deck-reloc)
     target_link_libraries(deckprx PRIVATE psprecomp)
 endif()
 
@@ -138,7 +138,7 @@ if(DECK_SOURCES)
     target_sources(Seto-static PRIVATE $<TARGET_OBJECTS:deckprx>)
     target_compile_definitions(Seto-static PRIVATE HAVE_DECK_CORPUS)
 else()
-    message(STATUS "S9.5 deck corpus not found under build/s93-deck2-reloc; building without moddeck")
+    message(STATUS "S9.5 deck corpus not found under build/s93-deck-reloc; building without moddeck")
 endif()
 if(DECKTUT_SOURCES)
     target_sources(Seto-static PRIVATE $<TARGET_OBJECTS:decktutprx>)

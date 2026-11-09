@@ -15,9 +15,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define DECK_BASE       0x08910000u
-#define DECK_END_MAX    0x09700000u
-#define DECK_ENTRY      0x08917874u
+#define DECK_BASE       0x01400000u
+#define DECK_END_MAX    0x04000000u
+#define DECK_ENTRY      0x01407874u
 #define DECK_UID        0x00080003u
 #define DECK_LBN_PATH   "disc0:/sce_lbn0x56f0_size0x2ae0a"
 
@@ -31,6 +31,15 @@ static deck_export_t g_exports[MAX_EXPORTS];
 static int g_nexports;
 static uint32_t g_eboot_gp, g_deck_gp;
 static int g_deck_loaded;
+static char g_deck_path[512];
+static uint32_t g_eboot_info;
+
+/* Loaded on the first ModuleMgr request: by then the game has already stopped
+ * and unloaded libtitle, so its low-window mapping can be reused. */
+void psp_deck_prepare(const char *path, uint32_t eboot_info) {
+    snprintf(g_deck_path, sizeof g_deck_path, "%s", path ? path : "");
+    g_eboot_info = eboot_info;
+}
 
 void deck_psp_recomp_register(void);
 
@@ -173,7 +182,8 @@ int psp_deck_image_load(const char *path, uint32_t eboot_info) {
         (uint64_t)vaddr + memsz > DECK_END_MAX) {
         free(d); fprintf(stderr, "deck PRX: segment outside the window\n"); return -1;
     }
-    if (psp_mem_write_block(vaddr, d + off, filesz) != 0) {
+    if (psp_mem_map_extra(vaddr, memsz) != 0 ||
+        psp_mem_write_block(vaddr, d + off, filesz) != 0) {
         free(d); fprintf(stderr, "deck PRX: cannot place the image\n"); return -1;
     }
     if (psp_read32(vaddr) != rd32(d + off) ||
@@ -210,11 +220,14 @@ int psp_deck_image_load(const char *path, uint32_t eboot_info) {
 }
 
 int psp_deck_load_uid(const char *path, uint32_t *uid) {
-    if (!g_deck_loaded) return 0;
     const char *slash = strrchr(path, '/');
     if (strcmp(path, DECK_LBN_PATH) != 0 &&
         (!slash || strcmp(slash + 1, "libdeck.prx") != 0))
         return 0;
+    if (!g_deck_loaded) {
+        if (!g_deck_path[0]) return 0;
+        if (psp_deck_image_load(g_deck_path, g_eboot_info) != 0) return 0;
+    }
     *uid = DECK_UID;
     return 1;
 }

@@ -1017,13 +1017,33 @@ story into the classroom and capture the duel PRX requests.
 `libtitle` (UID `0x00070002`) immediately before it loads `libstory` and
 `libfield`. The title is mapped in the low/extra window, so after the story
 starts that window is free: the 13.8 MB `moddeck` image fits at `0x01400000`
-without touching the story/field RAM windows or the heap. A lazy loader on the
-ModuleMgr request was prototyped, but the deck request did not reproduce in the
-later runs, so it is not committed yet.
+without touching the story/field RAM windows or the heap.
 
-**Next target.** Follow the bottom-right exit to the classroom and reach the
-first scripted duel; free or reuse a module window so `moddeck` and the duel
-PRXs can load while story/field are resident.
+`moddeck` now loads lazily on the ModuleMgr request (`psp_deck_prepare` +
+`psp_mem_map_extra`). A run in which the story requested the deck produced:
+
+```text
+module: load 'disc0:/sce_lbn0x56f0_size0x2ae0a'
+deck PRX 0x01400000..0x021CEE10 (14349504 bytes .bss), gp 0x01427930, 1245 EBOOT exports
+deck: entered recompiled module_start 0x01407874
+```
+
+**Field buttons observed.** With a clean free-roam frame (no message window):
+
+| Button | Effect |
+|---|---|
+| CROSS | Talks to a nearby character; away from one shows “There's no one to talk to!” |
+| TRIANGLE | Opens the Top Menu (Deck Menu / Status / Email / Schedule / Options / End Game) |
+| SQUARE / SELECT | Opens the “Explanation” help window |
+| START / CIRCLE / R / L | No observed effect in free roam |
+
+The Talk/Duel/Item/PDA/Map command menu has not been reproduced by any single
+button press in the current free-roam state; the one capture that showed it
+(`s200-menu2`) came after the talk + walk prelude. This is the immediate blocker
+for the room exit.
+
+**Next target.** Reproduce the field command menu, choose Map → “Exit from this
+spot?” YES, and follow the story into the classroom to the first scripted duel.
 
 ## Limitations
 
