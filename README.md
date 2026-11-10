@@ -48,8 +48,21 @@ the students and finishing the first class precede the Crowler duel. The VFPU
 products and adds the measured `vtfm3.t`/`vtfm4.q` vectors from
 [pspautotests](https://github.com/hrydgard/pspautotests/blob/master/tests/cpu/vfpu/matrix.expected).
 Those seven lanes fail before the fix and match exactly afterwards; CTest passes
-21/21. In-game visual validation is still pending. The local near-eye clipping
-experiment has not proved a visual improvement and is not in the patch stack.
+21/21. Run s346 reaches Classroom free roam (`state=1`, `box=0`) with the player
+and Crowler visible, and reports zero bad accesses. See
+`build/s346-classroom.png` and `build/s346-run.out` locally. The room is still
+mostly absent; this is not yet a navigable field. Its orthographic projection
+has constant clip W=1, so near-eye clipping does not explain the missing room;
+the speculative local clipping code was removed.
+
+A second patch preserves homogeneous transforms (`vhtfm`) instead of emitting
+them as smaller matrices. It adds PSP-measured homogeneous vectors and synthetic
+emitter tests; CTest still passes 21/21. Re-emit the EBOOT after applying it:
+exactly three calls change in two generated units. In-game validation of this
+second correction is pending. With `SETO_MENU_MAP=1`, automation now stops after
+the Classroom dialogue and captures `build/classroom-free-roam.ppm` instead of
+blindly attempting Duel; `SETO_TRACE_FIELD=1` also traces the next GE frame's
+world/view/projection matrices, viewport and model positions.
 
 **S9.3 — story/name menu: PARTIAL.** A minimal `sceUtilityOsk` HLE lets the
 original `ENTER NAME` flow return a configured name, and a minimal mailbox HLE
@@ -149,6 +162,8 @@ git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s9-field.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s9-font.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s9-duel.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-vtfm.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-ge-trace.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-vhtfm.patch
 
 cmake -S build/psprecomp -B build/psprecomp-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build/psprecomp-build -j 8

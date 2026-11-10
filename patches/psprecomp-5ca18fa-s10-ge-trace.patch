@@ -1,0 +1,70 @@
+diff --git a/include/psprecomp/hle.h b/include/psprecomp/hle.h
+--- a/include/psprecomp/hle.h
++++ b/include/psprecomp/hle.h
+@@ -76,6 +76,9 @@ void psp_hle_dump_recent(FILE *out);
+ /* Register everything the toolkit implements. Call once at startup. */
+ void psp_hle_init(void);
+ 
++/* Diagnostic only: trace the next complete GE frame without changing it. */
++void psp_ge_trace_next_frame(void);
++
+ /* ---- o32 argument access ------------------------------------------------- */
+ 
+ /* Arguments 0-3 arrive in $a0-$a3; 4 and beyond are on the stack, at $sp+16
+diff --git a/src/hle/ge.c b/src/hle/ge.c
+--- a/src/hle/ge.c
++++ b/src/hle/ge.c
+@@ -30,6 +30,7 @@
+ #include "psprecomp/render.h"
+ 
+ #include <math.h>
++#include <stdatomic.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -542,10 +543,17 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
+ 
+ /* PSPRECOMP_TRACE_GE=<frame> logs every primitive drawn during that vblank:
+  * what it is, its vertex format, and the texture state it is drawn with. */
++static _Atomic uint64_t g_trace_frame = UINT64_MAX;
++
++void psp_ge_trace_next_frame(void) {
++    atomic_store(&g_trace_frame, psp_display_vblanks() + 2);
++}
++
+ static int trace_frame(void) {
+     static long f = -2;
+     if (f == -2) { const char *e = getenv("PSPRECOMP_TRACE_GE"); f = e ? atol(e) : -1; }
+-    return f >= 0 && (long)psp_display_vblanks() == f;
++    const uint64_t vb = psp_display_vblanks();
++    return (f >= 0 && (long)vb == f) || vb == atomic_load(&g_trace_frame);
+ }
+ 
+ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -584,6 +592,26 @@ static void draw_prim(uint32_t type, uint32_t count) {
+     else     g_ge.vaddr += count * (uint32_t)stride;
+ 
+     if (trace_frame()) {
++        if (!VT_THROUGH(g_ge.vtype)) {
++            const float *matrices[] = { g_xf.world, g_xf.view, g_xf.proj };
++            for (int m = 0; m < 3; m++) {
++                fprintf(stderr, "  %s", m == 0 ? "world" : m == 1 ? "view" : "projection");
++                for (int j = 0; j < (m == 2 ? 16 : 12); j++)
++                    fprintf(stderr, " %.7g", (double)matrices[m][j]);
++                fputc('\n', stderr);
++            }
++            fprintf(stderr, "  viewport scale=(%g,%g,%g) pos=(%g,%g,%g) offset=(%g,%g)\n",
++                    (double)g_xf.xscale, (double)g_xf.yscale, (double)g_xf.zscale,
++                    (double)g_xf.xpos, (double)g_xf.ypos, (double)g_xf.zpos,
++                    (double)g_xf.offx, (double)g_xf.offy);
++            for (uint32_t j = 0; !isz && j < n && j < 3; j++) {
++                float p[3];
++                read3(g_ge.vaddr - count * (uint32_t)stride + j * (uint32_t)stride +
++                      (uint32_t)pos_off, (int)VT_POS(g_ge.vtype), 0, p);
++                fprintf(stderr, "  model%u=(%g,%g,%g)\n", j,
++                        (double)p[0], (double)p[1], (double)p[2]);
++            }
++        }
+         fprintf(stderr, "  mat %08X cbp %08X lt %d tex0 %08X\n", g_material, g_cbp, g_lt.enable,
+                 psp_read32(g_ds.tex_addr));
+         for (uint32_t k = 0; k < n && k < 16; k++)
