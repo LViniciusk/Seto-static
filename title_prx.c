@@ -232,14 +232,18 @@ void title_import_forward(uint32_t nid) {
     if (nid == 0x39ADDA9Fu && getenv("SETO_TRACE_CONFIRM") &&
         atomic_load(&g_scene_state) == 4 && atomic_load(&g_scene_phase) == 6 &&
         win >= 0x01200000u && win < 0x01270000u) {
-        static int last_state = -1;
+        static int last_state = -1, last_sel = -1;
         static uint32_t last_pad;
         const int wstate = psp_read8(win + 233);
+        const int sel = psp_read8(win + 211);
         const uint32_t pad = psp_read32(0x08101540u);
-        if (wstate != last_state || pad != last_pad) {
-            fprintf(stderr, "title window: state=%d pad=0x%08X edge=0x%08X ret=0x%08X\n",
-                    wstate, pad, psp_read32(0x08101538u), psp_cpu.r[PSP_REG_V0]);
+        if (wstate != last_state || sel != last_sel || pad != last_pad) {
+            fprintf(stderr, "title window: state=%d sel=%d cfg=0x%02X pad=0x%08X "
+                            "edge=0x%08X ret=0x%08X\n",
+                    wstate, sel, psp_read8(win + 201), pad,
+                    psp_read32(0x08101538u), psp_cpu.r[PSP_REG_V0]);
             last_state = wstate;
+            last_sel = sel;
             last_pad = pad;
         }
     }
@@ -274,6 +278,11 @@ int psp_title_scene3(void) { return atomic_load(&g_scene3); }
 int psp_title_scene_state(void) { return atomic_load(&g_scene_state); }
 int psp_title_scene_phase(void) { return atomic_load(&g_scene_phase); }
 int psp_title_scene_cursor(void) { return atomic_load(&g_scene_cursor); }
+
+/* The name dialog's message-window object: byte 211 is the selected item.
+ * Read-only, so the host can wait for the original code to consume a pulse
+ * instead of assuming a fixed frame timing. */
+int psp_title_confirm_sel(void) { return psp_read8(0x0126C898u + 211u); }
 
 void psp_title_menu_request(uint32_t mask) {
     atomic_store(&g_menu_request, mask);

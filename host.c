@@ -54,6 +54,7 @@ void psp_title_start_request(int on);
 int  psp_title_start_done(void);
 int  psp_title_scene3(void);
 int  psp_title_scene_state(void);
+int  psp_title_confirm_sel(void);
 int  psp_title_scene_phase(void);
 int  psp_title_scene_cursor(void);
 void psp_title_menu_request(uint32_t mask);
@@ -164,43 +165,6 @@ static int box_up(void) {
         }
     /* The title name-confirm panel is shorter than field dialogue boxes. */
     return light * 5 > total * 3;
-}
-
-static int dialogue_up(void) {
-    static uint32_t px[480 * 272];
-    static uint32_t previous;
-    static int stable;
-    if (!box_up() || psp_display_read(px) != 0) {
-        previous = 0;
-        stable = 0;
-        return 0;
-    }
-    uint32_t hash = 2166136261u;
-    int text = 0;
-    /* shortcut: dark glyph coordinates only; revisit for other text styles. */
-    for (int y = 220; y < 261; y++)
-        for (int x = 60; x < 431; x++) {
-            const uint32_t c = px[y * 480 + x];
-            if ((int)(c & 0xFF) < 110 && (int)((c >> 8) & 0xFF) < 110 &&
-                (int)((c >> 16) & 0xFF) < 110) {
-                hash = (hash ^ ((uint32_t)y * 480u + (uint32_t)x)) * 16777619u;
-                text++;
-            }
-        }
-    if (text < 4) {
-        previous = 0;
-        stable = 0;
-        return 0;
-    }
-    if (hash != previous) {
-        previous = hash;
-        stable = 0;
-        return 0;
-    }
-    if (++stable < 20) return 0;
-    previous = 0;
-    stable = 0;
-    return 1;
 }
 
 static int name_prompt_up(void) {
@@ -329,6 +293,22 @@ static void auto_press(uint32_t mask) {
     psp_ctrl_set(mask, 128, 128);
     Sleep(100);
     psp_ctrl_set(0, 128, 128);
+}
+
+/* A talk with Crowler draws his portrait across the frame centre; the
+ * "no one" message and the HUD-only free roam have no pink there. */
+static int crowler_talk(void) {
+    static uint32_t px[480 * 272];
+    if (psp_display_read(px) != 0) return 0;
+    int pink = 0;
+    for (int y = 50; y < 220; y += 2)
+        for (int x = 120; x < 360; x += 2) {
+            const uint32_t c = px[y * 480 + x];
+            const int r = (int)(c & 0xFF), g = (int)((c >> 8) & 0xFF),
+                      b = (int)((c >> 16) & 0xFF);
+            if (r > 150 && b > 110 && r > g * 1.3 && b > g * 1.1) pink++;
+        }
+    return pink > 30;
 }
 
 static int title_press_until_change(uint32_t mask) {
@@ -479,12 +459,30 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                             /* The original message window reads the digital
                              * D-pad from 0x08101540; the earlier attempt
                              * only moved the analog stick. */
-                            fprintf(stderr, "input: name confirm LEFT\n");
-                            auto_press(PSP_CTRL_LEFT);
-                            Sleep(400);
-                            choice = stable_title_confirm_choice();
-                            fprintf(stderr, "input: name confirm after LEFT choice=%d\n",
-                                    choice);
+                            int sel = psp_title_confirm_sel();
+                            fprintf(stderr, "input: name confirm LEFT (sel=%d)\n", sel);
+                            for (int t = 0; t < 12 && sel != 2; t++) {
+                                psp_title_pad_request(PSP_CTRL_LEFT);
+                                if (t >= 4) {
+                                    psp_ctrl_set(PSP_CTRL_LEFT, 128, 128);
+                                    Sleep(40);
+                                    psp_ctrl_set(0, 128, 128);
+                                }
+                                Sleep(200);
+                                const int now = psp_title_confirm_sel();
+                                if (now != sel)
+                                    fprintf(stderr, "input: name confirm sel %d->%d\n",
+                                            sel, now);
+                                sel = now;
+                            }
+                            for (int i = 0; i < 10; i++) {
+                                choice = title_confirm_choice();
+                                if (choice == 1) break;
+                                Sleep(100);
+                            }
+                            if (choice == 1) choice = stable_title_confirm_choice();
+                            fprintf(stderr, "input: name confirm after LEFT choice=%d sel=%d\n",
+                                    choice, sel);
                             psp_display_capture("build/s93-name-confirm-left.ppm");
                             if (choice == 1) {
                                 psp_display_capture("build/s93-name-confirm-yes.ppm");
@@ -706,79 +704,73 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                             psp_duel_manager_start_requested());
 #ifdef HAVE_DUEL_CORPUS
                                     if (class_done && psp_read32(0x093CDAFCu) == 1u) {
-                                        psp_title_walk(0, 255, 255);
-                                        psp_ctrl_set(0, 255, 255);
-                                        Sleep(2800);
-                                        psp_title_walk(0, 128, 128);
-                                        psp_ctrl_set(0, 128, 128);
-                                        Sleep(800);
-                                        field_press(PSP_CTRL_CROSS);
-                                        Sleep(1500);
-                                        psp_display_capture("build/s93-class-duel-menu.ppm");
-                                        /* Crowler is the selected target. Talk to him
-                                         * before retrying Duel; advance only visible
-                                         * dialogue from the original game. */
-                                        field_press(PSP_CTRL_CROSS);
-                                        int seen_talk_box = 0, seen_talk_text = 0, talk_quiet = 0;
-                                        for (int k = 0; k < 180 &&
-                                                !psp_duel_manager_start_requested(); k++) {
-                                            if (box_up()) {
-                                                seen_talk_box = 1;
-                                                talk_quiet = 0;
-                                                if (!dialogue_up()) {
-                                                    Sleep(100);
+                                        /* The script leaves Crowler somewhere
+                                         * in the room. Turn in place in four
+                                         * directions and probe Talk/Duel
+                                         * until the game requests the duel
+                                         * manager. */
+                                        static const struct { int ax, ay; const char *n; }
+                                        fdirs[] = {
+                                            { 128, 0, "up" }, { 128, 255, "down" },
+                                            { 0, 128, "left" }, { 255, 128, "right" },
+                                        };
+                                        for (int pass = 0; pass < 2 &&
+                                                !psp_duel_manager_start_requested(); pass++) {
+                                            for (int d = 0; d < 4 &&
+                                                    !psp_duel_manager_start_requested(); d++) {
+                                                psp_title_walk(0, fdirs[d].ax, fdirs[d].ay);
+                                                psp_ctrl_set(0, fdirs[d].ax, fdirs[d].ay);
+                                                Sleep(150);
+                                                psp_title_walk(0, 128, 128);
+                                                psp_ctrl_set(0, 128, 128);
+                                                Sleep(250);
+                                                field_press(PSP_CTRL_CROSS);
+                                                Sleep(1200);
+                                                const int talk = crowler_talk();
+                                                char path[64];
+                                                snprintf(path, sizeof path,
+                                                         "build/s93-face-%s.ppm", fdirs[d].n);
+                                                psp_display_capture(path);
+                                                fprintf(stderr, "input: face %s talk=%d "
+                                                                "state=%u box=%d\n",
+                                                        fdirs[d].n, talk,
+                                                        psp_read32(0x093CDAFCu), box_up());
+                                                if (talk) {
+                                                    /* Advance his dialogue; a
+                                                     * choice menu may appear. */
+                                                    for (int k = 0; k < 60 &&
+                                                            !psp_duel_manager_start_requested(); k++) {
+                                                        if (box_up()) {
+                                                            auto_press(PSP_CTRL_CROSS);
+                                                            Sleep(800);
+                                                        } else {
+                                                            Sleep(200);
+                                                        }
+                                                    }
+                                                    if (!psp_duel_manager_start_requested()) {
+                                                        field_press(PSP_CTRL_DOWN);
+                                                        Sleep(400);
+                                                        field_press(PSP_CTRL_CROSS);
+                                                        Sleep(1200);
+                                                    }
                                                     continue;
                                                 }
-                                                if (!seen_talk_text)
-                                                    psp_display_capture("build/s93-crowler-talk-first.ppm");
-                                                seen_talk_text = 1;
-                                                auto_press(PSP_CTRL_CROSS);
-                                                Sleep(800);
-                                                if (k % 10 == 0) {
-                                                    char path[64];
-                                                    snprintf(path, sizeof path,
-                                                             "build/s93-crowler-talk%d.ppm", k);
-                                                    psp_display_capture(path);
+                                                /* No target: select Duel in
+                                                 * the command menu. */
+                                                field_press(PSP_CTRL_DOWN);
+                                                Sleep(400);
+                                                field_press(PSP_CTRL_CROSS);
+                                                Sleep(1200);
+                                                for (int k = 0; k < 8 && box_up() &&
+                                                        !psp_duel_manager_start_requested(); k++) {
+                                                    auto_press(PSP_CTRL_CROSS);
+                                                    Sleep(500);
                                                 }
-                                            } else if (seen_talk_box) {
-                                                if (++talk_quiet >= 20) break;
-                                                Sleep(100);
-                                            } else {
-                                                Sleep(100);
                                             }
                                         }
-                                        fprintf(stderr, "input: Crowler talk box=%d text=%d state=%u duel-start=%d\n",
-                                                seen_talk_box, seen_talk_text,
-                                                psp_read32(0x093CDAFCu),
-                                                psp_duel_manager_start_requested());
-                                        if (psp_duel_manager_start_requested()) {
-                                            menu = 1;
-                                            break;
-                                        }
-                                        if (!seen_talk_text || psp_read32(0x093CDAFCu) != 1u) {
-                                            psp_display_capture("build/s93-crowler-talk-end.ppm");
-                                            menu = 1;
-                                            break;
-                                        }
-                                        /* Stay by Crowler; the long walk can leave
-                                         * him out of range before the Duel choice. */
-                                        field_press(PSP_CTRL_CROSS);
-                                        Sleep(1500);
-                                        const int row = menu_row();
-                                        psp_display_capture("build/s93-crowler-next.ppm");
-                                        fprintf(stderr, "input: Crowler next row=%d state=%u box=%d\n",
-                                                row, psp_read32(0x093CDAFCu), box_up());
-                                        if (row < 0) {
-                                            menu = 1;
-                                            break;
-                                        }
-                                        if (row == 0) field_press(PSP_CTRL_DOWN);
-                                        Sleep(600);
-                                        psp_display_capture("build/s93-class-duel-select.ppm");
-                                        field_press(PSP_CTRL_CROSS);
                                         for (int k = 0; k < 600 &&
                                                 !psp_duel_manager_start_requested(); k++) {
-                                            if (dialogue_up()) {
+                                            if (box_up()) {
                                                 auto_press(PSP_CTRL_CROSS);
                                                 Sleep(800);
                                             } else {
