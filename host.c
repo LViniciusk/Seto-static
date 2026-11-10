@@ -425,7 +425,14 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                     if (psp_title_scene3()) {
                         fprintf(stderr, "input: auto scene3 cursor=%d state=%d\n",
                                 psp_title_scene_cursor(), psp_title_scene_state());
-                        auto_menu(PSP_CTRL_UP, 1);
+                        for (int t = 0; t < 4 && psp_title_scene_cursor() != 0; t++)
+                            auto_menu(PSP_CTRL_UP, 1);
+                        if (psp_title_scene_cursor() != 0) {
+                            fprintf(stderr, "input: pause; title cursor %d never reached 0\n",
+                                    psp_title_scene_cursor());
+                            g_input_done = 1;
+                            return 0;
+                        }
                         auto_menu(PSP_CTRL_CROSS, 0);
                         fprintf(stderr, "input: auto menu result state=%d cursor=%d\n",
                                 psp_title_scene_state(), psp_title_scene_cursor());

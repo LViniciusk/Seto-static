@@ -1270,6 +1270,28 @@ accesses. Repeated `ehfile_queue` waits remain observed, but their causal
 relation to progression is not established. No battle board or processed
 result has yet been verified.
 
+## S9.12 results — original name confirmation passed
+
+**Handler.** The name-confirmation dialog is the EBOOT message window
+`0x080476CC` (libehsys export NID `0x39ADDA9F`), entered from the title poll
+`0x0064C0D8`. It reads the **digital D-pad** from `0x08101540` (`0x80`
+left, `0x20` right, `0x10` up, `0x40` down); the one-frame confirm edge is
+`0x08101538` filtered by `0x0803D8F8` (NID `0x8171F765`, the same filter the
+title menu uses). The earlier analog-stick attempt never set those bits.
+
+**Fix.** `host.c` sends one digital LEFT when the dialog opens. The window
+moves the highlight from **NO** to **YES**; YES is drawn blue (`112,182,255`)
+and NO pink (`255,98,173`), so the classifier now accepts the blue highlight
+and sends CROSS only when YES is visibly selected. No guest memory is written;
+input still goes through `psp_ctrl_set` and the EBOOT input update.
+
+**Evidence (s332).** Window state `3 -> 4 -> 5 -> 6` with poll return `2`;
+title phase `6 -> 9`; scene `4 -> 1 -> 2 -> 3`; Story Mode then loads
+`modstory` and `modfield` and runs the opening script. The command menu opens
+(`build/s93-menu-open.ppm`: Chancellor's Office, Talk/Duel/Item/PDA/Map), the
+world map travels to the Classroom, and the classroom script runs until the
+`SETO_BRINGUP_CAP=150` cap. CTest 21/21.
+
 ## Limitations
 
 - `sceReg` serves only the `/DATA/FONT` and `/SYSPROFILE/RESOLUTION` subtrees
