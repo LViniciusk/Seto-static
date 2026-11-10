@@ -193,7 +193,22 @@ static void title_osk(uint32_t nid) {
  * -Dpsp_hle_call=title_import_forward). The call reaches the real EBOOT
  * function through psp_call_from_host(), so the guest register file, stack
  * arguments, $ra and frame chain are the normal generated path. */
+static _Atomic int g_scene_state;
+static _Atomic int g_scene_phase;
+
 void title_import_forward(uint32_t nid) {
+    if (getenv("SETO_TRACE_CONFIRM") && atomic_load(&g_scene_state) == 4 &&
+        atomic_load(&g_scene_phase) == 6) {
+        static uint32_t seen[64];
+        static int nseen;
+        int k = 0;
+        while (k < nseen && seen[k] != nid) k++;
+        if (k == nseen && nseen < 64) {
+            seen[nseen++] = nid;
+            fprintf(stderr, "title import p6: nid=0x%08X ra=0x%08X a0=0x%08X\n",
+                    nid, psp_cpu.r[PSP_REG_RA], psp_cpu.r[PSP_REG_A0]);
+        }
+    }
     if (nid == 0xF6269B82u || nid == 0xF3F76017u ||
         nid == 0x4B85C861u || nid == 0x3DFAEBA9u) {
         title_osk(nid);
@@ -210,9 +225,24 @@ void title_import_forward(uint32_t nid) {
     /* A cross-module call must run the callee with its own globals base. The
      * title code has no $gp-relative access, but the EBOOT does. */
     uint32_t caller_gp = psp_cpu.r[PSP_REG_GP];
+    uint32_t win = psp_cpu.r[PSP_REG_A0];
     psp_cpu.r[PSP_REG_GP] = g_eboot_gp;
     psp_call_from_host(addr);
     psp_cpu.r[PSP_REG_GP] = caller_gp;
+    if (nid == 0x39ADDA9Fu && getenv("SETO_TRACE_CONFIRM") &&
+        atomic_load(&g_scene_state) == 4 && atomic_load(&g_scene_phase) == 6 &&
+        win >= 0x01200000u && win < 0x01270000u) {
+        static int last_state = -1;
+        static uint32_t last_pad;
+        const int wstate = psp_read8(win + 233);
+        const uint32_t pad = psp_read32(0x08101540u);
+        if (wstate != last_state || pad != last_pad) {
+            fprintf(stderr, "title window: state=%d pad=0x%08X edge=0x%08X ret=0x%08X\n",
+                    wstate, pad, psp_read32(0x08101538u), psp_cpu.r[PSP_REG_V0]);
+            last_state = wstate;
+            last_pad = pad;
+        }
+    }
 }
 
 static void title_entered(uint32_t addr) {
@@ -233,8 +263,6 @@ int psp_title_menu_ready(void) { return atomic_load(&g_menu_ready); }
 static _Atomic int g_start_request;
 static _Atomic int g_start_done;
 static _Atomic int g_scene3;
-static _Atomic int g_scene_state;
-static _Atomic int g_scene_phase;
 static _Atomic int g_scene_cursor;
 static _Atomic uint32_t g_menu_request;
 static _Atomic uint32_t g_pad_request;
@@ -292,13 +320,26 @@ static void title_input_update(uint32_t addr) {
     atomic_store(&g_scene_phase, phase);
     atomic_store(&g_scene_cursor, cursor);
     if (state == 3) atomic_store(&g_scene3, 1);
+    static int modal_trace_dumped;
+    if (!modal_trace_dumped && state == 4 && phase == 6 &&
+        getenv("SETO_TRACE_CONFIRM")) {
+        fprintf(stderr, "title trace: recent function entries at scene=%d/%d\n",
+                state, phase);
+        psp_trace_dump();
+        modal_trace_dumped = 1;
+    }
     if (state == 4 && phase == 6) {
         const uint32_t input = psp_read32(0x08101530u);
         const uint8_t event = psp_read8(0x08262BF4u);
-        if (!valid || input != last_input || event != last_event) {
-            fprintf(stderr, "title event: input=0x%08X code=0x%02X\n", input, event);
+        const uint32_t caller = psp_cpu.r[PSP_REG_RA];
+        static uint32_t last_caller;
+        if (!valid || input != last_input || event != last_event ||
+            caller != last_caller) {
+            fprintf(stderr, "title event: input=0x%08X code=0x%02X caller=0x%08X\n",
+                    input, event, caller);
             last_input = input;
             last_event = event;
+            last_caller = caller;
             valid = 1;
         }
     } else {
@@ -349,10 +390,24 @@ static void title_input_update(uint32_t addr) {
     psp_ctrl_set(g_pad_on ? 0x00000008u : 0u, 128, 128);
 }
 
+static void title_confirm_widget_trace(uint32_t addr) {
+    (void)addr;
+    const int state = atomic_load(&g_scene_state);
+    const int phase = atomic_load(&g_scene_phase);
+    fprintf(stderr, "title confirm widget: scene=%d/%d pad=0x%08X event=0x%02X "
+                    "caller=0x%08X a0=0x%08X s0=0x%08X s1=0x%08X s2=0x%08X\n",
+            state, phase, psp_read32(0x08101530u), psp_read8(0x08262BF4u),
+            psp_cpu.r[PSP_REG_RA], psp_cpu.r[PSP_REG_A0],
+            psp_cpu.r[PSP_REG_S0], psp_cpu.r[PSP_REG_S1],
+            psp_cpu.r[PSP_REG_S2]);
+}
+
 static void title_menu_ready(uint32_t addr) {
     (void)addr;
     atomic_store(&g_menu_ready, 1);
     psp_trace_watch(0x08035AC8u, title_input_update);
+    if (getenv("SETO_TRACE_CONFIRM"))
+        psp_trace_watch_label(0x0064C214u, title_confirm_widget_trace);
 }
 
 static void title_callback_entered(uint32_t addr) {

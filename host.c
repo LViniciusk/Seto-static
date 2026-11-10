@@ -142,6 +142,7 @@ static DWORD WINAPI bringup_cap(LPVOID unused) {
  * the rest of the pad is added when a scene asks for it. The thread ends with
  * the process (or when the game exits) and releases what it held. */
 #define PSP_CTRL_START 0x00000008u
+#define PSP_CTRL_LEFT  0x00000080u
 #define PSP_CTRL_UP    0x00000010u
 #define PSP_CTRL_DOWN  0x00000040u
 #define PSP_CTRL_CROSS 0x00004000u
@@ -216,8 +217,9 @@ static int name_prompt_up(void) {
     return red >= 20;
 }
 
-/* Title's name confirmation is a centered brown panel with a pink selected
- * YES/NO pill; return -1 unless that exact state and visible highlight exist. */
+/* Title's name confirmation is a centered brown panel with one selected
+ * YES/NO pill: YES is drawn blue, NO pink. Return -1 unless that exact state
+ * and a visible highlight exist. */
 static int title_confirm_choice(void) {
     static uint32_t px[480 * 272];
     if (psp_display_read(px) != 0) {
@@ -238,14 +240,14 @@ static int title_confirm_choice(void) {
             const uint32_t c = px[y * 480 + x];
             const int r = (int)(c & 0xFF), g = (int)((c >> 8) & 0xFF),
                       b = (int)((c >> 16) & 0xFF);
-            yes += r > 120 && b > 70 && r > g * 1.4 && b > g * 1.25;
+            yes += b > 200 && b > r + 80 && g > r + 40;
         }
     for (int y = 145; y < 176; y++)
         for (int x = 245; x < 315; x++) {
             const uint32_t c = px[y * 480 + x];
             const int r = (int)(c & 0xFF), g = (int)((c >> 8) & 0xFF),
                       b = (int)((c >> 16) & 0xFF);
-            no += r > 120 && b > 70 && r > g * 1.4 && b > g * 1.25;
+            no += r > 200 && r > g + 80 && b > g + 40;
         }
     const int choice = panel < 10000 ? -1 :
                        yes > 200 && yes > no * 2 ? 1 :
@@ -448,75 +450,47 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                         }
                         if (psp_display_capture("build/s92-after.ppm") == 0)
                             fprintf(stderr, "capture: build/s92-after.ppm\n");
-                        fprintf(stderr, "input: auto name advance\n");
-                        /* CROSS opens the OSK; wait for the returned name screen
-                         * before START, then accept only a visible dialog. */
-                        int name_phase = psp_title_scene_phase();
-                        title_press_until_change(PSP_CTRL_CROSS);
-                        Sleep(300);
-                        fprintf(stderr, "input: name OSK state=%d phase=%d story=%d\n",
-                                psp_title_scene_state(), psp_title_scene_phase(),
-                                psp_story_started());
-                        psp_display_capture("build/s93-name-osk.ppm");
-                        name_phase = psp_title_scene_phase();
-                        if (psp_title_scene_state() == 4 && name_phase != 4 &&
-                            !psp_story_started()) {
-                            title_press_until_change(PSP_CTRL_START);
-                            Sleep(300);
-                            fprintf(stderr, "input: name START state=%d phase=%d story=%d\n",
-                                    psp_title_scene_state(), psp_title_scene_phase(),
-                                    psp_story_started());
-                            psp_display_capture("build/s93-name-confirm.ppm");
-                            int returned_name = 0;
-                            for (int i = 0; i < 100 && psp_title_scene_state() == 4 &&
-                                                !returned_name; i++) {
-                                Sleep(100);
-                                if (psp_title_scene_phase() == 4)
-                                    returned_name = name_prompt_up();
-                            }
-                            fprintf(stderr, "input: name returned prompt=%d phase=%d\n",
-                                    returned_name, psp_title_scene_phase());
-                            if (!returned_name) {
-                                fprintf(stderr, "input: pause; returned name prompt not visible\n");
+                        fprintf(stderr, "input: auto name START confirmation\n");
+                        title_press_until_change(PSP_CTRL_START);
+                        for (int i = 0; i < 100 &&
+                                        psp_title_scene_state() == 4 &&
+                                        psp_title_scene_phase() != 6 &&
+                                        !psp_story_started(); i++)
+                            Sleep(100);
+                        int choice = psp_title_scene_state() == 4 &&
+                                     psp_title_scene_phase() == 6
+                                   ? stable_title_confirm_choice() : -1;
+                        fprintf(stderr, "input: name confirm choice=%d state=%d phase=%d\n",
+                                choice, psp_title_scene_state(),
+                                psp_title_scene_phase());
+                        psp_display_capture("build/s93-name-confirm-dialog.ppm");
+                        if (choice == 1) {
+                            psp_display_capture("build/s93-name-confirm-yes.ppm");
+                            title_press_until_change(PSP_CTRL_CROSS);
+                        } else if (psp_title_scene_state() == 4 &&
+                                   psp_title_scene_phase() == 6) {
+                            /* The original message window reads the digital
+                             * D-pad from 0x08101540; the earlier attempt
+                             * only moved the analog stick. */
+                            fprintf(stderr, "input: name confirm LEFT\n");
+                            auto_press(PSP_CTRL_LEFT);
+                            Sleep(400);
+                            choice = stable_title_confirm_choice();
+                            fprintf(stderr, "input: name confirm after LEFT choice=%d\n",
+                                    choice);
+                            psp_display_capture("build/s93-name-confirm-left.ppm");
+                            if (choice == 1) {
+                                psp_display_capture("build/s93-name-confirm-yes.ppm");
+                                title_press_until_change(PSP_CTRL_CROSS);
+                            } else {
+                                fprintf(stderr, "input: pause at name confirmation; YES not visible\n");
                                 g_input_done = 1;
                                 return 0;
                             }
-                            if (returned_name && !psp_story_started()) {
-                                title_press_until_change(PSP_CTRL_START);
-                                for (int i = 0; i < 100 &&
-                                                psp_title_scene_state() == 4 &&
-                                                psp_title_scene_phase() != 6 &&
-                                                !psp_story_started(); i++)
-                                    Sleep(100);
-                                int choice = psp_title_scene_state() == 4 &&
-                                             psp_title_scene_phase() == 6
-                                           ? stable_title_confirm_choice() : -1;
-                                fprintf(stderr, "input: name confirm choice=%d state=%d phase=%d\n",
-                                        choice, psp_title_scene_state(),
-                                        psp_title_scene_phase());
-                                psp_display_capture("build/s93-name-confirm-dialog.ppm");
-                                if (choice == 0) {
-                                    psp_title_walk(0, 0, 128);
-                                    Sleep(600);
-                                    psp_title_walk(0, 128, 128);
-                                    choice = stable_title_confirm_choice();
-                                    psp_display_capture("build/s315-confirm-after-analog-left.ppm");
-                                    fprintf(stderr, "input: name confirm after analog LEFT=%d\n", choice);
-                                }
-                                if (choice == 1) {
-                                    psp_display_capture("build/s93-name-confirm-yes.ppm");
-                                    title_press_until_change(PSP_CTRL_CROSS);
-                                } else if (psp_title_scene_state() == 4 &&
-                                           psp_title_scene_phase() == 6) {
-                                    fprintf(stderr, "input: pause at name confirmation; YES not visible\n");
-                                    g_input_done = 1;
-                                    return 0;
-                                } else if (psp_title_scene_state() == 4) {
-                                    fprintf(stderr, "input: pause; name confirmation phase 6 did not arrive\n");
-                                    g_input_done = 1;
-                                    return 0;
-                                }
-                            }
+                        } else if (psp_title_scene_state() == 4) {
+                            fprintf(stderr, "input: pause; name confirmation phase 6 did not arrive\n");
+                            g_input_done = 1;
+                            return 0;
                         }
                         int last_state = psp_title_scene_state();
                         fprintf(stderr, "input: name confirm CROSS state=%d phase=%d story=%d\n",
