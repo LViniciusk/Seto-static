@@ -281,6 +281,9 @@ int psp_title_start_done(void) { return atomic_load(&g_start_done); }
 
 static void title_input_update(uint32_t addr) {
     (void)addr;
+    static int valid;
+    static uint32_t last_input;
+    static uint8_t last_event;
     int step = (short)psp_read16(0x0126C6FCu);
     int state = psp_read8(0x0126CF6Cu);
     int phase = (short)psp_read16(0x0126C700u);
@@ -289,6 +292,18 @@ static void title_input_update(uint32_t addr) {
     atomic_store(&g_scene_phase, phase);
     atomic_store(&g_scene_cursor, cursor);
     if (state == 3) atomic_store(&g_scene3, 1);
+    if (state == 4 && phase == 6) {
+        const uint32_t input = psp_read32(0x08101530u);
+        const uint8_t event = psp_read8(0x08262BF4u);
+        if (!valid || input != last_input || event != last_event) {
+            fprintf(stderr, "title event: input=0x%08X code=0x%02X\n", input, event);
+            last_input = input;
+            last_event = event;
+            valid = 1;
+        }
+    } else {
+        valid = 0;
+    }
 
     uint32_t menu = atomic_load(&g_menu_request);
     if (menu && state == 3) {
@@ -308,6 +323,8 @@ static void title_input_update(uint32_t addr) {
 
     uint32_t pad = atomic_exchange(&g_pad_request, 0);
     if (pad) {
+        if (state == 4 && phase == 6)
+            fprintf(stderr, "title input: phase6 pad 0x%08X\n", pad);
         if (g_pad_on) { psp_ctrl_set(0, 128, 128); g_pad_on = 0; }
         psp_ctrl_set(pad, 128, 128);
         g_pad_release = 1;

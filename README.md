@@ -1239,12 +1239,36 @@ field through states `5 -> 6 -> 23 -> 1`. Captures:
 `build/s93-travel10.ppm`, `build/s93-class-duel-menu.ppm`,
 `build/s93-class-duel-select.ppm`, `build/s93-first-duel.ppm`.
 
-**Still blocked.** No duel ModuleMgr load or `modduel_mgr` start occurred
-(`duel start requested=0`). The run returned to free roam after selection. The
-host now logs the real manager `module_start` request/return and stops its
-dialogue input when that request occurs. Next inspect the first frame after
-selecting Duel and reproduce the actual pre-duel/confirmation path without
-pressing through an unseen choice.
+**s308 update — duel modules start, battle not yet proved.** The original
+ModuleMgr path loaded and started `modduel_mgr` (entry `0x02200000`),
+`modduel_draw` (`0x03001BF4`) and `modduel_eng` (`0x02E00000`); all three
+`module_start` calls returned `0`. The final frame shows “Challenge me? Fine,
+I’ll take you on.” The run hit its 180 s cap with field state still `0`, no
+duel board, and no processed result. It also logged three bad accesses at
+`0x00000003` (first from `0x08034644`) and repeated `ehfile_queue` waits; their
+causal relation to battle progression is not established.
+
+The s308 input trace reported `auto START done=0 scene3=0`. Investigation found
+that `psp_trace_watch` holds only one active watch: adding the `0x0803D968`
+diagnostic replaced the `0x08035AC8` input-update hook. The current fix keeps
+both observations in the existing input hook. In s309 the original title input
+then reported `START done=1 scene3=1` and advanced state `3 -> 4`; the run had
+zero bad accesses and reached the visible name confirmation.
+
+In s312 the screenshot classifier identified the pink highlight on **NO**,
+sent one original D-pad DOWN press, and still identified NO; it sent no CROSS
+and paused (`build/s312-confirm-dialog.png`, `build/s312-after-down.png`). Runs
+s313–s316 did not reach phase `6`. The final s315 frame visibly showed
+`ENTER NAME`; its red prompt text was present, but the generic dialogue-box
+brightness gate rejected it during the transition. Removing that gate let
+s316 detect the returned prompt, but too early at phase `1`; START then reached
+phase `4` while the final frame still showed `ENTER NAME`. Requiring phase `4`
+before pressing START fixed the timing: s317 reached the original “Is this OK?”
+dialog at state `4`/phase `6`, with **NO** highlighted. An original analog-LEFT
+input for 600 ms left NO selected, so no CROSS was sent. The run had zero bad
+accesses. Repeated `ehfile_queue` waits remain observed, but their causal
+relation to progression is not established. No battle board or processed
+result has yet been verified.
 
 ## Limitations
 
