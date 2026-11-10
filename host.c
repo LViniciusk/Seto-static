@@ -324,16 +324,34 @@ static int title_press_until_change(uint32_t mask) {
     return 0;
 }
 
-/* One press of a state-3 menu key: the vblank hook applies it for exactly one
- * frame. The direct pad path is not used here because it would produce a
- * second edge and the cursor would skip an entry. */
-static void menu_step(uint32_t mask) {
-    const int c0 = psp_title_scene_cursor();
+/* Row of the orange highlight on the main menu (Story Mode starts at y 63,
+ * one row per 25 px). The main menu does not read the normal pad path, so
+ * the caller drives psp_title_menu_request and checks this after each hold. */
+static int main_menu_row(void) {
+    static uint32_t px[480 * 272];
+    if (psp_display_read(px) != 0) return -1;
+    int y0 = -1, y1 = -1;
+    for (int y = 40; y < 180; y++) {
+        int c = 0;
+        for (int x = 140; x < 372; x++) {
+            const uint32_t v = px[y * 480 + x];
+            const int r = (int)(v & 0xFF), g = (int)((v >> 8) & 0xFF),
+                      b = (int)((v >> 16) & 0xFF);
+            if (r > 230 && g > 120 && g < 200 && b < 60) c++;
+        }
+        if (c > 80) { if (y0 < 0) y0 = y; y1 = y; }
+    }
+    if (y0 < 0) return -1;
+    return ((y0 + y1) / 2 - 71 + 12) / 25;
+}
+
+/* One short menu_request hold: the hook re-issues the edge every input update
+ * while the request is set, so keep it near one update. */
+static void menu_hold(uint32_t mask, int ms) {
     psp_title_menu_request(mask);
-    for (int i = 0; i < 3000 && psp_title_scene_cursor() == c0; i++)
-        Sleep(1);
+    Sleep(ms);
     psp_title_menu_request(0);
-    Sleep(150);
+    Sleep(300);
 }
 
 static void auto_menu(uint32_t mask, int by_cursor) {
@@ -521,9 +539,19 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                             fprintf(stderr, "input: auto main menu cursor=%d\n",
                                     psp_title_scene_cursor());
                             if (getenv("SETO_FREE_DUEL")) {
-                                menu_step(0x00000040u);
+                                int row = main_menu_row();
+                                fprintf(stderr, "input: free menu row=%d\n", row);
+                                for (int i = 0; i < 12 && row != 1; i++) {
+                                    if (row < 0) break;
+                                    menu_hold(row < 1 ? PSP_CTRL_DOWN : PSP_CTRL_UP,
+                                              8 + (i % 3) * 6);
+                                    row = main_menu_row();
+                                    fprintf(stderr, "input: free menu row=%d\n", row);
+                                }
                                 psp_display_capture("build/s93-free-menu.ppm");
-                                menu_step(0x00004000u);
+                                for (int i = 0; i < 3 &&
+                                                psp_title_scene_state() == 3; i++)
+                                    menu_hold(PSP_CTRL_CROSS, 8);
                                 for (int i = 0; i < 15; i++) {
                                     Sleep(1000);
                                     if (i == 5 || i == 10) {
@@ -711,12 +739,13 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                          * manager. */
                                         static const struct { int ax, ay; const char *n; }
                                         fdirs[] = {
+                                            { 128, 128, "none" },
                                             { 128, 0, "up" }, { 128, 255, "down" },
                                             { 0, 128, "left" }, { 255, 128, "right" },
                                         };
                                         for (int pass = 0; pass < 2 &&
                                                 !psp_duel_manager_start_requested(); pass++) {
-                                            for (int d = 0; d < 4 &&
+                                            for (int d = 0; d < 5 &&
                                                     !psp_duel_manager_start_requested(); d++) {
                                                 psp_title_walk(0, fdirs[d].ax, fdirs[d].ay);
                                                 psp_ctrl_set(0, fdirs[d].ax, fdirs[d].ay);
