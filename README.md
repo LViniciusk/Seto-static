@@ -41,6 +41,16 @@ controls, the original menu advances from cursor 1 to 0 and confirmation changes
 the scene state from 3 to 4, presenting the next scene, in 5/5 headless runs
 (see [S9.2 results](#s92-results--title-menu)).
 
+**S10 — visible field: IN PROGRESS.** The current goal is a visible, navigable
+Classroom before attempting a duel. Free Duel is locked on a new game; meeting
+the students and finishing the first class precede the Crowler duel. The VFPU
+`vtfm` helper used the wrong matrix orientation. The S10 patch fixes its dot
+products and adds the measured `vtfm3.t`/`vtfm4.q` vectors from
+[pspautotests](https://github.com/hrydgard/pspautotests/blob/master/tests/cpu/vfpu/matrix.expected).
+Those seven lanes fail before the fix and match exactly afterwards; CTest passes
+21/21. In-game visual validation is still pending. The local near-eye clipping
+experiment has not proved a visual improvement and is not in the patch stack.
+
 **S9.3 — story/name menu: PARTIAL.** A minimal `sceUtilityOsk` HLE lets the
 original `ENTER NAME` flow return a configured name, and a minimal mailbox HLE
 unblocks the game's loader. The recompiled game reaches the **MAIN MENU**, loads
@@ -138,6 +148,7 @@ git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s9-mailbox.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s9-field.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s9-font.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s9-duel.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-vtfm.patch
 
 cmake -S build/psprecomp -B build/psprecomp-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build/psprecomp-build -j 8
