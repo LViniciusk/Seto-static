@@ -423,11 +423,17 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                         fprintf(stderr, "input: auto name phase=%d state=%d\n",
                                 psp_title_scene_phase(), psp_title_scene_state());
                         int name_prompt = 0;
-                        for (int i = 0; i < 100 && psp_title_scene_state() == 4 &&
+                        for (int i = 0; i < 400 && psp_title_scene_state() == 4 &&
                                             !name_prompt; i++) {
                             Sleep(100);
                             if (psp_title_scene_phase() == 4)
                                 name_prompt = name_prompt_up();
+                            /* The title's own animation rate varies between
+                             * runs; a second START after ten seconds is what a
+                             * player would do when the prompt looks idle. */
+                            if (i == 100 && !name_prompt &&
+                                psp_title_scene_phase() < 4)
+                                title_press_until_change(PSP_CTRL_START);
                         }
                         fprintf(stderr, "input: auto name prompt=%d phase=%d state=%d\n",
                                 name_prompt, psp_title_scene_phase(),
@@ -608,13 +614,28 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                     psp_display_capture("build/s93-menu-open.ppm");
                                     fprintf(stderr, "input: auto menu-open state=%u\n",
                                             psp_read32(0x093CDAFCu));
-                                    for (int d = 0; d < 4; d++) {
-                                        field_press(0x00000040u);
-                                        Sleep(600);
+                                    /* The menu is Talk/Duel/Item/PDA/Map. A
+                                     * press can be lost, which lands on PDA
+                                     * (state 11/12); back out and repeat with
+                                     * one more DOWN rather than opening Email. */
+                                    for (int attempt = 0; attempt < 3; attempt++) {
+                                        const int downs = 4 + attempt;
+                                        for (int d = 0; d < downs; d++) {
+                                            field_press(0x00000040u);
+                                            Sleep(600);
+                                        }
+                                        psp_display_capture("build/s93-map-sel.ppm");
+                                        field_press(0x00004000u);
+                                        Sleep(3000);
+                                        const uint32_t st = psp_read32(0x093CDAFCu);
+                                        fprintf(stderr, "input: menu attempt=%d downs=%d state=%u\n",
+                                                attempt, downs, st);
+                                        if (st != 11u && st != 12u) break;
+                                        field_press(0x00002000u);   /* CIRCLE: leave PDA */
+                                        Sleep(1500);
+                                        field_press(0x00004000u);   /* reopen the menu */
+                                        Sleep(1500);
                                     }
-                                    psp_display_capture("build/s93-map-sel.ppm");
-                                    field_press(0x00004000u);
-                                    Sleep(5000);
                                     psp_display_capture("build/s93-map.ppm");
                                     field_press(0x00004000u);
                                     Sleep(4000);
@@ -628,34 +649,54 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                      * blind CROSS on the map travels somewhere
                                      * else. Row 0 is Main Gate, so one DOWN is
                                      * Classroom. */
-                                    Sleep(6000);
+                                    Sleep(5000);
                                     psp_display_capture("build/s93-map-world.ppm");
                                     fprintf(stderr, "input: travel map state=%u\n",
                                             psp_read32(0x093CDAFCu));
-                                    auto_press(0x00000040u);
-                                    Sleep(1200);
-                                    psp_display_capture("build/s93-travel-class.ppm");
+                                    if (getenv("SETO_TRACE_FIELD")) psp_ge_trace_next_frame();
+                                    /* The destination list is drawn over the
+                                     * last field frame while the field unloads.
+                                     * Row 0 is Main Gate, so one DOWN picks
+                                     * Classroom; then CROSS confirms. A travel
+                                     * takes about twenty seconds to reload. */
+                                    Sleep(2000);
+                                    psp_display_capture("build/s93-map-list.ppm");
+                                    /* CROSS first: the prompt/fade has to clear
+                                     * before the list takes the D-pad. */
                                     auto_press(0x00004000u);
-                                    Sleep(3000);
-                                    psp_display_capture("build/s93-travel-confirm.ppm");
-                                    fprintf(stderr, "input: travel chosen state=%u\n",
+                                    Sleep(900);
+                                    auto_press(0x00000040u);
+                                    Sleep(900);
+                                    psp_display_capture("build/s93-map-class.ppm");
+                                    auto_press(0x00004000u);
+                                    for (int t = 0; t < 40 &&
+                                            psp_read32(0x093CDAFCu) == 0u; t++) {
+                                        if (t % 10 == 9) {
+                                            char path[48];
+                                            snprintf(path, sizeof path,
+                                                     "build/s93-load%d.ppm", t);
+                                            psp_display_capture(path);
+                                        }
+                                        Sleep(1000);
+                                    }
+                                    fprintf(stderr, "input: travel reloaded state=%u\n",
                                             psp_read32(0x093CDAFCu));
                                     psp_display_dump_at("build/vram-a.ppm", 0x04000000u);
                                     psp_display_dump_at("build/vram-b.ppm", 0x04088000u);
-                                    /* A second confirm ("Go here?") may follow;
-                                     * the dialogue loop below skips empty beats. */
-                                    for (int k = 0; k < 6; k++) {
-                                        auto_press(0x00004000u);
-                                        Sleep(1500);
-                                        if (k == 2) {
-                                            psp_display_capture("build/s93-travel5.ppm");
-                                        }
-                                    }
+                                    psp_display_capture("build/s93-travel-confirm.ppm");
                                     /* Brief state-1 gaps separate dialogue beats;
                                      * wait for quiet before capturing free roam. */
                                     int seen_class_box = 0, quiet = 0, class_done = 0;
+                                    int room_shot = 0;
                                     for (int k = 0; k < 600 && !class_done &&
                                             !psp_duel_manager_start_requested(); k++) {
+                                        if (!room_shot && psp_read32(0x093CDAFCu) == 1u) {
+                                            room_shot = 1;
+                                            Sleep(1200);
+                                            psp_display_capture("build/s93-room.ppm");
+                                            fprintf(stderr, "input: arrived room state=%u\n",
+                                                    psp_read32(0x093CDAFCu));
+                                        }
                                         const int box = box_up();
                                         const uint32_t st = psp_read32(0x093CDAFCu);
                                         if (box) {

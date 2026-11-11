@@ -55,26 +55,30 @@ Three fixes were needed to see it:
    transforms, dropping the translation. They now keep the matrix order and the
    implicit final input of 1, with PSP-measured homogeneous vectors and synthetic
    emitter checks.
-3. **Through-mode vertex positions.** This was the actual reason the room was
-   invisible. Through-mode 16-bit positions are 12.4 fixed point, and the
-   rasterizer read them as whole pixels, so every 2D quad was 16x too large: the
-   field's HUD background layers covered the 3D world with what looked like a
-   blue gradient. Dumping both VRAM buffers showed the complete room in the
-   buffer that was not presented. The fix divides 16-bit through positions by
-   16, makes 8-bit through positions decode to zero like the hardware, keeps
-   float positions as pixels, and the raster tests now encode their pixel
-   coordinates as 12.4.
+3. **Where the room goes.** Not a transform bug. Dumping both VRAM buffers at
+   free roam showed the complete room in one buffer and the background plus
+   characters in the other. In the traced frame the 3D room is drawn first and a
+   full-screen opaque 2D gradient is drawn *after* it, so the room is covered.
+   The gradient quad's vertices are (0,0)-(480,272) raw, i.e. whole pixels: a
+   through-mode 12.4 reading was tried and disproved by tracing the world map,
+   whose background tiles are also full-screen at these coordinates (dividing by
+   16 shrinks the map and the real name-dialog bars to nothing). That change was
+   reverted; CTest 21/21.
 
-Evidence: run s356 renders the Chancellor's Office with its room, carpet, tree
-and action menu (`build/s356-menuopen.png`), and the name dialog has its real
-layout instead of the giant cream bars (`build/s355-name.png`). CTest 21/21.
+Evidence: with the pixel reading, the name dialog shows the real "ENTER NAME"
+bar and message box (`build/s345-name.png`). The room itself is present in VRAM
+(`build/vram-b.png` from run s358) and the office is rendered when the covering
+quad is not drawn (`build/s356-menuopen.png`, from the disproved experiment).
+The open problem is frame composition/order between the field's 3D list and the
+full-screen 2D background.
 
-The current blocker is the map transition. Choosing Map in the office and
-answering the exit prompt unloads the field (`state=0`) and then the field never
-restarts: no new frame is drawn, both VRAM buffers keep the old office frame,
-the last translated code sits in an EBOOT loop, and the log shows the file
-worker waiting on `ehfile_queue`. So the office is visibly functional, but
-traveling to the Classroom and the duel is not yet reached.
+The map transition does complete on some runs: in s363 the field unloaded at
+vb 3396 and reloaded at vb 4496, and s366 reached free roam again
+(`build/s366-room.png`), but the destination chosen was still Chancellor's
+Office. The destination list renders without its panel or highlight, and its
+cursor cannot be verified from pixels, so choosing Classroom is not yet
+repeatable. So the office is visibly functional, but the Classroom and the duel
+are not reached.
 
 Automation notes: with `SETO_MENU_MAP=1` the script stops after the Classroom
 dialogue and captures `build/classroom-free-roam.ppm` instead of blindly
@@ -186,7 +190,7 @@ git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-vtfm.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-ge-trace.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-vhtfm.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-frame-dump.patch
-git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-through-pos.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-thread-trace.patch
 
 cmake -S build/psprecomp -B build/psprecomp-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build/psprecomp-build -j 8
