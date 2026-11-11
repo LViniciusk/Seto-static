@@ -459,7 +459,6 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                 choice, psp_title_scene_state(),
                                 psp_title_scene_phase());
                         psp_display_capture("build/s93-name-confirm-dialog.ppm");
-                        if (choice != 1 && psp_title_confirm_sel() == 2) choice = 1;
                         if (choice == 1) {
                             psp_display_capture("build/s93-name-confirm-yes.ppm");
                             title_press_until_change(PSP_CTRL_CROSS);
@@ -490,10 +489,6 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                 Sleep(100);
                             }
                             if (choice == 1) choice = stable_title_confirm_choice();
-                            /* The window's own selection index is the authoritative
-                             * YES/NO state; the pixel classifier was calibrated on
-                             * a UI that a through-mode position fix resized. */
-                            if (choice != 1 && sel == 2) choice = 1;
                             fprintf(stderr, "input: name confirm after LEFT choice=%d sel=%d\n",
                                     choice, sel);
                             psp_display_capture("build/s93-name-confirm-left.ppm");

@@ -1,0 +1,420 @@
+diff --git a/include/psprecomp/render.h b/include/psprecomp/render.h
+--- a/include/psprecomp/render.h
++++ b/include/psprecomp/render.h
+@@ -80,6 +80,11 @@
+     int      atest;          /* ATE */
+     int      atest_func, atest_ref, atest_mask; /* ATST */
+ 
++    int      stencil;        /* STE: framebuffer alpha is the stencil buffer */
++    int      stencil_func, stencil_ref, stencil_mask; /* STST */
++    int      stencil_fail, stencil_zfail, stencil_zpass; /* SOP */
++    uint32_t write_mask;     /* PMSKC/PMSKA: set bits preserve the destination */
++
+     int      sc_x0, sc_y0, sc_x1, sc_y1;        /* SCISSOR1/2, inclusive */
+ 
+     int      ztest;          /* ZTE */
+diff --git a/src/hle/ge.c b/src/hle/ge.c
+--- a/src/hle/ge.c
++++ b/src/hle/ge.c
+@@ -59,6 +59,11 @@
+ #define GE_ABE          0x21
+ #define GE_ATE          0x22
+ #define GE_ZTE          0x23
++#define GE_STE          0x24
++#define GE_STST         0xDC
++#define GE_SOP          0xDD
++#define GE_PMSKC        0xE8
++#define GE_PMSKA        0xE9
+ #define GE_ZSCALE       0x44
+ #define GE_ZPOS         0x47
+ #define GE_RNORM        0x51
+@@ -353,6 +358,8 @@
+     g_ds.clut_mask = 0xFF;
+     g_ds.atest_func = 1;
+     g_ds.atest_mask = 0xFF;
++    g_ds.stencil_func = 1;
++    g_ds.stencil_mask = 0xFF;
+     g_ds.tex_w = g_ds.tex_h = 1;
+     g_ds.tex_alpha = 1;
+     g_ds.sc_x1 = 479;
+@@ -783,6 +790,19 @@
+         case GE_TME:   g_ds.tex_enable = arg & 1; break;
+         case GE_ABE:   g_ds.blend = arg & 1; break;
+         case GE_ATE:   g_ds.atest = arg & 1; break;
++        case GE_STE:   g_ds.stencil = arg & 1; break;
++        case GE_STST:
++            g_ds.stencil_func = arg & 7;
++            g_ds.stencil_ref = (arg >> 8) & 0xFF;
++            g_ds.stencil_mask = (arg >> 16) & 0xFF;
++            break;
++        case GE_SOP:
++            g_ds.stencil_fail = arg & 7;
++            g_ds.stencil_zfail = (arg >> 8) & 7;
++            g_ds.stencil_zpass = (arg >> 16) & 7;
++            break;
++        case GE_PMSKC: g_ds.write_mask = (g_ds.write_mask & 0xFF000000u) | arg; break;
++        case GE_PMSKA: g_ds.write_mask = (g_ds.write_mask & 0x00FFFFFFu) | ((arg & 0xFF) << 24); break;
+         case GE_SHADE: g_ds.gouraud = arg & 1; break;
+         case GE_AMC:   g_material = (g_material & 0xFF000000u) | arg; break;
+         case GE_AMA:   g_material = (g_material & 0x00FFFFFFu) | ((arg & 0xFF) << 24); break;
+diff --git a/src/render.c b/src/render.c
+--- a/src/render.c
++++ b/src/render.c
+@@ -9,8 +9,8 @@
+  * game's.
+  *
+  * Per pixel, in order: clear mode short-circuits everything; otherwise vertex
+- * colour, texture function, alpha test, depth test, blend, write. Stencil,
+- * fog, dithering, colour test and logic ops are not implemented.
++ * colour, texture function, alpha test, stencil/depth test, blend, masked write.
++ * Fog, dithering, colour test and logic ops are not implemented.
+  */
+ 
+ #include "psprecomp/render.h"
+@@ -273,8 +273,6 @@
+         default: out[ch] = sc > dc ? sc - dc : dc - sc; break;
+         }
+     }
+-    /* ponytail: the framebuffer's alpha byte is stencil on hardware; the
+-     * source alpha is written instead until stencil exists. */
+     return rgba(out[0], out[1], out[2], (int)A(s));
+ }
+ 
+@@ -290,7 +288,29 @@
+ }
+ 
+ static uint32_t fb_read(uint32_t at) {
+-    return g_fb_fmt == 3 ? psp_read32(at) : psp_color_expand(psp_read16(at), g_fb_fmt);
++    uint32_t c = g_fb_fmt == 3 ? psp_read32(at) : psp_color_expand(psp_read16(at), g_fb_fmt);
++    return g_fb_fmt == 0 ? c & 0x00FFFFFFu : c;
++}
++
++static void fb_write(uint32_t at, uint32_t c, uint32_t mask) {
++    if (g_fb_fmt == 3) psp_write32(at, (c & ~mask) | (psp_read32(at) & mask));
++    else {
++        mask = color_pack(mask, g_fb_fmt);
++        psp_write16(at, (uint16_t)((color_pack(c, g_fb_fmt) & ~mask) | (psp_read16(at) & mask)));
++    }
++    g_pixels++;
++}
++
++static int stencil_op(int op, int old, int ref) {
++    const int step = g_fb_fmt == 1 ? 255 : g_fb_fmt == 2 ? 17 : 1;
++    switch (op) {
++    case 1: return 0;
++    case 2: return ref;
++    case 3: return old ^ 255;
++    case 4: return old + step > 255 ? 255 : old + step;
++    case 5: return old < step ? 0 : old - step;
++    default: return old;
++    }
+ }
+ 
+ static int depth_pass(int func, int z, int d) {
+@@ -339,16 +359,29 @@
+             c = tex_combine(st, psp_tex_fetch(st, tx, ty), c);
+         }
+         if (st->atest && !alpha_pass(st, c)) return;
+-        if (st->ztest && have_z) {
+-            if (!depth_pass(st->zfunc, z, psp_read16(zat))) return;
+-            if (st->zwrite) psp_write16(zat, (uint16_t)z);
++        const uint32_t d = fb_read(at);
++        int stencil = (int)A(d);
++        if (st->stencil && !depth_pass(st->stencil_func,
++                st->stencil_ref & st->stencil_mask, stencil & st->stencil_mask)) {
++            stencil = stencil_op(st->stencil_fail, stencil, st->stencil_ref);
++            fb_write(at, (d & 0x00FFFFFFu) | ((uint32_t)stencil << 24), st->write_mask);
++            return;
+         }
+-        if (st->blend) c = blend(st, c, fb_read(at));
+-    }
+-
+-    if (bytes == 4) psp_write32(at, c);
+-    else            psp_write16(at, (uint16_t)color_pack(c, g_fb_fmt));
+-    g_pixels++;
++        if (st->ztest && have_z && !depth_pass(st->zfunc, z, psp_read16(zat))) {
++            if (st->stencil) {
++                stencil = stencil_op(st->stencil_zfail, stencil, st->stencil_ref);
++                fb_write(at, (d & 0x00FFFFFFu) | ((uint32_t)stencil << 24), st->write_mask);
++            }
++            return;
++        }
++        if (st->ztest && have_z && st->zwrite) psp_write16(zat, (uint16_t)z);
++        if (st->stencil) stencil = stencil_op(st->stencil_zpass, stencil, st->stencil_ref);
++        if (st->blend) c = blend(st, c, d);
++        /* Source alpha controls tests/blending, never the stored stencil. */
++        c = (c & 0x00FFFFFFu) | ((uint32_t)stencil << 24);
++    }
++
++    fb_write(at, c, st->write_mask);
+ }
+ 
+ static int edge(const psp_vertex *p, const psp_vertex *q, int x, int y) {
+diff --git a/tests/test_raster.c b/tests/test_raster.c
+--- a/tests/test_raster.c
++++ b/tests/test_raster.c
+@@ -109,7 +109,7 @@
+ 
+     CHECK(psp_ge_pixels() == 100 * 100, "sprite pixel count: %llu (want 10000)",
+           (unsigned long long)psp_ge_pixels());
+-    CHECK(pixel(150, 100) == 0xFF0000FFu, "sprite interior: 0x%08X", pixel(150, 100));
++    CHECK(pixel(150, 100) == 0x000000FFu, "sprite interior: 0x%08X", pixel(150, 100));
+     CHECK(pixel(99, 100) == 0, "left of sprite should be untouched: 0x%08X", pixel(99, 100));
+     CHECK(pixel(150, 49) == 0, "above sprite should be untouched: 0x%08X", pixel(150, 49));
+     /* Half-open on the far edge, so adjacent sprites tile without overlapping. */
+@@ -128,7 +128,7 @@
+ 
+     CHECK(psp_ge_pixels() > 4000, "triangle should cover ~5000 px, got %llu",
+           (unsigned long long)psp_ge_pixels());
+-    CHECK(pixel(20, 20) == 0xFF00FF00u, "inside triangle: 0x%08X", pixel(20, 20));
++    CHECK(pixel(20, 20) == 0x0000FF00u, "inside triangle: 0x%08X", pixel(20, 20));
+     /* The hypotenuse runs from (110,10) to (10,110); (100,100) is well past it. */
+     CHECK(pixel(100, 100) == 0, "outside hypotenuse: 0x%08X", pixel(100, 100));
+ }
+@@ -144,7 +144,7 @@
+     vertex(2, 110, 10, 0xFFFFFFFFu);
+     cmd(0x04, (3u << 16) | 3);
+     end_list();
+-    CHECK(pixel(20, 20) == 0xFFFFFFFFu, "reversed winding still fills: 0x%08X",
++    CHECK(pixel(20, 20) == 0x00FFFFFFu, "reversed winding still fills: 0x%08X",
+           pixel(20, 20));
+ }
+ 
+@@ -161,7 +161,7 @@
+ 
+     CHECK(psp_ge_pixels() == 50 * 50, "clipped sprite: %llu (want 2500)",
+           (unsigned long long)psp_ge_pixels());
+-    CHECK(pixel(0, 0) == 0xFFFF0000u, "clipped sprite covers origin");
++    CHECK(pixel(0, 0) == 0x00FF0000u, "clipped sprite covers origin");
+     CHECK(pixel(479, 271) == 0, "far corner untouched: 0x%08X", pixel(479, 271));
+ }
+ 
+@@ -224,9 +224,9 @@
+     end_list();
+     for (int i = 0; i < 4; i++) psp_hle_call(0x46F186C3u);
+ 
+-    CHECK(pixel(185, 75) == 0xFF000040u, "top-left quarter shows texel (0,0): 0x%08X", pixel(185, 75));
+-    CHECK(pixel(415, 75) == 0xFF000080u, "top-right quarter shows texel (1,0): 0x%08X", pixel(415, 75));
+-    CHECK(pixel(185, 200) == 0xFF0000C0u, "bottom-left quarter shows texel (0,1): 0x%08X", pixel(185, 200));
++    CHECK(pixel(185, 75) == 0x00000040u, "top-left quarter shows texel (0,0): 0x%08X", pixel(185, 75));
++    CHECK(pixel(415, 75) == 0x00000080u, "top-right quarter shows texel (1,0): 0x%08X", pixel(415, 75));
++    CHECK(pixel(185, 200) == 0x000000C0u, "bottom-left quarter shows texel (0,1): 0x%08X", pixel(185, 200));
+     CHECK(pixel(175, 136) == 0, "world translation moved the left edge past x=175: 0x%08X", pixel(175, 136));
+     CHECK(pixel(425, 136) == 0, "right edge stops before x=425: 0x%08X", pixel(425, 136));
+     CHECK(pixel(300, 64) == 0, "top edge is at y=68: 0x%08X", pixel(300, 64));
+@@ -244,8 +244,8 @@
+     end_list();
+ 
+     /* Two triangles sharing an edge tile the square without a seam. */
+-    CHECK(pixel(20, 20) == 0xFFFFFFFFu, "strip tri 0: 0x%08X", pixel(20, 20));
+-    CHECK(pixel(100, 100) == 0xFFFFFFFFu, "strip tri 1: 0x%08X", pixel(100, 100));
++    CHECK(pixel(20, 20) == 0x00FFFFFFu, "strip tri 0: 0x%08X", pixel(20, 20));
++    CHECK(pixel(100, 100) == 0x00FFFFFFu, "strip tri 1: 0x%08X", pixel(100, 100));
+ }
+ 
+ /* The backend interface itself. The software path is the reference every other
+@@ -336,7 +336,7 @@
+     int bad = 0;
+     for (int y = 0; y < 4; y++)
+         for (int x = 0; x < 4; x++)
+-            if (pixel(10 + x, 20 + y) != texel_id(x, y)) bad++;
++            if (pixel(10 + x, 20 + y) != (texel_id(x, y) & 0x00FFFFFFu)) bad++;
+     CHECK(bad == 0, "1:1 textured sprite: %d of 16 texels wrong (0,0)=0x%08X (3,2)=0x%08X",
+           bad, pixel(10, 20), pixel(13, 22));
+ 
+@@ -348,7 +348,7 @@
+     tvertex(1, 8, 8, 4, 4, 0xFFFFFFFFu);
+     cmd(0x04, (6u << 16) | 2);
+     end_list();
+-    CHECK(pixel(5, 3) == texel_id(2, 1), "2x scaled: pixel (5,3) is texel (2,1): 0x%08X", pixel(5, 3));
++    CHECK(pixel(5, 3) == (texel_id(2, 1) & 0x00FFFFFFu), "2x scaled: pixel (5,3) is texel (2,1): 0x%08X", pixel(5, 3));
+ 
+     /* Modulate: a half-grey vertex colour halves each channel. */
+     psp_ge_reset();
+@@ -359,7 +359,7 @@
+     tvertex(1, 1, 1, 1, 1, 0xFF808080u);
+     cmd(0x04, (6u << 16) | 2);
+     end_list();
+-    CHECK(pixel(0, 0) == 0xFF408020u, "modulate by half grey: 0x%08X (want 0xFF408020)", pixel(0, 0));
++    CHECK(pixel(0, 0) == 0x00408020u, "modulate by half grey: 0x%08X (want 0x00408020)", pixel(0, 0));
+ }
+ 
+ /* Swizzle by moving blocks in storage order, independent of the renderer's
+@@ -399,7 +399,7 @@
+     int bad = 0, fx = -1, fy = -1;
+     for (int y = 0; y < 16; y++)
+         for (int x = 0; x < 64; x++) {
+-            uint32_t want = 0xFF000000u | (uint32_t)(((x + y) & 15) * 0x0F0E0D);
++            uint32_t want = (uint32_t)(((x + y) & 15) * 0x0F0E0D);
+             if (pixel(x, y) != want) { if (!bad) { fx = x; fy = y; } bad++; }
+         }
+     CHECK(bad == 0, "swizzled CLUT4: %d of 1024 wrong, first at (%d,%d) = 0x%08X", bad, fx, fy,
+@@ -419,7 +419,7 @@
+     g_pc = 0;
+     cmd(0x04, (6u << 16) | 2);
+     end_list();
+-    CHECK(pixel(1, 0) == 0xFF0F0E0Du, "CLUT is copied at load, not read at draw: 0x%08X", pixel(1, 0));
++    CHECK(pixel(1, 0) == 0x000F0E0Du, "CLUT is copied at load, not read at draw: 0x%08X", pixel(1, 0));
+ }
+ 
+ static void test_alpha_test_and_blend(void) {
+@@ -437,7 +437,7 @@
+     cmd(0x04, (6u << 16) | 2);
+     end_list();
+     CHECK(pixel(0, 0) == 0xFFFF0000u, "alpha test drops alpha-0 texel: 0x%08X", pixel(0, 0));
+-    CHECK(pixel(1, 0) == 0x800000FFu, "alpha test keeps alpha-128 texel: 0x%08X", pixel(1, 0));
++    CHECK(pixel(1, 0) == 0xFF0000FFu, "alpha test keeps texel RGB and destination stencil: 0x%08X", pixel(1, 0));
+ 
+     /* SRC_ALPHA, ONE_MINUS_SRC_ALPHA, ADD: half red over blue. */
+     psp_ge_reset();
+@@ -515,7 +515,7 @@
+     end_list();
+ 
+     uint32_t got = psp_read32(PSP_VRAM_BASE + ram_probe);
+-    CHECK(got == 0xFF00FF00u, "relative FBP draws into VRAM at 0x%08X: 0x%08X",
++    CHECK(got == 0x0000FF00u, "relative FBP draws into VRAM at 0x%08X: 0x%08X",
+           PSP_VRAM_BASE + ram_probe, got);
+     if (ram_ok)
+         CHECK(psp_read32(ram_probe) == 0x12345678u,
+@@ -539,10 +539,10 @@
+     tvertex(1, 4, 4, 4, 4, 0xFFFFFFFFu);
+     cmd(0x04, (6u << 16) | 2);
+     end_list();
+-    CHECK(pixel(0, 0) == 0xFFFF0000u, "DXT1 index 0 is endpoint 0 (blue): 0x%08X", pixel(0, 0));
+-    CHECK(pixel(1, 0) == 0xFF0000FFu, "DXT1 index 1 is endpoint 1 (red): 0x%08X", pixel(1, 0));
+-    CHECK(pixel(2, 0) == 0xFFAA0055u, "DXT1 index 2 is 2/3 endpoint 0: 0x%08X", pixel(2, 0));
+-    CHECK(pixel(3, 3) == 0xFF5500AAu, "DXT1 index 3 is 1/3 endpoint 0: 0x%08X", pixel(3, 3));
++    CHECK(pixel(0, 0) == 0x00FF0000u, "DXT1 index 0 is endpoint 0 (blue): 0x%08X", pixel(0, 0));
++    CHECK(pixel(1, 0) == 0x000000FFu, "DXT1 index 1 is endpoint 1 (red): 0x%08X", pixel(1, 0));
++    CHECK(pixel(2, 0) == 0x00AA0055u, "DXT1 index 2 is 2/3 endpoint 0: 0x%08X", pixel(2, 0));
++    CHECK(pixel(3, 3) == 0x005500AAu, "DXT1 index 3 is 1/3 endpoint 0: 0x%08X", pixel(3, 3));
+     CHECK(psp_render_unsupported_texels() == 0, "no texel was undecodable");
+ }
+ 
+@@ -573,10 +573,10 @@
+     zsprite(4, 0, 4, 4, 8, 100, 0xFFFF0000u);      /* equal: drawn */
+     cmd(0x04, (6u << 16) | 6);
+     end_list();
+-    CHECK(pixel(2, 2) == 0xFF0000FFu, "nearer sprite drawn: 0x%08X", pixel(2, 2));
+-    CHECK(pixel(6, 2) == 0xFF0000FFu, "farther sprite hidden behind it: 0x%08X", pixel(6, 2));
+-    CHECK(pixel(10, 2) == 0xFF00FF00u, "farther sprite drawn where uncovered: 0x%08X", pixel(10, 2));
+-    CHECK(pixel(2, 6) == 0xFFFF0000u, "equal depth passes GEQUAL: 0x%08X", pixel(2, 6));
++    CHECK(pixel(2, 2) == 0x000000FFu, "nearer sprite drawn: 0x%08X", pixel(2, 2));
++    CHECK(pixel(6, 2) == 0x000000FFu, "farther sprite hidden behind it: 0x%08X", pixel(6, 2));
++    CHECK(pixel(10, 2) == 0x0000FF00u, "farther sprite drawn where uncovered: 0x%08X", pixel(10, 2));
++    CHECK(pixel(2, 6) == 0x00FF0000u, "equal depth passes GEQUAL: 0x%08X", pixel(2, 6));
+ }
+ 
+ /* Attributes are sampled at pixel centres. This is WTF's LED panel: a quad
+@@ -602,8 +602,78 @@
+     int bad = 0, first = -1;
+     for (int y = 0; y < 16; y++)
+         for (int x = 120; x < 360; x += 7)
+-            if (pixel(x, 159 + y) != (0xFF000000u | (uint32_t)(y + 1))) { bad++; if (first < 0) first = y; }
++            if (pixel(x, 159 + y) != (uint32_t)(y + 1)) { bad++; if (first < 0) first = y; }
+     CHECK(bad == 0, "every row samples its own texel row: %d wrong, first in row %d", bad, first);
++}
++
++/* Field composition: mark room pixels, then fill only the unmarked background. */
++static void test_stencil_composition(void) {
++    psp_ge_reset();
++    clear_fb();
++    begin_list();
++    vertex(0, 0, 0, 0);
++    vertex(1, 8, 8, 0);
++    cmd(0xD3, 0x000201);                          /* clear stencil, not RGB */
++    cmd(0x04, (6u << 16) | 2);
++    cmd(0xD3, 0);
++    cmd(0x24, 1);                                 /* STE */
++    cmd(0xDC, 0xFF0201);                          /* ALWAYS, ref 2 */
++    cmd(0xDD, 0x020000);                          /* KEEP/KEEP/REPLACE */
++    vertex(2, 2, 2, 0xFF0000FFu);
++    vertex(3, 6, 6, 0xFF0000FFu);
++    cmd(0x04, (6u << 16) | 2);
++    cmd(0xDC, 0xFF0002);                          /* EQUAL, ref 0 */
++    cmd(0xDD, 0);                                 /* KEEP */
++    vertex(4, 0, 0, 0xFF00FF00u);
++    vertex(5, 8, 8, 0xFF00FF00u);
++    cmd(0x04, (6u << 16) | 2);
++    end_list();
++    CHECK(pixel(3, 3) == 0x020000FFu, "background must not cover room: %08X", pixel(3, 3));
++    CHECK(pixel(1, 1) == 0x0000FF00u, "background fills unmarked pixels: %08X", pixel(1, 1));
++
++    /* Disabling stencil must preserve it, and write masks must protect RGB/alpha. */
++    begin_list();
++    cmd(0x24, 0);
++    cmd(0xE8, 0xFFFFFF);
++    vertex(0, 2, 2, 0xFFFFFFFFu);
++    vertex(1, 6, 6, 0xFFFFFFFFu);
++    cmd(0x04, (6u << 16) | 2);
++    end_list();
++    CHECK(pixel(3, 3) == 0x020000FFu, "disabled stencil and RGB mask preserve room");
++    begin_list();
++    cmd(0x24, 1);
++    cmd(0xDC, 0xFF0701);
++    cmd(0xDD, 0x020000);
++    cmd(0xE9, 0xFF);
++    cmd(0x04, (6u << 16) | 2);
++    end_list();
++    CHECK(pixel(3, 3) == 0x020000FFu, "alpha mask protects stencil replacement");
++}
++
++static void test_stencil_ops(void) {
++    const int expected[] = { 0x55, 0, 0x23, 0xAA, 0x56, 0x54 };
++    for (int outcome = 0; outcome < 3; outcome++) {
++        for (int op = 0; op < 6; op++) {
++            psp_ge_reset();
++            psp_write32(FB, 0x550000FFu);
++            begin_list();
++            cmd(0x24, 1);
++            cmd(0xDC, 0xFF2300 | (outcome != 0)); /* NEVER on stencil failure */
++            cmd(0xDD, (uint32_t)op << (outcome * 8));
++            cmd(0x9E, 0x110000);
++            cmd(0x9F, 480);
++            cmd(0x23, 1);
++            cmd(0xDE, outcome == 1 ? 0 : 1);    /* NEVER on depth failure */
++            vertex(0, 0, 0, 0xFF00FF00u);
++            vertex(1, 1, 1, 0xFF00FF00u);
++            cmd(0x04, (6u << 16) | 2);
++            end_list();
++            const uint32_t want = ((uint32_t)expected[op] << 24) |
++                                  (outcome == 2 ? 0x00FF00u : 0x0000FFu);
++            CHECK(pixel(0, 0) == want, "stencil outcome %d op %d: %08X != %08X",
++                  outcome, op, pixel(0, 0), want);
++        }
++    }
+ }
+ 
+ /* A PRIM leaves the vertex pointer after what it used, so a second PRIM with
+@@ -629,8 +699,8 @@
+     cmd(0x04, (6u << 16) | 2);                     /* corners 3, 2: still the green box */
+     cmd(0x04, (6u << 16) | 2);                     /* IADDR moved on: 0, 1, the red box */
+     end_list();
+-    CHECK(pixel(2, 2) == 0xFF0000FFu, "first sprite: 0x%08X", pixel(2, 2));
+-    CHECK(pixel(12, 2) == 0xFF00FF00u, "second PRIM continued from the vertex pointer: 0x%08X", pixel(12, 2));
++    CHECK(pixel(2, 2) == 0x000000FFu, "first sprite: 0x%08X", pixel(2, 2));
++    CHECK(pixel(12, 2) == 0x0000FF00u, "second PRIM continued from the vertex pointer: 0x%08X", pixel(12, 2));
+     CHECK(psp_ge_pixels() == 4 * 16, "indexed sprites drew the same boxes again: %llu pixels",
+           (unsigned long long)psp_ge_pixels());
+ }
+@@ -670,9 +740,9 @@
+ 
+ static void test_lighting(void) {
+     lit_quad(0, 1);
+-    CHECK(pixel(240, 136) == 0xFF0000FFu, "light along the normal: full diffuse: 0x%08X", pixel(240, 136));
++    CHECK(pixel(240, 136) == 0x000000FFu, "light along the normal: full diffuse: 0x%08X", pixel(240, 136));
+     lit_quad(1, 0);
+-    CHECK(pixel(240, 136) == 0xFF000000u, "light across the face: no diffuse: 0x%08X", pixel(240, 136));
++    CHECK(pixel(240, 136) == 0x00000000u, "light across the face: no diffuse: 0x%08X", pixel(240, 136));
+ }
+ 
+ int main(void) {
+@@ -694,6 +764,8 @@
+     test_clear_mode_and_scissor();
+     test_dxt1();
+     test_depth();
++    test_stencil_composition();
++    test_stencil_ops();
+     test_samples_at_pixel_centres();
+     test_vertex_flow();
+     test_lighting();

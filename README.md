@@ -41,7 +41,7 @@ controls, the original menu advances from cursor 1 to 0 and confirmation changes
 the scene state from 3 to 4, presenting the next scene, in 5/5 headless runs
 (see [S9.2 results](#s92-results--title-menu)).
 
-**S10 — field renders; Classroom travel blocked: PARTIAL.** The goal is a visible,
+**S10 — field composition fixed; Classroom travel unverified: PARTIAL.** The goal is a visible,
 navigable Classroom before a duel. Free Duel is locked on a new game, and the
 first class precedes the Crowler duel, so the field has to be usable first.
 
@@ -55,39 +55,38 @@ Three fixes were needed to see it:
    transforms, dropping the translation. They now keep the matrix order and the
    implicit final input of 1, with PSP-measured homogeneous vectors and synthetic
    emitter checks.
-3. **Where the room goes.** Not a transform bug. Dumping both VRAM buffers at
-   free roam showed the complete room in one buffer and the background plus
-   characters in the other. In the traced frame the 3D room is drawn first and a
-   full-screen opaque 2D gradient is drawn *after* it, so the room is covered.
-   The gradient quad's vertices are (0,0)-(480,272) raw, i.e. whole pixels: a
-   through-mode 12.4 reading was tried and disproved by tracing the world map,
-   whose background tiles are also full-screen at these coordinates (dividing by
-   16 shrinks the map and the real name-dialog bars to nothing). That change was
-   reverted; CTest 21/21.
+3. **Stencil composition.** Run s349 marks room pixels with stencil 2
+   (`STST=FF0201`, `SOP=020000`) and then draws the gradient only where stencil
+   equals 0 (`STST=FF0002`). The renderer ignored those commands, so the gradient
+   covered the room. The stencil patch decodes the test, all six operations and
+   RGB/alpha write masks, using framebuffer alpha as stencil. Source alpha still
+   controls blending, but no longer overwrites stencil. No draws are skipped or
+   reordered. Synthetic tests cover the exact room/background sequence, masked
+   writes and all three stencil outcomes; CTest 21/21.
 
-Evidence: with the pixel reading, the name dialog shows the real "ENTER NAME"
-bar and message box (`build/s345-name.png`). The room itself is present in VRAM
-(`build/vram-b.png` from run s358) and the office is rendered when the covering
-quad is not drawn (`build/s356-menuopen.png`, from the disproved experiment).
-The open problem is frame composition/order between the field's 3D list and the
-full-screen 2D background.
+Through-mode positions remain whole pixels. The earlier `/16` experiment was
+disproved by full-screen world-map tiles and reverted; it is not part of this fix.
 
-The map transition does complete on some runs: in s363 the field unloaded at
-vb 3396 and reloaded at vb 4496, and s366 reached free roam again
-(`build/s366-room.png`), but the destination chosen was still Chancellor's
-Office. The destination list renders without its panel or highlight, and its
-cursor cannot be verified from pixels, so choosing Classroom is not yet
-repeatable. So the office is visibly functional, but the Classroom and the duel
-are not reached.
+Run s368 presents the office's 3D geometry (`build/s368-office.png`) and the
+world map with its destination panel and selection highlight (`build/s368-map.png`).
+The name confirmation visibly selects YES (`build/s368-name-yes.png`). The rebuilt
+headless executable stopped at its 200-second cap with 0 bad accesses, 0 dispatch
+misses and 0 traps. All 21 patches reapplied to a clean upstream checkout; its
+four stencil files match the runtime and its fresh build passes CTest 21/21.
+
+Earlier travel runs unloaded and reloaded the field, but selected Chancellor's
+Office rather than Classroom. Classroom selection, first-class completion and
+the duel still require verification; a successful transition alone proves none
+of them.
 
 Automation notes: with `SETO_MENU_MAP=1` the script stops after the Classroom
 dialogue and captures `build/classroom-free-roam.ppm` instead of blindly
 attempting Duel. `SETO_TRACE_FIELD=1` traces the next GE frame's
 world/view/projection matrices, viewport, model positions, screen bounds and
 pixels written per primitive, over four vblanks so an alternate-vblank render
-cannot be missed, and can dump both VRAM swapchain buffers. The YES/NO decision
-now follows the message window's own selection byte (`sel==2`) because the pixel
-classifier was calibrated on the inflated UI.
+cannot be missed, and can dump both VRAM swapchain buffers. Name confirmation
+requires a stable, visibly highlighted YES; the selection byte alone cannot
+authorize CROSS.
 
 **S9.3 — story/name menu: PARTIAL.** A minimal `sceUtilityOsk` HLE lets the
 original `ENTER NAME` flow return a configured name, and a minimal mailbox HLE
@@ -191,6 +190,7 @@ git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-ge-trace.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-vhtfm.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-frame-dump.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-thread-trace.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-stencil.patch
 
 cmake -S build/psprecomp -B build/psprecomp-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build/psprecomp-build -j 8
