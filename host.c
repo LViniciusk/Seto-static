@@ -327,13 +327,22 @@ static void try_talk_aluno(void) {
             Sleep(700);
         }
         field_press(dpad[d]);
-        field_press(dpad[d]);
+        {
+            char path[48];
+            snprintf(path, sizeof path, "build/s439-pos-%d.ppm", d);
+            psp_display_capture(path);
+        }
         auto_press(PSP_CTRL_CROSS);
         Sleep(800);
         if (psp_read32(0x093CDAFCu) == 6u) {
             field_press(0x00002000u);      /* menu opened: no adjacent NPC */
             Sleep(700);
             continue;
+        }
+        {
+            char path[48];
+            snprintf(path, sizeof path, "build/s439-box-%d.ppm", d);
+            psp_display_capture(path);
         }
         fprintf(stderr, "input: talk dir=%d box=%d state=%u\n", d, box_up(),
                 psp_read32(0x093CDAFCu));
@@ -857,6 +866,28 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                             class_done, psp_read32(0x093CDAFCu),
                                             psp_duel_manager_start_requested());
                                     if (class_done) {
+                                        if (getenv("SETO_PDA")) {
+                                            field_press(PSP_CTRL_CROSS);
+                                            Sleep(1500);
+                                            for (int d = 0; d < 3; d++) {
+                                                field_press(PSP_CTRL_DOWN);
+                                                Sleep(500);
+                                            }
+                                            field_press(PSP_CTRL_CROSS);
+                                            Sleep(2000);
+                                            psp_display_capture("build/s440-pda.ppm");
+                                            fprintf(stderr, "input: pda state=%u\n",
+                                                    psp_read32(0x093CDAFCu));
+                                            for (int d = 0; d < 4; d++) {
+                                                field_press(PSP_CTRL_DOWN);
+                                                Sleep(600);
+                                                char path[48];
+                                                snprintf(path, sizeof path,
+                                                         "build/s440-pda-%d.ppm", d);
+                                                psp_display_capture(path);
+                                            }
+                                            psp_display_capture("build/s440-pda-end.ppm");
+                                        }
                                         if (getenv("SETO_DUEL")) {
                                             char path[64];
                                             for (int attempt = 0; attempt < 2 &&

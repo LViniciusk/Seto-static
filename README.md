@@ -90,8 +90,10 @@ highlights Duel (`build/s432-duel-sel.png`) and CROSS starts the class dialogue
 state 1; a second Duel attempt repeats it and
 `psp_duel_manager_start_requested()` stays false. Crowler also says "You have a
 little time 'til class starts." at 7:30 AM, so the battle appears gated on the
-class-time event, not on the menu entry. A student dialogue, a class-completion
-event and the duel remain unverified.
+class-time event, not on the menu entry. D-pad input does move the player
+(`build/s439-pos-0.ppm`..`s439-pos-3.ppm`) and the nearby student follows, but
+the HUD clock stays at 7:30 AM and the Duel entry still replays the tutorial.
+A student dialogue, a class-completion event and the duel remain unverified.
 
 The character quads still arrive with an unrotated world matrix (scale and
 translation only; local plane YZ, normal on X), so camera-facing orientation is
