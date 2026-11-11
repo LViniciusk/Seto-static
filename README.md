@@ -88,6 +88,56 @@ cannot be missed, and can dump both VRAM swapchain buffers. Name confirmation
 requires a stable, visibly highlighted YES; the selection byte alone cannot
 authorize CROSS.
 
+### S10 performance — same pixels, less address decoding
+
+The software renderer now resolves checked framebuffer, depth and texture spans
+once per draw instead of resolving every pixel/texel access. It retains the
+original checked accesses for unmapped/partial spans and active memory watches;
+spans cannot cross module overlays and never survive a draw. Textures are still
+read live, including framebuffer feedback and writes between draws. Display
+reads copy valid 8888 rows directly. Raster loops reject off-screen/scissored
+work earlier, step integer triangle edges, and specialize standard alpha blending
+without changing its rounding. No frame skipping, resolution reduction, fast
+math, effect removal, guest-state writes or new dependencies.
+
+Synthetic workload medians, three interleaved runs before/after on this machine
+(milliseconds; 40 iterations, except 800 display reads):
+
+| Workload | Before | After | Speedup |
+|---|---:|---:|---:|
+| Opaque | 1765 | 558 | 3.16x |
+| Textured triangles | 3373 | 891 | 3.79x |
+| Alpha sprites | 587 | 134 | 4.38x |
+| Stencil background | 2351 | 635 | 3.70x |
+| 4444 triangles + depth | 3155 | 1045 | 3.02x |
+| Display copy | 1664 | 14 | 118.86x |
+
+All workloads retain the pre-optimization hashes and pixel counts. An additional
+400 deterministic mixed-state draws check all framebuffer/texture formats,
+blend/stencil/depth states, masks, target changes, texture writes and VRAM
+feedback against the old renderer. `--checked` repeats the same oracles with
+bulk access disabled by a memory watch. Upstream CTest passes 21/21 after all
+22 patches are applied to a clean checkout, including watch/overlay/partial-span
+regressions. These are renderer benchmarks, **not a promise of in-game FPS**;
+existing character orientation and rendering-fidelity issues are separate.
+
+The live headless A/B test sampled front-buffer address changes every 2 ms,
+read-only, rather than counting Win32 repaints or vblank calls. In the same
+opening office dialogue (`field=23`), the old executable produced a median
+**5.22 swaps/s** (8 two-second samples), versus **9.44 swaps/s** (5 samples) after
+optimization: **1.81x**, not 30 FPS. The optimized run subsequently reached the
+Classroom at roughly 10–13 swaps/s. Both runs ended at a 180-second cap with
+zero dispatch misses/traps. Invalid accesses to `0x00000003` during title setup
+remain (6 before, 3 after); the identical signature already exists in s351/s359.
+They are not hidden or fixed by this optimization. Further whole-game profiling
+is needed before changing scheduling, timing or the recompiled CPU path.
+
+```powershell
+cmake --build build/s6-build --target bench-render -j 4
+.\build\s6-build\bench-render.exe
+.\build\s6-build\bench-render.exe --checked
+```
+
 **S9.3 — story/name menu: PARTIAL.** A minimal `sceUtilityOsk` HLE lets the
 original `ENTER NAME` flow return a configured name, and a minimal mailbox HLE
 unblocks the game's loader. The recompiled game reaches the **MAIN MENU**, loads
@@ -191,6 +241,7 @@ git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-vhtfm.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-frame-dump.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-thread-trace.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-stencil.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-render-perf.patch
 
 cmake -S build/psprecomp -B build/psprecomp-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build/psprecomp-build -j 8

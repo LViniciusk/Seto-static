@@ -228,3 +228,6 @@ target_link_libraries(Seto-static PRIVATE tagforce gdi32)
 
 add_executable(test-lbn-seek EXCLUDE_FROM_ALL tests/lbn_seek.c)
 target_link_libraries(test-lbn-seek PRIVATE psprecomp)
+
+add_executable(bench-render EXCLUDE_FROM_ALL tests/render_bench.c)
+target_link_libraries(bench-render PRIVATE psprecomp)
