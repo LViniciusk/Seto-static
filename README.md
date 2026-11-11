@@ -75,9 +75,28 @@ misses and 0 traps. All 21 patches reapplied to a clean upstream checkout; its
 four stencil files match the runtime and its fresh build passes CTest 21/21.
 
 Earlier travel runs unloaded and reloaded the field, but selected Chancellor's
-Office rather than Classroom. Classroom selection, first-class completion and
-the duel still require verification; a successful transition alone proves none
-of them.
+Office rather than Classroom. Run s429-s431 (2026-11-11) reached the Classroom
+in free roam: `build/s93-room.png` shows the room and two students, and
+`build/s428-talk.png` / `build/s431-start-talk-end.png` show Crowler's dialogue
+and the "SP_GAME, the new transfer" introduction. The field state was 23 during
+the talk and returned to 1 afterwards; the Classrom loop reported `done=1` after
+the dialogue closed. The action menu does open with CROSS in free roam
+(`build/s432-duel.png`: Talk/Duel/Item/PDA); START alone does not. The first
+attempt sent DOWN before the menu existed, so CROSS selected Talk and Crowler
+answered "You have a little time 'til class starts." With the menu open, DOWN
+highlights Duel (`build/s432-duel-sel.png`) and CROSS starts the class dialogue
+"`I'll teach all you need to know about dueling.`" (`build/s432-duel2.png`,
+`build/s432-duel3.png`). After the tutorial the scene returns to free roam with
+state 1; a second Duel attempt repeats it and
+`psp_duel_manager_start_requested()` stays false. Crowler also says "You have a
+little time 'til class starts." at 7:30 AM, so the battle appears gated on the
+class-time event, not on the menu entry. A student dialogue, a class-completion
+event and the duel remain unverified.
+
+The character quads still arrive with an unrotated world matrix (scale and
+translation only; local plane YZ, normal on X), so camera-facing orientation is
+not proven. The screenshots show the sprites from the current fixed camera; no
+renderer or VFPU change has been made for this.
 
 Automation notes: with `SETO_MENU_MAP=1` the script stops after the Classroom
 dialogue and captures `build/classroom-free-roam.ppm` instead of blindly
@@ -87,6 +106,30 @@ pixels written per primitive, over four vblanks so an alternate-vblank render
 cannot be missed, and can dump both VRAM swapchain buffers. Name confirmation
 requires a stable, visibly highlighted YES; the selection byte alone cannot
 authorize CROSS.
+
+Name confirmation now waits for the original message window to become interactive,
+rechecks the visible YES, and retries unconsumed input edges only until the window
+acknowledges confirmation. It no longer relies on a 40/100 ms tap or repeats CROSS
+through the subsequent closing animation. `python tests/title_confirm.py` checks
+seven acknowledgement, readiness, timeout and duel-stop cases (C compiler on PATH).
+Runs s411/s412 confirmed YES and reached Story Mode through the original code.
+
+**Title animation reset remains unresolved.** The read-only s411 capture recorded
+the name pane playing frames 30–35 twice before holding frame 35; s412 played them
+once. The original controller checks for frame 34 before selecting the final
+35–36 interval. This is not proof that input duration, the animation player, or
+scheduling is the underlying cause. The background's seamless loop is also not
+fixed; no guest animation counters, loop bounds or completion states were patched.
+
+The `s10-sleep-wakeup` runtime patch fixes a proven synchronization error:
+real-thread `sceKernelSleepThread` returned success after one tick without a
+wakeup. It now remains blocked until a real `WakeupThread` request; queued wakeups
+and the inline fallback remain supported. The regression fails before the fix;
+fresh CTest runs pass 21/21 with real threads and 21/21 inline. In-game animation
+checks s417–s419 all confirmed YES and reached Story Mode with zero bad accesses,
+but s417 still played the closing interval twice. This synchronization fix is
+**not a fix for the reported animation reset**; the background loop remains
+unverified. No broader scheduler or guest-script change was applied.
 
 ### S10 performance — same pixels, less address decoding
 
@@ -242,6 +285,7 @@ git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-frame-dump.patc
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-thread-trace.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-stencil.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-render-perf.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-sleep-wakeup.patch
 
 cmake -S build/psprecomp -B build/psprecomp-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build/psprecomp-build -j 8

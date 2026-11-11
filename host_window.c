@@ -27,6 +27,9 @@ static uint32_t *g_read;
 static uint32_t *g_dib;
 static BITMAPINFO g_bmi;
 static int g_have_frame;
+static HDC g_memdc;
+static HBITMAP g_membmp, g_memold;
+static int g_memw, g_memh;
 
 static void update_frame(HWND hwnd) {
     if (IsIconic(hwnd)) return;
@@ -47,24 +50,38 @@ static void paint(HWND hwnd, HDC hdc) {
     RECT rc;
     GetClientRect(hwnd, &rc);
     const int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
-    FillRect(hdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
-    if (!g_have_frame || cw <= 0 || ch <= 0) return;
-
-    /* 480:272 is 30:17. Fit the largest 30:17 rectangle and centre it. */
-    int dw, dh;
-    if ((int64_t)cw * 17 > (int64_t)ch * 30) {
-        dh = ch;
-        dw = MulDiv(ch, 30, 17);
-    } else {
-        dw = cw;
-        dh = MulDiv(cw, 17, 30);
+    if (cw <= 0 || ch <= 0) return;
+    /* Compose off-screen so a repaint never shows the black fill. */
+    if (cw != g_memw || ch != g_memh || !g_memdc) {
+        if (g_memdc) {
+            SelectObject(g_memdc, g_memold);
+            DeleteObject(g_membmp);
+            DeleteDC(g_memdc);
+        }
+        g_memdc = CreateCompatibleDC(hdc);
+        g_membmp = CreateCompatibleBitmap(hdc, cw, ch);
+        g_memold = SelectObject(g_memdc, g_membmp);
+        g_memw = cw; g_memh = ch;
     }
-    if (dw <= 0 || dh <= 0) return;
-
-    SetStretchBltMode(hdc, COLORONCOLOR);
-    StretchDIBits(hdc, (cw - dw) / 2, (ch - dh) / 2, dw, dh,
-                  0, 0, SCREEN_W, SCREEN_H, g_dib, &g_bmi,
-                  DIB_RGB_COLORS, SRCCOPY);
+    FillRect(g_memdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    if (g_have_frame) {
+        /* 480:272 is 30:17. Fit the largest 30:17 rectangle and centre it. */
+        int dw, dh;
+        if ((int64_t)cw * 17 > (int64_t)ch * 30) {
+            dh = ch;
+            dw = MulDiv(ch, 30, 17);
+        } else {
+            dw = cw;
+            dh = MulDiv(cw, 17, 30);
+        }
+        if (dw > 0 && dh > 0) {
+            SetStretchBltMode(g_memdc, COLORONCOLOR);
+            StretchDIBits(g_memdc, (cw - dw) / 2, (ch - dh) / 2, dw, dh,
+                          0, 0, SCREEN_W, SCREEN_H, g_dib, &g_bmi,
+                          DIB_RGB_COLORS, SRCCOPY);
+        }
+    }
+    BitBlt(hdc, 0, 0, cw, ch, g_memdc, 0, 0, SRCCOPY);
 }
 
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -97,6 +114,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_ID);
+        if (g_memdc) {
+            SelectObject(g_memdc, g_memold);
+            DeleteObject(g_membmp);
+            DeleteDC(g_memdc);
+            g_memdc = NULL;
+        }
         g_hwnd = NULL;
         PostQuitMessage(0);
         return 0;

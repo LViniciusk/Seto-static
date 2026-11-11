@@ -283,6 +283,7 @@ int psp_title_scene_cursor(void) { return atomic_load(&g_scene_cursor); }
  * Read-only, so the host can wait for the original code to consume a pulse
  * instead of assuming a fixed frame timing. */
 int psp_title_confirm_sel(void) { return psp_read8(0x0126C898u + 211u); }
+int psp_title_confirm_state(void) { return psp_read8(0x0126C898u + 233u); }
 
 void psp_title_menu_request(uint32_t mask) {
     atomic_store(&g_menu_request, mask);
@@ -356,7 +357,8 @@ static void title_input_update(uint32_t addr) {
     }
 
     uint32_t menu = atomic_load(&g_menu_request);
-    if (menu && state == 3) {
+    if (menu && (state == 3 || (state == 4 && phase == 6 &&
+                               psp_title_confirm_state() == 3))) {
         g_pad_on = 0;
         g_menu_on ^= 1;
         psp_ctrl_set(g_menu_on ? menu : 0u, 128, 128);

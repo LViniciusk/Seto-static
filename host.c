@@ -55,6 +55,7 @@ int  psp_title_start_done(void);
 int  psp_title_scene3(void);
 int  psp_title_scene_state(void);
 int  psp_title_confirm_sel(void);
+int  psp_title_confirm_state(void);
 int  psp_title_scene_phase(void);
 int  psp_title_scene_cursor(void);
 void psp_title_menu_request(uint32_t mask);
@@ -295,6 +296,102 @@ static void auto_press(uint32_t mask) {
     psp_ctrl_set(0, 128, 128);
 }
 
+/* Retry unconsumed edges, but stop as soon as the original window accepts YES. */
+static int title_confirm_yes(void) {
+    for (int i = 0; i < 200 && psp_title_confirm_state() == 2; i++) {
+        if (psp_duel_manager_start_requested()) return 0;
+        Sleep(10);
+    }
+    if (psp_duel_manager_start_requested() || psp_title_confirm_state() != 3 ||
+        stable_title_confirm_choice() != 1) return 0;
+    psp_title_menu_request(PSP_CTRL_CROSS);
+    for (int i = 0; i < 200 && psp_title_confirm_state() == 3; i++) {
+        if (psp_duel_manager_start_requested()) break;
+        Sleep(10);
+    }
+    psp_title_menu_request(0);
+    psp_ctrl_set(0, 128, 128);
+    return psp_title_confirm_state() != 3;
+}
+
+static void try_talk_aluno(void) {
+    for (int t = 0; t < 20 && box_up(); t++) {
+        auto_press(PSP_CTRL_CROSS);
+        Sleep(400);
+    }
+    static const uint32_t dpad[4] = { 0x00000080u, 0x00000020u,
+                                      0x00000010u, 0x00000040u };
+    for (int d = 0; d < 4 && !box_up(); d++) {
+        if (psp_read32(0x093CDAFCu) == 6u) {
+            field_press(0x00002000u);      /* CIRCLE: close action menu */
+            Sleep(700);
+        }
+        field_press(dpad[d]);
+        field_press(dpad[d]);
+        auto_press(PSP_CTRL_CROSS);
+        Sleep(800);
+        if (psp_read32(0x093CDAFCu) == 6u) {
+            field_press(0x00002000u);      /* menu opened: no adjacent NPC */
+            Sleep(700);
+            continue;
+        }
+        fprintf(stderr, "input: talk dir=%d box=%d state=%u\n", d, box_up(),
+                psp_read32(0x093CDAFCu));
+    }
+    psp_display_capture("build/s428-talk.ppm");
+    for (int t = 0; t < 12 && box_up(); t++) {
+        auto_press(PSP_CTRL_CROSS);
+        Sleep(400);
+    }
+    psp_display_capture("build/s428-talk-end.ppm");
+    fprintf(stderr, "input: talk ended box=%d state=%u\n",
+            box_up(), psp_read32(0x093CDAFCu));
+}
+
+static void try_talk_menu(void) {
+    psp_title_walk(0, 255, 255);
+    psp_ctrl_set(0, 255, 255);
+    Sleep(1200);
+    psp_title_walk(0, 128, 128);
+    psp_ctrl_set(0, 128, 128);
+    Sleep(500);
+    field_press(PSP_CTRL_CROSS);
+    Sleep(1500);
+    psp_display_capture("build/s430-menu.ppm");
+    fprintf(stderr, "input: talk menu state=%u\n", psp_read32(0x093CDAFCu));
+    field_press(PSP_CTRL_CROSS);      /* Talk is the first entry */
+    Sleep(2000);
+    psp_display_capture("build/s430-talk-menu.ppm");
+    fprintf(stderr, "input: talk menu select state=%u box=%d\n",
+            psp_read32(0x093CDAFCu), box_up());
+    for (int t = 0; t < 12 && box_up(); t++) {
+        auto_press(PSP_CTRL_CROSS);
+        Sleep(400);
+    }
+    psp_display_capture("build/s430-talk-menu-end.ppm");
+    fprintf(stderr, "input: talk menu ended state=%u box=%d\n",
+            psp_read32(0x093CDAFCu), box_up());
+}
+
+static void try_talk_start(void) {
+    field_press(PSP_CTRL_START);
+    Sleep(1500);
+    psp_display_capture("build/s431-start.ppm");
+    fprintf(stderr, "input: start menu state=%u\n", psp_read32(0x093CDAFCu));
+    field_press(PSP_CTRL_CROSS);      /* Talk is the first entry */
+    Sleep(2000);
+    psp_display_capture("build/s431-start-talk.ppm");
+    fprintf(stderr, "input: start talk state=%u box=%d\n",
+            psp_read32(0x093CDAFCu), box_up());
+    for (int t = 0; t < 12 && box_up(); t++) {
+        auto_press(PSP_CTRL_CROSS);
+        Sleep(400);
+    }
+    psp_display_capture("build/s431-start-talk-end.ppm");
+    fprintf(stderr, "input: start talk ended state=%u box=%d\n",
+            psp_read32(0x093CDAFCu), box_up());
+}
+
 static int title_press_until_change(uint32_t mask) {
     const int state = psp_title_scene_state(), phase = psp_title_scene_phase();
     for (int attempt = 0; attempt < 4; attempt++) {
@@ -461,7 +558,11 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                         psp_display_capture("build/s93-name-confirm-dialog.ppm");
                         if (choice == 1) {
                             psp_display_capture("build/s93-name-confirm-yes.ppm");
-                            title_press_until_change(PSP_CTRL_CROSS);
+                            if (!title_confirm_yes()) {
+                                fprintf(stderr, "input: pause; YES was not acknowledged\n");
+                                g_input_done = 1;
+                                return 0;
+                            }
                         } else if (psp_title_scene_state() == 4 &&
                                    psp_title_scene_phase() == 6) {
                             /* The original message window reads the digital
@@ -494,7 +595,11 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                             psp_display_capture("build/s93-name-confirm-left.ppm");
                             if (choice == 1) {
                                 psp_display_capture("build/s93-name-confirm-yes.ppm");
-                                title_press_until_change(PSP_CTRL_CROSS);
+                                if (!title_confirm_yes()) {
+                                    fprintf(stderr, "input: pause; YES was not acknowledged\n");
+                                    g_input_done = 1;
+                                    return 0;
+                                }
                             } else {
                                 fprintf(stderr, "input: pause at name confirmation; YES not visible\n");
                                 g_input_done = 1;
@@ -512,7 +617,8 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                         fprintf(stderr, "input: auto name dialog state=%d phase=%d cursor=%d story=%d\n",
                                 psp_title_scene_state(), psp_title_scene_phase(),
                                 psp_title_scene_cursor(), psp_story_started());
-                        for (int i = 0; i < 300 && !psp_story_started(); i++) {
+                        for (int i = 0; i < 300 && !psp_story_started() &&
+                                        psp_title_scene_state() != 3; i++) {
                             Sleep(100);
                             const int s = psp_title_scene_state();
                             if (s != last_state) {
@@ -525,7 +631,7 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                         if (psp_display_capture("build/s92-menu2.ppm") == 0)
                             fprintf(stderr, "capture: build/s92-menu2.ppm\n");
                         if (!psp_story_started() && psp_title_scene_state() == 3) {
-                            Sleep(1500);
+                            Sleep(100);
                             fprintf(stderr, "input: auto main menu cursor=%d\n",
                                     psp_title_scene_cursor());
                             if (getenv("SETO_FREE_DUEL")) {
@@ -554,9 +660,9 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                         psp_title_scene_state(), psp_title_scene_phase());
                             } else {
                             auto_press(0x00004000u);
-                            for (int i = 0; i < 30 && !psp_story_started(); i++) {
+                            for (int i = 0; i < 40 && !psp_story_started(); i++) {
                                 auto_press((i & 1) ? 0x00004000u : 0x00000008u);
-                                Sleep(400);
+                                Sleep(60);
                             }
                             fprintf(stderr, "input: auto main menu state=%d phase=%d story=%d\n",
                                     psp_title_scene_state(), psp_title_scene_phase(),
@@ -682,12 +788,37 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                     /* Brief state-1 gaps separate dialogue beats;
                                      * wait for quiet before capturing free roam. */
                                     int seen_class_box = 0, quiet = 0, class_done = 0;
-                                    int room_shot = 0;
+                                    int room_shot = 0, talk_done = 0;
                                     for (int k = 0; k < 600 && !class_done &&
                                             !psp_duel_manager_start_requested(); k++) {
                                         if (!room_shot && psp_read32(0x093CDAFCu) == 1u) {
                                             room_shot = 1;
+                                            if (getenv("SETO_TRACE_ROOM") ||
+                                                getenv("SETO_WATCH_CHAR"))
+                                                psp_ge_trace_next_frame();
+                                            const char *wf = getenv("SETO_WATCH_FIELD");
+                                            if (wf) psp_mem_watch_write((uint32_t)strtoul(wf, NULL, 0));
+                                            if (getenv("SETO_FACE_TEST")) {
+                                                psp_title_walk(0, 0, 128);
+                                                Sleep(900);
+                                                psp_title_walk(0, 128, 128);
+                                                Sleep(400);
+                                                psp_display_capture("build/s373-room-left.ppm");
+                                                psp_title_walk(0, 255, 128);
+                                                Sleep(900);
+                                                psp_title_walk(0, 128, 128);
+                                                Sleep(400);
+                                                psp_display_capture("build/s373-room-right.ppm");
+                                            }
+                                            if (getenv("SETO_TRACE_FACE"))
+                                                psp_ge_trace_next_frame();
                                             Sleep(1200);
+                                            if (getenv("SETO_WATCH_CHAR")) {
+                                                const uint32_t cv =
+                                                    psp_ge_trace_character_vaddr();
+                                                fprintf(stderr, "watch char vaddr %08X\n", cv);
+                                                if (cv) psp_mem_watch_write(cv + 10);
+                                            }
                                             psp_display_capture("build/s93-room.ppm");
                                             fprintf(stderr, "input: arrived room state=%u\n",
                                                     psp_read32(0x093CDAFCu));
@@ -710,6 +841,15 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                             Sleep(100);
                                         } else {
                                             quiet = 0;
+                                            if (getenv("SETO_TALK_ALUNO") && !talk_done &&
+                                                st == 1u && k > 20) {
+                                                talk_done = 1;
+                                                try_talk_aluno();
+                                                if (getenv("SETO_TALK_START"))
+                                                    try_talk_start();
+                                                else if (getenv("SETO_TALK_MENU"))
+                                                    try_talk_menu();
+                                            }
                                             Sleep(100);
                                         }
                                     }
@@ -717,6 +857,66 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                             class_done, psp_read32(0x093CDAFCu),
                                             psp_duel_manager_start_requested());
                                     if (class_done) {
+                                        if (getenv("SETO_DUEL")) {
+                                            char path[64];
+                                            for (int attempt = 0; attempt < 2 &&
+                                                            !psp_duel_manager_start_requested();
+                                                 attempt++) {
+                                                if (psp_read32(0x093CDAFCu) == 1u) {
+                                                    field_press(PSP_CTRL_CROSS);
+                                                    Sleep(1500);
+                                                }
+                                                snprintf(path, sizeof path,
+                                                         "build/s435-menu-%d.ppm", attempt);
+                                                psp_display_capture(path);
+                                                fprintf(stderr,
+                                                        "input: duel menu attempt=%d state=%u\n",
+                                                        attempt, psp_read32(0x093CDAFCu));
+                                                if (psp_read32(0x093CDAFCu) == 6u) {
+                                                    field_press(PSP_CTRL_DOWN);
+                                                    Sleep(600);
+                                                    snprintf(path, sizeof path,
+                                                             "build/s435-sel-%d.ppm", attempt);
+                                                    psp_display_capture(path);
+                                                    field_press(PSP_CTRL_CROSS);
+                                                    Sleep(2000);
+                                                }
+                                                snprintf(path, sizeof path,
+                                                         "build/s435-scene-%d.ppm", attempt);
+                                                psp_display_capture(path);
+                                                fprintf(stderr,
+                                                        "input: duel scene attempt=%d state=%u box=%d\n",
+                                                        attempt, psp_read32(0x093CDAFCu),
+                                                        box_up());
+                                                for (int t = 0; t < 100 &&
+                                                                !psp_duel_manager_start_requested();
+                                                     t++) {
+                                                    if (!box_up() && t >= 4) {
+                                                        Sleep(500);
+                                                        continue;
+                                                    }
+                                                    auto_press(PSP_CTRL_CROSS);
+                                                    Sleep(500);
+                                                    if (t == 6) {
+                                                        snprintf(path, sizeof path,
+                                                                 "build/s435-class-%d.ppm", attempt);
+                                                        psp_display_capture(path);
+                                                    }
+                                                }
+                                                snprintf(path, sizeof path,
+                                                         "build/s435-end-%d.ppm", attempt);
+                                                psp_display_capture(path);
+                                                fprintf(stderr,
+                                                        "input: duel end attempt=%d start=%d state=%u\n",
+                                                        attempt,
+                                                        psp_duel_manager_start_requested(),
+                                                        psp_read32(0x093CDAFCu));
+                                            }
+                                            psp_display_capture("build/s435-duel3.ppm");
+                                            fprintf(stderr, "input: duel start=%d state=%u\n",
+                                                    psp_duel_manager_start_requested(),
+                                                    psp_read32(0x093CDAFCu));
+                                        }
                                         if (getenv("SETO_TRACE_FIELD")) psp_ge_trace_next_frame();
                                         /* Two display buffers alternate at 30 fps;
                                          * capture both plus repeats so a missing
@@ -1003,6 +1203,8 @@ int main(int argc, char **argv) {
     }
     psp_cpu_reset();
     psp_hle_init();
+    const char *ww = getenv("SETO_WATCH_WRITE");
+    if (ww) psp_mem_watch_write((uint32_t)strtoul(ww, NULL, 0));
     psp_umd_set_iso(iso);
     psp_umd_register();
     psp_fpl_register();
