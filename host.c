@@ -453,6 +453,7 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                 choice, psp_title_scene_state(),
                                 psp_title_scene_phase());
                         psp_display_capture("build/s93-name-confirm-dialog.ppm");
+                        if (choice != 1 && psp_title_confirm_sel() == 2) choice = 1;
                         if (choice == 1) {
                             psp_display_capture("build/s93-name-confirm-yes.ppm");
                             title_press_until_change(PSP_CTRL_CROSS);
@@ -483,6 +484,10 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                 Sleep(100);
                             }
                             if (choice == 1) choice = stable_title_confirm_choice();
+                            /* The window's own selection index is the authoritative
+                             * YES/NO state; the pixel classifier was calibrated on
+                             * a UI that a through-mode position fix resized. */
+                            if (choice != 1 && sel == 2) choice = 1;
                             fprintf(stderr, "input: name confirm after LEFT choice=%d sel=%d\n",
                                     choice, sel);
                             psp_display_capture("build/s93-name-confirm-left.ppm");
@@ -617,70 +622,33 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                     /* Confirm the highlighted destination on
                                      * the world map, then let the travel and
                                      * the story request their modules. */
-                                    /* The map cursor sits on a location; the
-                                     * D-pad should move it between nodes and
-                                     * CROSS opens that location's menu. */
-                                    static const struct { uint32_t m; const char *n; }
-                                    mdirs[] = {
-                                        { 0x00000020u, "right" }, { 0x00000010u, "up" },
-                                        { 0x00000080u, "left" },  { 0x00000040u, "down" },
-                                    };
-                                    for (int d = 0; d < 4; d++) {
-                                        auto_press(mdirs[d].m);
-                                        Sleep(1500);
-                                        char path[64];
-                                        snprintf(path, sizeof path, "build/s93-map-%s.ppm",
-                                                 mdirs[d].n);
-                                        psp_display_capture(path);
-                                    }
-                                    auto_press(0x00004000u);
-                                    Sleep(2500);
-                                    psp_display_capture("build/s93-map-cross.ppm");
-                                    /* The list can open seconds after the map
-                                     * CROSS when that press lands in a fade.
-                                     * Wait for it, move the highlight to
-                                     * Classroom (row 1), then confirm. */
-                                    int list = menu_panel();
-                                    for (int t = 0; t < 8 && !list; t++) {
-                                        auto_press(0x00004000u);
-                                        Sleep(1200);
-                                        list = menu_panel();
-                                    }
-                                    fprintf(stderr, "input: travel list=%d row=%d\n",
-                                            list, menu_row());
-                                    for (int t = 0; t < 6; t++) {
-                                        const int row = menu_row();
-                                        if (row == 1) break;
-                                        if (row == 0) {
-                                            auto_press(0x00000040u);
-                                            Sleep(1200);
-                                        } else {
-                                            Sleep(1000);
-                                        }
-                                    }
+                                    /* After YES the field unloads and the
+                                     * destination list appears over the world
+                                     * map. Wait for it without pressing: a
+                                     * blind CROSS on the map travels somewhere
+                                     * else. Row 0 is Main Gate, so one DOWN is
+                                     * Classroom. */
+                                    Sleep(6000);
+                                    psp_display_capture("build/s93-map-world.ppm");
+                                    fprintf(stderr, "input: travel map state=%u\n",
+                                            psp_read32(0x093CDAFCu));
+                                    auto_press(0x00000040u);
+                                    Sleep(1200);
                                     psp_display_capture("build/s93-travel-class.ppm");
-                                    fprintf(stderr, "input: travel row=%d\n", menu_row());
-                                    /* Confirm until the list closes; if it
-                                     * resets to Main Gate, move down again. */
-                                    for (int t = 0; t < 8 && menu_panel(); t++) {
-                                        auto_press(0x00004000u);
-                                        Sleep(2000);
-                                        if (menu_panel() && menu_row() == 0) {
-                                            auto_press(0x00000040u);
-                                            Sleep(1200);
-                                        }
-                                    }
+                                    auto_press(0x00004000u);
+                                    Sleep(3000);
                                     psp_display_capture("build/s93-travel-confirm.ppm");
-                                    fprintf(stderr, "input: travel done list=%d\n",
-                                            menu_panel());
-                                    for (int k = 0; k < 15; k++) {
+                                    fprintf(stderr, "input: travel chosen state=%u\n",
+                                            psp_read32(0x093CDAFCu));
+                                    psp_display_dump_at("build/vram-a.ppm", 0x04000000u);
+                                    psp_display_dump_at("build/vram-b.ppm", 0x04088000u);
+                                    /* A second confirm ("Go here?") may follow;
+                                     * the dialogue loop below skips empty beats. */
+                                    for (int k = 0; k < 6; k++) {
                                         auto_press(0x00004000u);
-                                        Sleep(1000);
-                                        if (k == 5 || k == 10) {
-                                            char path[64];
-                                            snprintf(path, sizeof path,
-                                                     "build/s93-travel%d.ppm", k);
-                                            psp_display_capture(path);
+                                        Sleep(1500);
+                                        if (k == 2) {
+                                            psp_display_capture("build/s93-travel5.ppm");
                                         }
                                     }
                                     /* Brief state-1 gaps separate dialogue beats;
@@ -714,7 +682,22 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                             psp_duel_manager_start_requested());
                                     if (class_done) {
                                         if (getenv("SETO_TRACE_FIELD")) psp_ge_trace_next_frame();
-                                        Sleep(1000);
+                                        /* Two display buffers alternate at 30 fps;
+                                         * capture both plus repeats so a missing
+                                         * room cannot be blamed on one frame. */
+                                        for (int f = 0; f < 6; f++) {
+                                            char path[48];
+                                            snprintf(path, sizeof path,
+                                                     "build/free-roam-%d.ppm", f);
+                                            psp_display_capture(path);
+                                            Sleep(33);
+                                        }
+                                        if (getenv("SETO_TRACE_FIELD")) {
+                                            psp_display_dump_at("build/vram-a.ppm", 0x04000000u);
+                                            psp_display_dump_at("build/vram-b.ppm", 0x04088000u);
+                                            psp_display_dump_at("build/vram-shown.ppm",
+                                                                psp_display_framebuffer());
+                                        }
                                         psp_display_capture("build/classroom-free-roam.ppm");
                                         fprintf(stderr, "input: free roam vb=%llu box=%d state=%u\n",
                                                 (unsigned long long)psp_display_vblanks(),

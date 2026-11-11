@@ -41,34 +41,49 @@ controls, the original menu advances from cursor 1 to 0 and confirmation changes
 the scene state from 3 to 4, presenting the next scene, in 5/5 headless runs
 (see [S9.2 results](#s92-results--title-menu)).
 
-**S10 — visible field: IN PROGRESS.** The current goal is a visible, navigable
-Classroom before attempting a duel. Free Duel is locked on a new game; meeting
-the students and finishing the first class precede the Crowler duel. The VFPU
-`vtfm` helper used the wrong matrix orientation. The S10 patch fixes its dot
-products and adds the measured `vtfm3.t`/`vtfm4.q` vectors from
-[pspautotests](https://github.com/hrydgard/pspautotests/blob/master/tests/cpu/vfpu/matrix.expected).
-Those seven lanes fail before the fix and match exactly afterwards; CTest passes
-21/21. Run s346 reaches Classroom free roam (`state=1`, `box=0`) with the player
-and Crowler visible, and reports zero bad accesses. See
-`build/s346-classroom.png` and `build/s346-run.out` locally. The room is still
-mostly absent; this is not yet a navigable field. Its orthographic projection
-has constant clip W=1, so near-eye clipping does not explain the missing room;
-the speculative local clipping code was removed.
+**S10 — field renders; Classroom travel blocked: PARTIAL.** The goal is a visible,
+navigable Classroom before a duel. Free Duel is locked on a new game, and the
+first class precedes the Crowler duel, so the field has to be usable first.
 
-A second patch preserves homogeneous transforms (`vhtfm`) instead of emitting
-them as smaller matrices. It adds PSP-measured homogeneous vectors and synthetic
-emitter tests; CTest still passes 21/21. Re-emit the EBOOT after applying it:
-exactly three calls change in two generated units. Run s347 validates this
-second correction in-game without the clipping experiment: free roam still
-shows the protagonist and Crowler, with zero bad accesses, but the room remains
-mostly absent (`build/s347-classroom.png`). With `SETO_MENU_MAP=1`, automation stops after
-the Classroom dialogue and captures `build/classroom-free-roam.ppm` instead of
-blindly attempting Duel; `SETO_TRACE_FIELD=1` also traces the next GE frame's
-world/view/projection matrices, viewport and model positions. The trace spans
-four vblanks so it cannot miss the game's alternate-vblank render, and includes
-screen bounds, front/onscreen vertex counts and pixels written per primitive.
-The raster test enables tracing on a synthetic transformed quad and verifies
-its original pixel assertions still pass (21/21 CTest).
+Three fixes were needed to see it:
+
+1. **VFPU `vtfm` orientation.** The helper multiplied with the matrix the wrong
+   way round. The fix, plus the measured `vtfm3.t`/`vtfm4.q` vectors from
+   [pspautotests](https://github.com/hrydgard/pspautotests/blob/master/tests/cpu/vfpu/matrix.expected),
+   turned seven failing lanes into exact matches.
+2. **Homogeneous transforms.** Three `vhtfm4` instructions were emitted as 3x3
+   transforms, dropping the translation. They now keep the matrix order and the
+   implicit final input of 1, with PSP-measured homogeneous vectors and synthetic
+   emitter checks.
+3. **Through-mode vertex positions.** This was the actual reason the room was
+   invisible. Through-mode 16-bit positions are 12.4 fixed point, and the
+   rasterizer read them as whole pixels, so every 2D quad was 16x too large: the
+   field's HUD background layers covered the 3D world with what looked like a
+   blue gradient. Dumping both VRAM buffers showed the complete room in the
+   buffer that was not presented. The fix divides 16-bit through positions by
+   16, makes 8-bit through positions decode to zero like the hardware, keeps
+   float positions as pixels, and the raster tests now encode their pixel
+   coordinates as 12.4.
+
+Evidence: run s356 renders the Chancellor's Office with its room, carpet, tree
+and action menu (`build/s356-menuopen.png`), and the name dialog has its real
+layout instead of the giant cream bars (`build/s355-name.png`). CTest 21/21.
+
+The current blocker is the map transition. Choosing Map in the office and
+answering the exit prompt unloads the field (`state=0`) and then the field never
+restarts: no new frame is drawn, both VRAM buffers keep the old office frame,
+the last translated code sits in an EBOOT loop, and the log shows the file
+worker waiting on `ehfile_queue`. So the office is visibly functional, but
+traveling to the Classroom and the duel is not yet reached.
+
+Automation notes: with `SETO_MENU_MAP=1` the script stops after the Classroom
+dialogue and captures `build/classroom-free-roam.ppm` instead of blindly
+attempting Duel. `SETO_TRACE_FIELD=1` traces the next GE frame's
+world/view/projection matrices, viewport, model positions, screen bounds and
+pixels written per primitive, over four vblanks so an alternate-vblank render
+cannot be missed, and can dump both VRAM swapchain buffers. The YES/NO decision
+now follows the message window's own selection byte (`sel==2`) because the pixel
+classifier was calibrated on the inflated UI.
 
 **S9.3 — story/name menu: PARTIAL.** A minimal `sceUtilityOsk` HLE lets the
 original `ENTER NAME` flow return a configured name, and a minimal mailbox HLE
@@ -170,6 +185,8 @@ git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s9-duel.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-vtfm.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-ge-trace.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-vhtfm.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-frame-dump.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-through-pos.patch
 
 cmake -S build/psprecomp -B build/psprecomp-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build/psprecomp-build -j 8

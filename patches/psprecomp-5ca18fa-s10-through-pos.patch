@@ -1,0 +1,77 @@
+diff --git a/src/hle/ge.c b/src/hle/ge.c
+--- a/src/hle/ge.c
++++ b/src/hle/ge.c
+@@ -520,10 +520,26 @@
+     read3(addr + (uint32_t)pos_off, (int)VT_POS(vtype), through, pos);
+     out->behind = 0;
+     if (through) {
+-        /* Through mode's depth is an unsigned 16-bit value. */
+-        out->x = (int)pos[0];
+-        out->y = (int)pos[1];
+-        out->z = VT_POS(vtype) == 2 ? (float)psp_read16(addr + (uint32_t)pos_off + 4) : pos[2];
++        /* 16-bit through positions are 12.4 fixed point, not whole pixels;
++         * read as pixels they stretch every 2D quad 16x (an earlier field
++         * capture lost its room under "full-screen" HUD rectangles that were
++         * 30x17). 8-bit through positions decode to zero on hardware, float
++         * positions are pixels and their depth is an integer. Sub-pixel
++         * positions are floored: the rasterizer is integer.
++         * shortcut: no sub-pixel precision in through mode, upgrade if 2D
++         * text or sprites visibly jitter. */
++        if (VT_POS(vtype) == 2) {
++            out->x = (int)floorf(pos[0] / 16.0f);
++            out->y = (int)floorf(pos[1] / 16.0f);
++            out->z = (float)psp_read16(addr + (uint32_t)pos_off + 4);
++        } else if (VT_POS(vtype) == 1) {
++            out->x = out->y = 0;
++            out->z = 0;
++        } else {
++            out->x = (int)floorf(pos[0]);
++            out->y = (int)floorf(pos[1]);
++            out->z = pos[2];
++        }
+         return 1;
+     }
+     if (g_lt.enable) {
+diff --git a/tests/test_raster.c b/tests/test_raster.c
+--- a/tests/test_raster.c
++++ b/tests/test_raster.c
+@@ -78,12 +78,14 @@
+     call(0xAB49E76A, LIST, 0, 0, 0); /* sceGeListEnQueue */
+ }
+ 
+-/* One 16-bit-position, 8888-colour vertex. Colour precedes position. */
++/* One 16-bit-position, 8888-colour vertex. Colour precedes position. Through
++ * positions are 12.4 fixed point, so a pixel coordinate is written as x * 16;
++ * the expectations below stay in whole pixels. */
+ static void vertex(int idx, int x, int y, uint32_t rgba) {
+     uint32_t a = VERTS + (uint32_t)idx * 12;   /* 4 colour + 6 pos, padded to 12 */
+     psp_write32(a, rgba);
+-    psp_write16(a + 4, (uint16_t)x);
+-    psp_write16(a + 6, (uint16_t)y);
++    psp_write16(a + 4, (uint16_t)(x * 16));
++    psp_write16(a + 6, (uint16_t)(y * 16));
+     psp_write16(a + 8, 0);
+ }
+ 
+@@ -295,8 +297,8 @@
+     psp_write16(a + 0, (uint16_t)u);
+     psp_write16(a + 2, (uint16_t)v);
+     psp_write32(a + 4, rgba);
+-    psp_write16(a + 8, (uint16_t)x);
+-    psp_write16(a + 10, (uint16_t)y);
++    psp_write16(a + 8, (uint16_t)(x * 16));
++    psp_write16(a + 10, (uint16_t)(y * 16));
+     psp_write16(a + 12, 0);
+ }
+ 
+@@ -552,8 +554,8 @@
+     for (int k = 0; k < 2; k++) {
+         uint32_t a = VERTS + (uint32_t)(idx + k) * 12;
+         psp_write32(a, rgba);
+-        psp_write16(a + 4, (uint16_t)(k ? x1 : x0));
+-        psp_write16(a + 6, (uint16_t)(k ? y1 : y0));
++        psp_write16(a + 4, (uint16_t)((k ? x1 : x0) * 16));
++        psp_write16(a + 6, (uint16_t)((k ? y1 : y0) * 16));
+         psp_write16(a + 8, (uint16_t)z);
+     }
+ }
