@@ -58,11 +58,17 @@ the speculative local clipping code was removed.
 A second patch preserves homogeneous transforms (`vhtfm`) instead of emitting
 them as smaller matrices. It adds PSP-measured homogeneous vectors and synthetic
 emitter tests; CTest still passes 21/21. Re-emit the EBOOT after applying it:
-exactly three calls change in two generated units. In-game validation of this
-second correction is pending. With `SETO_MENU_MAP=1`, automation now stops after
+exactly three calls change in two generated units. Run s347 validates this
+second correction in-game without the clipping experiment: free roam still
+shows the protagonist and Crowler, with zero bad accesses, but the room remains
+mostly absent (`build/s347-classroom.png`). With `SETO_MENU_MAP=1`, automation stops after
 the Classroom dialogue and captures `build/classroom-free-roam.ppm` instead of
 blindly attempting Duel; `SETO_TRACE_FIELD=1` also traces the next GE frame's
-world/view/projection matrices, viewport and model positions.
+world/view/projection matrices, viewport and model positions. The trace spans
+four vblanks so it cannot miss the game's alternate-vblank render, and includes
+screen bounds, front/onscreen vertex counts and pixels written per primitive.
+The raster test enables tracing on a synthetic transformed quad and verifies
+its original pixel assertions still pass (21/21 CTest).
 
 **S9.3 — story/name menu: PARTIAL.** A minimal `sceUtilityOsk` HLE lets the
 original `ENTER NAME` flow return a configured name, and a minimal mailbox HLE
