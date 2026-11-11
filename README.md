@@ -100,6 +100,16 @@ translation only; local plane YZ, normal on X), so camera-facing orientation is
 not proven. The screenshots show the sprites from the current fixed camera; no
 renderer or VFPU change has been made for this.
 
+A controlled `vmmul` experiment (2026-11-11) used the PSP measurement in
+pspautotests `tests/cpu/vfpu/matrix.expected`: plain `vmmul.q M200, M000, M100`
+is A*B (row 0 1585 1655 1787 1861), while the runtime returns A^T*B. Changing
+only the multiply formula to A*B makes that unit test and CTest pass 21/21, but
+the game's office geometry breaks immediately (the field appears rotated and
+torn), so the game relies on the existing E-form/operand convention. The
+mismatch is therefore in the emitter's operand/E decoding, not in the multiply
+formula; the change was reverted and no global VFPU change is part of this
+tree. The character orientation and the screen-relative movement remain open.
+
 Automation notes: with `SETO_MENU_MAP=1` the script stops after the Classroom
 dialogue and captures `build/classroom-free-roam.ppm` instead of blindly
 attempting Duel. `SETO_TRACE_FIELD=1` traces the next GE frame's

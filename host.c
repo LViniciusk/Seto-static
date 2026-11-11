@@ -148,6 +148,9 @@ static DWORD WINAPI bringup_cap(LPVOID unused) {
 #define PSP_CTRL_UP    0x00000010u
 #define PSP_CTRL_DOWN  0x00000040u
 #define PSP_CTRL_CROSS 0x00004000u
+#define PSP_CTRL_CIRCLE 0x00002000u
+#define PSP_CTRL_TRIANGLE 0x00001000u
+#define PSP_CTRL_RIGHT 0x00000020u
 
 #ifdef HAVE_TITLE_CORPUS
 /* Send one menu button until the guest changes the observed cursor or scene
@@ -399,6 +402,21 @@ static void try_talk_start(void) {
     psp_display_capture("build/s431-start-talk-end.ppm");
     fprintf(stderr, "input: start talk ended state=%u box=%d\n",
             psp_read32(0x093CDAFCu), box_up());
+}
+
+static void try_walk_class(void) {
+    for (int i = 0; i < 40; i++) {
+        field_press((i & 1) ? 0x00000080u : 0x00000020u);
+        if (i % 10 == 9) {
+            char path[48];
+            snprintf(path, sizeof path, "build/s442-walk-%d.ppm", i / 10);
+            psp_display_capture(path);
+            fprintf(stderr, "input: walk step=%d state=%u box=%d\n",
+                    i + 1, psp_read32(0x093CDAFCu), box_up());
+        }
+        if (box_up() || psp_read32(0x093CDAFCu) != 1u) break;
+    }
+    psp_display_capture("build/s442-walk-end.ppm");
 }
 
 static int title_press_until_change(uint32_t mask) {
@@ -854,6 +872,8 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                                 st == 1u && k > 20) {
                                                 talk_done = 1;
                                                 try_talk_aluno();
+                                                if (getenv("SETO_WALK_CLASS"))
+                                                    try_walk_class();
                                                 if (getenv("SETO_TALK_START"))
                                                     try_talk_start();
                                                 else if (getenv("SETO_TALK_MENU"))
@@ -1094,8 +1114,57 @@ static DWORD WINAPI input_thread(LPVOID unused) {
         } else
 #endif
         {
+            /* Field free roam: direct pad, so the player can walk and talk
+             * without the automation. */
+            const uint32_t fst = psp_read32(0x093CDAFCu);
+            if (fst == 1u || fst == 6u || fst == 11u || fst == 12u || fst == 23u) {
+                uint32_t fm = 0;
+                if (GetAsyncKeyState(VK_LEFT) & 0x8000)  fm |= 0x00000080u;
+                if (GetAsyncKeyState(VK_RIGHT) & 0x8000) fm |= 0x00000020u;
+                if (GetAsyncKeyState(VK_UP) & 0x8000)    fm |= 0x00000010u;
+                if (GetAsyncKeyState(VK_DOWN) & 0x8000)  fm |= 0x00000040u;
+                if (GetAsyncKeyState('Z') & 0x8000)      fm |= 0x00004000u;
+                if (GetAsyncKeyState('X') & 0x8000)      fm |= 0x00002000u;
+                if (GetAsyncKeyState('C') & 0x8000)      fm |= 0x00001000u;
+                if (GetAsyncKeyState(VK_RETURN) & 0x8000) fm |= 0x00000008u;
+                psp_ctrl_set(fm, 128, 128);
+                Sleep(10);
+                continue;
+            }
 #ifdef HAVE_TITLE_CORPUS
             const int state = psp_title_scene_state();
+            /* Story/part menus and other screens do not use the title's
+             * menu_request path; send the pad directly there. */
+            if (state != 3 && state != 4) {
+                uint32_t fm = 0;
+                if (GetAsyncKeyState(VK_LEFT) & 0x8000)  fm |= PSP_CTRL_LEFT;
+                if (GetAsyncKeyState(VK_RIGHT) & 0x8000) fm |= PSP_CTRL_RIGHT;
+                if (GetAsyncKeyState(VK_UP) & 0x8000)    fm |= PSP_CTRL_UP;
+                if (GetAsyncKeyState(VK_DOWN) & 0x8000)  fm |= PSP_CTRL_DOWN;
+                if (GetAsyncKeyState('Z') & 0x8000)      fm |= PSP_CTRL_CROSS;
+                if (GetAsyncKeyState('X') & 0x8000)      fm |= PSP_CTRL_CIRCLE;
+                if (GetAsyncKeyState('C') & 0x8000)      fm |= PSP_CTRL_TRIANGLE;
+                if (GetAsyncKeyState(VK_RETURN) & 0x8000) fm |= PSP_CTRL_START;
+                psp_ctrl_set(fm, 128, 128);
+                Sleep(10);
+                continue;
+            }
+            if (state == 4) {
+                /* Name/confirmation and the story part selector: direct pad
+                 * with both axes, held while the key is down. */
+                uint32_t fm = 0;
+                if (GetAsyncKeyState(VK_LEFT) & 0x8000)  fm |= PSP_CTRL_LEFT;
+                if (GetAsyncKeyState(VK_RIGHT) & 0x8000) fm |= PSP_CTRL_RIGHT;
+                if (GetAsyncKeyState(VK_UP) & 0x8000)    fm |= PSP_CTRL_UP;
+                if (GetAsyncKeyState(VK_DOWN) & 0x8000)  fm |= PSP_CTRL_DOWN;
+                if (GetAsyncKeyState('Z') & 0x8000)      fm |= PSP_CTRL_CROSS;
+                if (GetAsyncKeyState('X') & 0x8000)      fm |= PSP_CTRL_CIRCLE;
+                if (GetAsyncKeyState('C') & 0x8000)      fm |= PSP_CTRL_TRIANGLE;
+                if (GetAsyncKeyState(VK_RETURN) & 0x8000) fm |= PSP_CTRL_START;
+                psp_ctrl_set(fm, 128, 128);
+                Sleep(10);
+                continue;
+            }
             if (menu_mask) {
                 const int c = psp_title_scene_cursor();
                 const int s = psp_title_scene_state();
