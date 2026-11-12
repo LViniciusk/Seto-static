@@ -1605,6 +1605,17 @@ values the renderer receives. The next step is the scene/camera setup in
 `modduel_eng` (the renderer is the EBOOT's, so the camera must come from the
 engine's scene graph).
 
+**Duel transition and settled list (s556).** The duel detector captured the
+first second of the tutorial duel (`build/duel-live-00..11.ppm`): the
+classroom and a green/purple field-texture strip render mid-screen, then the
+settled frame (`build/duel-live.ppm`) is the black field with the dialogue box.
+The GE list traced in the settled frame contains only three primitives --
+`x60`, `x32` and `x16`, all `clear 1` with texture off -- so the 2D field
+layer is drawn during the transition and **absent from the settled list**. The
+window's log then stops in the particle RNG null accesses (`0x03028E00`). The
+next fix is the draw-state condition that stops enqueuing the field layer after
+the transition, not the camera.
+
 **The 996 mesh is not the board (PPSSPP reference).** A PPSSPP frame of the
 same duel (Turn 1, SP_GAME vs Gillian) shows the duel field as a **2D layer**:
 a purple starfield background, a flat screen-aligned zone grid, the opponent's
