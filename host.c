@@ -275,6 +275,30 @@ static void field_press(uint32_t mask) {
     Sleep(120);
 }
 
+/* Turn/face without crossing the interaction radius: the field applies the
+ * camera-relative step on the first frames, so a long hold can walk past an
+ * adjacent NPC. */
+static void field_tap(uint32_t mask) {
+    if (psp_duel_manager_start_requested()) return;
+    psp_title_walk(mask, 128, 128);
+    psp_ctrl_set(mask, 128, 128);
+    Sleep(40);
+    psp_title_walk(0, 128, 128);
+    psp_ctrl_set(0, 128, 128);
+    Sleep(120);
+}
+
+/* A single frame: open the command menu without the held CROSS also selecting
+ * the remembered entry on the following frame. */
+static void field_one_shot(uint32_t mask) {
+    if (psp_duel_manager_start_requested()) return;
+    psp_title_pad_request(mask);
+    psp_ctrl_set(mask, 128, 128);
+    Sleep(20);
+    psp_ctrl_set(0, 128, 128);
+    Sleep(300);
+}
+
 static int screen_black(void) {
     static uint32_t px[480 * 272];
     if (psp_display_read(px) != 0) return 0;
@@ -329,18 +353,21 @@ static void try_talk_aluno(void) {
             field_press(0x00002000u);      /* CIRCLE: close action menu */
             Sleep(700);
         }
-        field_press(dpad[d]);
+        if (getenv("SETO_TALK_TAP")) field_tap(dpad[d]);
+        else field_press(dpad[d]);
         {
             char path[48];
             snprintf(path, sizeof path, "build/s439-pos-%d.ppm", d);
             psp_display_capture(path);
         }
-        auto_press(PSP_CTRL_CROSS);
-        Sleep(800);
+        field_one_shot(PSP_CTRL_CROSS);
+        Sleep(700);
         if (psp_read32(0x093CDAFCu) == 6u) {
-            field_press(0x00002000u);      /* menu opened: no adjacent NPC */
-            Sleep(700);
-            continue;
+            /* The command menu remembers its cursor: the Map travel left it
+             * on Map, so reset to Talk before selecting it. */
+            for (int u = 0; u < 4; u++) { field_press(0x00000010u); Sleep(250); }
+            auto_press(PSP_CTRL_CROSS);    /* Talk is the first entry */
+            Sleep(1200);
         }
         {
             char path[48];
@@ -386,6 +413,8 @@ static void try_talk_menu(void) {
 }
 
 static void try_talk_start(void) {
+    field_press(PSP_CTRL_CIRCLE);   /* close a PDA/action menu left open */
+    Sleep(500);
     field_press(PSP_CTRL_START);
     Sleep(1500);
     psp_display_capture("build/s431-start.ppm");
@@ -453,6 +482,27 @@ static int main_menu_row(void) {
     return ((y0 + y1) / 2 - 71 + 12) / 25;
 }
 
+/* Row of the orange highlight in the destination list (left panel). The list
+ * remembers the previous destination, so a fixed DOWN count is not reliable. */
+static int map_list_row(void) {
+    static uint32_t px[480 * 272];
+    if (psp_display_read(px) != 0) return -1;
+    int y0 = -1, y1 = -1;
+    for (int y = 45; y < 180; y++) {
+        int c = 0;
+        for (int x = 5; x < 150; x++) {
+            const uint32_t v = px[y * 480 + x];
+            const int r = (int)(v & 0xFF), g = (int)((v >> 8) & 0xFF),
+                      b = (int)((v >> 16) & 0xFF);
+            if (r > 230 && g > 120 && g < 200 && b < 60) c++;
+        }
+        if (c > 40) { if (y0 < 0) y0 = y; y1 = y; }
+    }
+    if (y0 < 0) return -1;
+    const int row = ((y0 + y1) / 2 - 68 + 11) / 22;
+    return row < 0 ? 0 : row > 4 ? 4 : row;
+}
+
 /* One short menu_request hold: the hook re-issues the edge every input update
  * while the request is set, so keep it near one update. */
 static void menu_hold(uint32_t mask, int ms) {
@@ -508,7 +558,19 @@ static DWORD WINAPI input_thread(LPVOID unused) {
     int menu_cursor = 0, menu_state = 0;
     DWORD menu_deadline = 0;
     DWORD press_ms = 0;
+    int duel_traces = 0;
+    DWORD duel_last = 0;
+    const int trace_duel = getenv("SETO_TRACE_DUEL") != NULL;
     while (!psp_exit_requested()) {
+        if (trace_duel && psp_duel_manager_start_requested()) {
+            const DWORD now = GetTickCount();
+            if (duel_traces < 6 && (duel_last == 0 || now - duel_last >= 1500)) {
+                duel_last = now;
+                duel_traces++;
+                psp_ge_trace_next_frame();
+                fprintf(stderr, "input: duel trace %d\n", duel_traces);
+            }
+        }
         /* libtitle accepts START at its PRESS START step: animation 5 owns the
          * frame and its step index (0x126C6FC) is 1. The same index occurs
          * during the loading sequence, but then the animation is not 5. */
@@ -793,8 +855,16 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                      * before the list takes the D-pad. */
                                     auto_press(0x00004000u);
                                     Sleep(900);
+                                    const int target_row = getenv("SETO_TRAVEL_STORE") ? 2 : 1;
                                     auto_press(0x00000040u);
                                     Sleep(900);
+                                    for (int i = 0; i < 6; i++) {
+                                        const int row = map_list_row();
+                                        if (row < 0 || row == target_row) break;
+                                        auto_press(row < target_row ? 0x00000040u
+                                                                    : 0x00000010u);
+                                        Sleep(700);
+                                    }
                                     psp_display_capture("build/s93-map-class.ppm");
                                     auto_press(0x00004000u);
                                     for (int t = 0; t < 40 &&
@@ -871,10 +941,14 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                             if (getenv("SETO_TALK_ALUNO") && !talk_done &&
                                                 st == 1u && k > 20) {
                                                 talk_done = 1;
-                                                try_talk_aluno();
+                                                if (getenv("SETO_TALK_START_ONLY"))
+                                                    try_talk_start();
+                                                else
+                                                    try_talk_aluno();
                                                 if (getenv("SETO_WALK_CLASS"))
                                                     try_walk_class();
-                                                if (getenv("SETO_TALK_START"))
+                                                if (getenv("SETO_TALK_START") &&
+                                                    !getenv("SETO_TALK_START_ONLY"))
                                                     try_talk_start();
                                                 else if (getenv("SETO_TALK_MENU"))
                                                     try_talk_menu();

@@ -1452,6 +1452,43 @@ title phase `6 -> 9`; scene `4 -> 1 -> 2 -> 3`; Story Mode then loads
 world map travels to the Classroom, and the classroom script runs until the
 `SETO_BRINGUP_CAP=150` cap. CTest 21/21.
 
+## S10 results — field preserved, vmmul split and the EHP store
+
+**vmmul split.** The field's 32 matrix calls use the E form
+(`vs E0, vt E1`; `SETO_TRACE_VMMUL` prints
+`08C... vs=..(E0) vt=..(E1)`). The runtime now makes the **plain** form follow
+the hardware (`A*B`, pspautotests `1585/5318/1655/5562`) while leaving the E
+form on its previous result (19). `test_vmmul_hardware`,
+`test_vmmul_orientation` and `vfpu` pass; the Classroom still renders
+(`build/s93-room.png`) and the field trace has 996 quads with 40 on screen.
+
+**Command-menu cursor.** The field command menu keeps its cursor across
+opening. The world-map travel selects **Map** (four DOWN), so the next CROSS
+opened PDA instead of Talk. The host opens the menu with a one-frame CROSS,
+resets the cursor with four held UP presses and only then selects Talk; this
+is an input-automation fix only (no guest memory write). The `s93-menu-open`
+capture shows the original Talk/Duel/Item/PDA/Map menu.
+
+**Store assets are EHP, not PRX/PHE.** The three files the Store opens are
+EHP/EhFolder archives (`0x03504845`, `NOT `, 26 entries) and GIM textures, not
+relocatable modules. `build/ehp_list.py` lists `card_frame_all.gim`,
+`card_icon*.gim`, `gx_pda_cover01.tms`, `ocg_packlist_a.bin`,
+`ocg_packname_a.bin`, `pickup_card.tms`, `sp_baloon.gim` and the other shop
+assets. There is no shop PRX to recompile; the missing scene is inside the
+store renderer.
+
+**COP1 rounding.** The EBOOT's shop layout calls `ceil.w.s` (and `floor.w.s`);
+the emitter used to emit `psp_unimplemented` and leave the FPR stale. The
+emitter now emits `psp_fceil`/`psp_ffloor`/`psp_fround` through
+`recomp_rt.h`, and the generated EBOOT corpus was updated. The new `emit` test
+checks all three instructions; CTest is 21/21.
+
+**Duel status.** The manual tutorial duel completed: six `input: duel trace`
+samples were followed by the post-duel `modstory`/`modfield` reload, so the
+duel result was processed. The sampled frames show the duel UI; no
+`modduel_draw` 3D primitive was captured in that run, so the duel board's 3D
+path remains a visual gap, not a progression blocker.
+
 ## Limitations
 
 - `sceReg` serves only the `/DATA/FONT` and `/SYSPROFILE/RESOLUTION` subtrees
@@ -1460,8 +1497,9 @@ world map travels to the Classroom, and the classroom script runs until the
   game runs but `sceFont` strings are blank.
 - `libtitle.prx`, `libstory.prx`, `libfield.prx`, `libdeck.prx`,
   `libdeck_tutorial.prx` and the six duel PRXs are integrated; `libcharalist`
-  and the recipe viewers are not. The duel images load, but no duel has started
-  yet.
+  and the recipe viewers are not. The manual tutorial duel completed (six
+  `input: duel trace` samples followed by the post-duel story/field reload);
+  the duel board's 3D draw was not captured in that run.
 - The rebased corpus relocates the EBOOT into the PSP user RAM window. The host
   refuses the unrelocated image instead of guessing its base.
 - Audio is paced by the runtime but not played; the Atrac stream calls remain
