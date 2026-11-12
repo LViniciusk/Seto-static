@@ -1499,11 +1499,17 @@ but the first CROSS was still `box=0`. The LEFT face before the CROSS (s514)
 also leaves `box=0`; the player is next to the red student at the door, which
 is not a talkable target, and the walk does not reach the classroom front.
 
-**s431 baseline not reproduced.** The cda9a1c host, the older
-`tagforce-vhtfm-check` EBOOT corpus and `SETO_VMMUL_OLD_PLAIN=1` (s519) still
-leave `talk dir=2 box=0`, as do the `auto_press`/`k>20` revert (s515) and the
-old-plain switch (s516). The tutorial trigger is not a single host, vmmul or
-corpus regression; the current build is restored to the latest host/corpus.
+**s431 baseline not reproduced.** The cda9a1c and b52292b hosts, the older
+`tagforce-vhtfm-check` EBOOT corpus and `SETO_VMMUL_OLD_PLAIN=1` (s519/s521)
+still leave `talk dir=2 box=0`, as do the `auto_press`/`k>20` revert (s515)
+and the old-plain switch (s516).
+
+**Historical working point (s435/s436).** The saved logs from 14:57/15:10 show
+`talk dir=2 box=1` / `talk dir=1 box=1`, `classroom done=1` and
+`duel menu attempt=0 state=6`; the s437+ runs lose the direction lines and end
+`box=0`/`done=0`. That combination (host, EBOOT corpus and psprecomp at s436)
+is not in git; reproducing it from cda9a1c/b52292b has not restored the talk.
+The current build is restored to the latest host/corpus.
 
 **Store assets are EHP, not PRX/PHE.** The three files the Store opens are
 EHP/EhFolder archives (`0x03504845`, `NOT `, 26 entries) and GIM textures, not
