@@ -1605,6 +1605,17 @@ values the renderer receives. The next step is the scene/camera setup in
 `modduel_eng` (the renderer is the EBOOT's, so the camera must come from the
 engine's scene graph).
 
+**Which module owns the camera (s552).** The libehsys matrix API exports are
+`0x5B05F797` (commit current matrix, `0x080326FC`) and `0xD697947E` (view
+builder, `0x0801850C`). `modfield` imports **both**; `modduel_eng` imports
+**neither**, and `modduel_draw` imports **only the view builder**. So the duel
+camera cannot come from the engine's matrix API: it is either computed inside
+`modduel_draw` (its `0x0305331C` path composes with `0x030680EC/0x030681EC/
+0x03068154` and sets a matrix mode) or taken by the EBOOT renderer from a scene
+node. The GE trace shows only the field's single view, so that path either is
+not reached or produces the field's pose. A PPSSPP reference of the same duel
+would settle which pose is intended before changing the guest camera code.
+
 **Duel 3D captured and located (s537/s538).** The GE trace now also prints the
 model-space extents of every mesh with 100+ vertices. In the duel the board is
 `GE prim 3 x996 vtype 00015F vaddr 09333BEC`: an untextured, alpha-blended
