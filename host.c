@@ -1098,6 +1098,21 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                                         psp_read32(0x093CDAFCu), box_up());
                                                 psp_display_capture("build/s490-before.ppm");
                                                 dump_field_state("before");
+                                                if (getenv("SETO_POS_SCAN")) {
+                                                    int n = 0;
+                                                    for (uint32_t a = 0x08C00000u;
+                                                         a < 0x093D2D90u; a += 4) {
+                                                        uint32_t v = psp_read32(a);
+                                                        if (v == 0x40B80000u || v == 0x3FE00000u) {
+                                                            fprintf(stderr,
+                                                                    "pos %08X=%08X\n", a, v);
+                                                            if (n++ == 0)
+                                                                psp_mem_watch_write(a);
+                                                            if (n >= 12) break;
+                                                        }
+                                                    }
+                                                    fprintf(stderr, "pos scan %d\n", n);
+                                                }
                                                 if (getenv("SETO_TRACE_ROOM"))
                                                     psp_ge_trace_next_frame();
                                                 static const uint32_t dirs[4] = {

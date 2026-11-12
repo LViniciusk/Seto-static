@@ -1511,6 +1511,13 @@ for state 23, but the rerun ended at state 1 (`analog: talk state=1`,
 `classroom done=0`), so the state 5/6/23 transition is timing-dependent rather
 than a fixed input sequence.
 
+**Position instrument (s533).** Scanning the field `.bss` for the float pair
+`5.75`/`1.75` finds the player position at `0x08C40DD4` (x=5.75) and
+`0x08C40DDC` (z=1.75), with copies at `0x08C40E30`/`0x08C40E38`. Watching the
+x word through every D-pad direction produces **no write**; the field receives
+the pad (s523 `buttons=00000040`) but the movement path never updates the
+player position. The blocker is the field state/movement call, not the pad.
+
 **HLE ctrl read (s523).** With `PSPRECOMP_TRACE_CTRL`, the field's own
 `sceCtrlReadBufferPositive` (buffer `09FFFB78`) reports
 `buttons=00000040` during the D-pad press, so the pad is not lost before the
