@@ -1471,6 +1471,12 @@ capture shows the original Talk/Duel/Item/PDA/Map menu. The headless runs
 still report `box_up=0` after the reset, so the tutorial dialogue trigger is
 not yet proved; the manual window remains the check.
 
+**Movement probe (s490).** A pure free-roam probe (`SETO_WALK_PROBE`) reports
+field state 1 with no dialogue, `box_up=0`; LEFT is blocked by the door wall,
+while RIGHT, UP and DOWN move the player and change the GE world trace
+(`build/s490-before/left/right/up/down.png`). The field is navigable on the
+current EXE; the remaining issue is the NPC turn/talk trigger, not the D-pad.
+
 **Store assets are EHP, not PRX/PHE.** The three files the Store opens are
 EHP/EhFolder archives (`0x03504845`, `NOT `, 26 entries) and GIM textures, not
 relocatable modules. `build/ehp_list.py` lists `card_frame_all.gim`,

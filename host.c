@@ -288,6 +288,18 @@ static void field_tap(uint32_t mask) {
     Sleep(120);
 }
 
+/* Short hold: the first frames turn the character, the rest move only a
+ * fraction of a long press, keeping an adjacent NPC inside the talk radius. */
+static void field_nudge(uint32_t mask) {
+    if (psp_duel_manager_start_requested()) return;
+    psp_title_walk(mask, 128, 128);
+    psp_ctrl_set(mask, 128, 128);
+    Sleep(100);
+    psp_title_walk(0, 128, 128);
+    psp_ctrl_set(0, 128, 128);
+    Sleep(200);
+}
+
 /* A single frame: open the command menu without the held CROSS also selecting
  * the remembered entry on the following frame. */
 static void field_one_shot(uint32_t mask) {
@@ -348,13 +360,19 @@ static void try_talk_aluno(void) {
     }
     static const uint32_t dpad[4] = { 0x00000080u, 0x00000020u,
                                       0x00000010u, 0x00000040u };
+    /* Camera-relative: DOWN walks toward the Classroom door/Crowler. */
+    static const uint32_t dpad_north[4] = { 0x00000040u, 0x00000010u,
+                                            0x00000080u, 0x00000020u };
+    const int nudge = getenv("SETO_TALK_NUDGE") != NULL;
+    const uint32_t *dirs = nudge ? dpad_north : dpad;
     for (int d = 0; d < 4 && !box_up(); d++) {
         if (psp_read32(0x093CDAFCu) == 6u) {
             field_press(0x00002000u);      /* CIRCLE: close action menu */
             Sleep(700);
         }
-        if (getenv("SETO_TALK_TAP")) field_tap(dpad[d]);
-        else field_press(dpad[d]);
+        if (nudge) field_nudge(dirs[d]);
+        else if (getenv("SETO_TALK_TAP")) field_tap(dirs[d]);
+        else field_press(dirs[d]);
         {
             char path[48];
             snprintf(path, sizeof path, "build/s439-pos-%d.ppm", d);
@@ -446,6 +464,25 @@ static void try_walk_class(void) {
         if (box_up() || psp_read32(0x093CDAFCu) != 1u) break;
     }
     psp_display_capture("build/s442-walk-end.ppm");
+}
+
+/* Camera-relative: the blocked LEFT sets the facing, RIGHT clears the doorway,
+ * then DOWN walks toward the front. */
+static void try_walk_down(void) {
+    field_press(0x00000080u);
+    for (int i = 0; i < 2; i++) field_press(0x00000020u);
+    for (int i = 0; i < 12; i++) {
+        field_press(0x00000040u);
+        if (i % 3 == 2) {
+            char path[64];
+            snprintf(path, sizeof path, "build/s493-walk-%d.ppm", i);
+            psp_display_capture(path);
+            fprintf(stderr, "input: walk-down %d state=%u box=%d\n", i + 1,
+                    psp_read32(0x093CDAFCu), box_up());
+        }
+        if (box_up() || psp_read32(0x093CDAFCu) != 1u) break;
+    }
+    psp_display_capture("build/s493-walk-end.ppm");
 }
 
 static int title_press_until_change(uint32_t mask) {
@@ -938,9 +975,54 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                             Sleep(100);
                                         } else {
                                             quiet = 0;
+                                            /* Pure free-roam probe: advance an invisible
+                                             * cutscene, then verify each D-pad direction
+                                             * with a frame capture and a GE trace. */
+                                            if (getenv("SETO_WALK_PROBE") && st == 1u &&
+                                                k == 30) {
+                                                for (int i = 0; i < 10; i++) {
+                                                    auto_press(PSP_CTRL_CROSS);
+                                                    Sleep(500);
+                                                }
+                                                psp_display_capture("build/s490-advance.ppm");
+                                                fprintf(stderr, "probe: advance state=%u box=%d\n",
+                                                        psp_read32(0x093CDAFCu), box_up());
+                                                psp_display_capture("build/s490-before.ppm");
+                                                if (getenv("SETO_TRACE_ROOM"))
+                                                    psp_ge_trace_next_frame();
+                                                static const uint32_t dirs[4] = {
+                                                    0x00000080u, 0x00000020u,
+                                                    0x00000010u, 0x00000040u };
+                                                static const char *const dnames[4] = {
+                                                    "left", "right", "up", "down" };
+                                                for (int d = 0; d < 4; d++) {
+                                                    field_press(dirs[d]);
+                                                    Sleep(800);
+                                                    char path[64];
+                                                    snprintf(path, sizeof path,
+                                                             "build/s490-%s.ppm", dnames[d]);
+                                                    psp_display_capture(path);
+                                                    if (getenv("SETO_TRACE_ROOM"))
+                                                        psp_ge_trace_next_frame();
+                                                    fprintf(stderr,
+                                                            "probe: %s state=%u box=%d\n",
+                                                            dnames[d],
+                                                            psp_read32(0x093CDAFCu),
+                                                            box_up());
+                                                }
+                                            }
                                             if (getenv("SETO_TALK_ALUNO") && !talk_done &&
-                                                st == 1u && k > 20) {
+                                                st == 1u && k >= 30) {
                                                 talk_done = 1;
+                                                /* The arrival beat can be an invisible
+                                                 * CROSS-advanced cutscene; unlock input
+                                                 * before walking/talking. */
+                                                for (int i = 0; i < 10; i++) {
+                                                    auto_press(PSP_CTRL_CROSS);
+                                                    Sleep(500);
+                                                }
+                                                if (getenv("SETO_WALK_THEN_TALK"))
+                                                    try_walk_down();
                                                 if (getenv("SETO_TALK_START_ONLY"))
                                                     try_talk_start();
                                                 else
