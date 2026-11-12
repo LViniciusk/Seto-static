@@ -1489,9 +1489,15 @@ that position.
 D-pad bit is set and still held (`pad: set=00000040 now=00000040`, then
 `held=00000040`). The field-state dump taken at the same moment shows exactly
 why the player stands still: `0x093CDAFC=1` but `0x093CDB20=0x0B` — the blind
-CROSS advance opened the PDA, and the walk directions were consumed as PDA
-navigation, not movement. The fix is to press CIRCLE before the walk; the
-current host does that and re-dumps the window as `walk-close`.
+CROSS advance leaves `0x093CDB20=0x0B`. Pressing CIRCLE before the walk
+(s510/s511) did **not** move the player and the pad readback stayed exact, so
+the word is not the sole blocker. The exact s504 movement prefix inside the
+story block (s512) also did not move, while the same sequence inside the
+`SETO_WALK_PROBE` block does. The host therefore walks and tries the talk from
+inside the probe block (s513): that moved the player to Crowler's right/behind,
+but the first CROSS was still `box=0`. The LEFT face before the CROSS (s514)
+also leaves `box=0`; the player is next to the red student at the door, which
+is not a talkable target, and the walk does not reach the classroom front.
 
 **Store assets are EHP, not PRX/PHE.** The three files the Store opens are
 EHP/EhFolder archives (`0x03504845`, `NOT `, 26 entries) and GIM textures, not

@@ -387,10 +387,6 @@ static void try_talk_aluno(void) {
     const int north = getenv("SETO_TALK_NORTH") != NULL;
     const uint32_t *dirs = (nudge || north) ? dpad_north : dpad;
     for (int d = 0; d < 4 && !box_up(); d++) {
-        /* A previous CROSS can leave the PDA open (word 0x093CDB20 = 0x0B)
-         * while the scene state stays 1; close it before the next direction. */
-        field_press(0x00002000u);
-        Sleep(500);
         if (nudge) field_nudge(dirs[d]);
         else if (getenv("SETO_TALK_TAP")) field_tap(dirs[d]);
         else field_press(dirs[d]);
@@ -491,11 +487,9 @@ static void try_walk_class(void) {
  * DOWN; a pure DOWN from the spawn is blocked by the door wall. */
 static void try_walk_down(void) {
     dump_field_state("walk-before");
-    /* The blind CROSS advance opens the PDA (0x093CDB20 = 0x0B); direction
-     * presses then navigate the PDA instead of moving the player. */
-    field_press(0x00002000u);
-    Sleep(500);
-    dump_field_state("walk-close");
+    /* Replay the exact s504 movement prefix: the blocked LEFT sets the facing,
+     * then RIGHT/UP clear the doorway before the long DOWN. */
+    field_press(0x00000080u);
     field_press(0x00000020u);
     field_press(0x00000010u);
     for (int i = 0; i < 12; i++) {
@@ -1070,6 +1064,42 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                                                 box_up());
                                                         dump_field_state("talk");
                                                         if (box_up()) break;
+                                                    }
+                                                }
+                                                /* The probe block's field_press path is
+                                                 * the one that moves; use it to walk
+                                                 * into the room and try the talk there. */
+                                                if (!box_up()) {
+                                                    for (int i = 0; i < 12; i++)
+                                                        field_press(0x00000040u);
+                                                    Sleep(800);
+                                                    /* The walk ends right/behind
+                                                     * Crowler; face him before CROSS. */
+                                                    field_press(0x00000080u);
+                                                    Sleep(800);
+                                                    field_one_shot(PSP_CTRL_CROSS);
+                                                    Sleep(700);
+                                                    psp_display_capture(
+                                                        "build/s504-probe-talk.ppm");
+                                                    fprintf(stderr,
+                                                            "probe: walk-talk state=%u box=%d\n",
+                                                            psp_read32(0x093CDAFCu),
+                                                            box_up());
+                                                    dump_field_state("walk-talk");
+                                                    if (psp_read32(0x093CDAFCu) == 6u) {
+                                                        for (int u = 0; u < 4; u++) {
+                                                            field_press(0x00000010u);
+                                                            Sleep(250);
+                                                        }
+                                                        auto_press(PSP_CTRL_CROSS);
+                                                        Sleep(1200);
+                                                        psp_display_capture(
+                                                            "build/s504-probe-talk2.ppm");
+                                                        fprintf(stderr,
+                                                                "probe: walk-talk2 state=%u box=%d\n",
+                                                                psp_read32(0x093CDAFCu),
+                                                                box_up());
+                                                        dump_field_state("walk-talk2");
                                                     }
                                                 }
                                             }
