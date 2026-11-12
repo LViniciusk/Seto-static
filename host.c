@@ -395,8 +395,8 @@ static void try_talk_aluno(void) {
             snprintf(path, sizeof path, "build/s439-pos-%d.ppm", d);
             psp_display_capture(path);
         }
-        field_one_shot(PSP_CTRL_CROSS);
-        Sleep(700);
+        auto_press(PSP_CTRL_CROSS);
+        Sleep(800);
         if (psp_read32(0x093CDAFCu) == 6u) {
             /* The command menu remembers its cursor: the Map travel left it
              * on Map, so reset to Talk before selecting it. */
@@ -1104,16 +1104,8 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                                 }
                                             }
                                             if (getenv("SETO_TALK_ALUNO") && !talk_done &&
-                                                st == 1u && k >= 30) {
+                                                st == 1u && k > 20) {
                                                 talk_done = 1;
-                                                /* The arrival beat can be an invisible
-                                                 * CROSS-advanced cutscene; unlock input
-                                                 * before walking/talking. */
-                                                for (int i = 0; i < 10; i++) {
-                                                    auto_press(PSP_CTRL_CROSS);
-                                                    Sleep(500);
-                                                }
-                                                Sleep(1500);
                                                 if (getenv("SETO_WALK_THEN_TALK"))
                                                     try_walk_down();
                                                 if (getenv("SETO_TALK_START_ONLY"))

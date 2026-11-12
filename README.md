@@ -1499,6 +1499,12 @@ but the first CROSS was still `box=0`. The LEFT face before the CROSS (s514)
 also leaves `box=0`; the player is next to the red student at the door, which
 is not a talkable target, and the walk does not reach the classroom front.
 
+**s431 baseline not reproduced.** The cda9a1c host, the older
+`tagforce-vhtfm-check` EBOOT corpus and `SETO_VMMUL_OLD_PLAIN=1` (s519) still
+leave `talk dir=2 box=0`, as do the `auto_press`/`k>20` revert (s515) and the
+old-plain switch (s516). The tutorial trigger is not a single host, vmmul or
+corpus regression; the current build is restored to the latest host/corpus.
+
 **Store assets are EHP, not PRX/PHE.** The three files the Store opens are
 EHP/EhFolder archives (`0x03504845`, `NOT `, 26 entries) and GIM textures, not
 relocatable modules. `build/ehp_list.py` lists `card_frame_all.gim`,
