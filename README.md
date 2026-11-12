@@ -1477,6 +1477,17 @@ while RIGHT, UP and DOWN move the player and change the GE world trace
 (`build/s490-before/left/right/up/down.png`). The field is navigable on the
 current EXE; the remaining issue is the NPC turn/talk trigger, not the D-pad.
 
+**Command-menu probe (s504).** A single 300 ms direction plus a one-frame
+CROSS leaves scene state 1 and `box_up=0` at all four directions; the nearby
+word `0x093CDB20` becomes `0x0B` (PDA) and `0x093CDB00` becomes `FFFFFFFF`,
+while `0x093CDAFC` stays 1. The full window `0x093CDAD0..0x093CDB30` is logged
+before and after each test. So the CROSS after a spawn direction opens the
+PDA, not the command menu; the red student at the door is not talkable from
+that position. The pure-DOWN walk in the story block did not move (s507),
+although the same `field_press` moves in the `SETO_WALK_PROBE` block; the
+remaining blocker is that story-block input context, not the D-pad or the
+camera.
+
 **Store assets are EHP, not PRX/PHE.** The three files the Store opens are
 EHP/EhFolder archives (`0x03504845`, `NOT `, 26 entries) and GIM textures, not
 relocatable modules. `build/ehp_list.py` lists `card_frame_all.gim`,

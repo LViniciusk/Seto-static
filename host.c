@@ -311,6 +311,16 @@ static void field_one_shot(uint32_t mask) {
     Sleep(300);
 }
 
+/* The field keeps the command-menu/PDA substate next to the scene state; dump
+ * a small window around it before and after each input so a box=0 result is
+ * not confused with an unopened menu. */
+static void dump_field_state(const char *tag) {
+    fprintf(stderr, "probe state %s:", tag);
+    for (uint32_t a = 0x093CDAD0u; a <= 0x093CDB30u; a += 4)
+        fprintf(stderr, " %08X=%08X", a, psp_read32(a));
+    fprintf(stderr, "\n");
+}
+
 static int screen_black(void) {
     static uint32_t px[480 * 272];
     if (psp_display_read(px) != 0) return 0;
@@ -364,12 +374,13 @@ static void try_talk_aluno(void) {
     static const uint32_t dpad_north[4] = { 0x00000040u, 0x00000010u,
                                             0x00000080u, 0x00000020u };
     const int nudge = getenv("SETO_TALK_NUDGE") != NULL;
-    const uint32_t *dirs = nudge ? dpad_north : dpad;
+    const int north = getenv("SETO_TALK_NORTH") != NULL;
+    const uint32_t *dirs = (nudge || north) ? dpad_north : dpad;
     for (int d = 0; d < 4 && !box_up(); d++) {
-        if (psp_read32(0x093CDAFCu) == 6u) {
-            field_press(0x00002000u);      /* CIRCLE: close action menu */
-            Sleep(700);
-        }
+        /* A previous CROSS can leave the PDA open (word 0x093CDB20 = 0x0B)
+         * while the scene state stays 1; close it before the next direction. */
+        field_press(0x00002000u);
+        Sleep(500);
         if (nudge) field_nudge(dirs[d]);
         else if (getenv("SETO_TALK_TAP")) field_tap(dirs[d]);
         else field_press(dirs[d]);
@@ -466,11 +477,9 @@ static void try_walk_class(void) {
     psp_display_capture("build/s442-walk-end.ppm");
 }
 
-/* Camera-relative: the blocked LEFT sets the facing, RIGHT clears the doorway,
- * then DOWN walks toward the front. */
+/* Camera-relative: DOWN alone walks from the door; the s490 probe proved this
+ * direction moves in the same after-arrival context. */
 static void try_walk_down(void) {
-    field_press(0x00000080u);
-    for (int i = 0; i < 2; i++) field_press(0x00000020u);
     for (int i = 0; i < 12; i++) {
         field_press(0x00000040u);
         if (i % 3 == 2) {
@@ -988,6 +997,7 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                                 fprintf(stderr, "probe: advance state=%u box=%d\n",
                                                         psp_read32(0x093CDAFCu), box_up());
                                                 psp_display_capture("build/s490-before.ppm");
+                                                dump_field_state("before");
                                                 if (getenv("SETO_TRACE_ROOM"))
                                                     psp_ge_trace_next_frame();
                                                 static const uint32_t dirs[4] = {
@@ -1002,6 +1012,7 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                                     snprintf(path, sizeof path,
                                                              "build/s490-%s.ppm", dnames[d]);
                                                     psp_display_capture(path);
+                                                    dump_field_state(dnames[d]);
                                                     if (getenv("SETO_TRACE_ROOM"))
                                                         psp_ge_trace_next_frame();
                                                     fprintf(stderr,
@@ -1009,6 +1020,38 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                                             dnames[d],
                                                             psp_read32(0x093CDAFCu),
                                                             box_up());
+                                                    /* Same context, one direction
+                                                     * press then CROSS: does the
+                                                     * command menu open? */
+                                                    field_one_shot(PSP_CTRL_CROSS);
+                                                    Sleep(700);
+                                                    char cpath[64];
+                                                    snprintf(cpath, sizeof cpath,
+                                                             "build/s504-%s-cross.ppm",
+                                                             dnames[d]);
+                                                    psp_display_capture(cpath);
+                                                    fprintf(stderr,
+                                                            "probe: %s cross state=%u box=%d\n",
+                                                            dnames[d],
+                                                            psp_read32(0x093CDAFCu),
+                                                            box_up());
+                                                    dump_field_state("cross");
+                                                    if (psp_read32(0x093CDAFCu) == 6u) {
+                                                        for (int u = 0; u < 4; u++) {
+                                                            field_press(0x00000010u);
+                                                            Sleep(250);
+                                                        }
+                                                        auto_press(PSP_CTRL_CROSS);
+                                                        Sleep(1200);
+                                                        psp_display_capture("build/s504-talk.ppm");
+                                                        fprintf(stderr,
+                                                                "probe: %s talk state=%u box=%d\n",
+                                                                dnames[d],
+                                                                psp_read32(0x093CDAFCu),
+                                                                box_up());
+                                                        dump_field_state("talk");
+                                                        if (box_up()) break;
+                                                    }
                                                 }
                                             }
                                             if (getenv("SETO_TALK_ALUNO") && !talk_done &&
