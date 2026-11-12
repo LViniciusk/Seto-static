@@ -269,7 +269,17 @@ static void field_press(uint32_t mask) {
     if (psp_duel_manager_start_requested()) return;
     psp_title_walk(mask, 128, 128);
     psp_ctrl_set(mask, 128, 128);
-    Sleep(300);
+    if (getenv("SETO_TRACE_PAD")) {
+        uint8_t ax, ay;
+        uint32_t rb = psp_ctrl_get(&ax, &ay);
+        fprintf(stderr, "pad: set=%08X now=%08X ax=%u ay=%u\n", mask, rb, ax, ay);
+        Sleep(150);
+        rb = psp_ctrl_get(&ax, &ay);
+        fprintf(stderr, "pad: held=%08X ax=%u ay=%u\n", rb, ax, ay);
+        Sleep(150);
+    } else {
+        Sleep(300);
+    }
     psp_title_walk(0, 128, 128);
     psp_ctrl_set(0, 128, 128);
     Sleep(120);
@@ -480,6 +490,12 @@ static void try_walk_class(void) {
 /* Camera-relative: the s504 sequence clears the doorway (RIGHT, UP) before
  * DOWN; a pure DOWN from the spawn is blocked by the door wall. */
 static void try_walk_down(void) {
+    dump_field_state("walk-before");
+    /* The blind CROSS advance opens the PDA (0x093CDB20 = 0x0B); direction
+     * presses then navigate the PDA instead of moving the player. */
+    field_press(0x00002000u);
+    Sleep(500);
+    dump_field_state("walk-close");
     field_press(0x00000020u);
     field_press(0x00000010u);
     for (int i = 0; i < 12; i++) {
@@ -490,6 +506,7 @@ static void try_walk_down(void) {
             psp_display_capture(path);
             fprintf(stderr, "input: walk-down %d state=%u box=%d\n", i + 1,
                     psp_read32(0x093CDAFCu), box_up());
+            dump_field_state("walk");
         }
         if (box_up() || psp_read32(0x093CDAFCu) != 1u) break;
     }

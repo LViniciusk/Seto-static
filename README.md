@@ -1483,10 +1483,15 @@ word `0x093CDB20` becomes `0x0B` (PDA) and `0x093CDB00` becomes `FFFFFFFF`,
 while `0x093CDAFC` stays 1. The full window `0x093CDAD0..0x093CDB30` is logged
 before and after each test. So the CROSS after a spawn direction opens the
 PDA, not the command menu; the red student at the door is not talkable from
-that position. The pure-DOWN (s507) and RIGHT+UP+DOWN (s508) walks in the story
-block did not move, although the same `field_press` moves in the
-`SETO_WALK_PROBE` block; the remaining blocker is that story-block input
-context, not the D-pad or the camera.
+that position.
+
+**Story-block input loss (s509).** Pad readback in `field_press` proves the
+D-pad bit is set and still held (`pad: set=00000040 now=00000040`, then
+`held=00000040`). The field-state dump taken at the same moment shows exactly
+why the player stands still: `0x093CDAFC=1` but `0x093CDB20=0x0B` — the blind
+CROSS advance opened the PDA, and the walk directions were consumed as PDA
+navigation, not movement. The fix is to press CIRCLE before the walk; the
+current host does that and re-dumps the window as `walk-close`.
 
 **Store assets are EHP, not PRX/PHE.** The three files the Store opens are
 EHP/EhFolder archives (`0x03504845`, `NOT `, 26 entries) and GIM textures, not
