@@ -1569,6 +1569,29 @@ duel result was processed. The sampled frames show the duel UI; no
 `modduel_draw` 3D primitive was captured in that run, so the duel board's 3D
 path remains a visual gap, not a progression blocker.
 
+**Duel module start (s548/s550).** The game never asks ModuleMgr for the duel
+modules: with `SETO_TRACE_MODULE` the only runtime loads are the font
+(`0x52c0`), title (`0x5e70`), story (`0x5e20`) and field (`0x5c60`) LBNs; none
+of the duel LBNs (`0x5c20`, `0x5940`, `0x5800`, `0x5750`, `0x5ef0`, `0x57f0`)
+is loaded, and no `sceKernelStartModule` names their UIDs. The six duel images
+are resident from the host's boot load, so their `module_start` constructors
+never ran. Running all six entries after the EBOOT boot (s550) returns 0 and
+leaves the duel byte-identical: the board is still `x996`,
+`world 10.25 ... (7.75,-3.433,10)`, `bounds x=-533..556 y=77..862
+onscreen=40/996`. The missing constructors are therefore not the scene bug.
+
+**Where the matrices come from (s548/s550).** The GE commands are written by
+`0x080372A0(list, mode, matrix)` (mode 0 projection, 1 view, 2 world, 3
+viewport); `0x080322E8` stages the VFPU matrix at `0x08101100` and reads the
+mode from `0x08101104` before calling it -- the game's `sceGum`-style commit.
+The view is uploaded eight times with the same values (camera `(9.75, 4.0,
+5.25)`, forward `(-0.577,-0.577,-0.577)`, `0.266663/0.470581` ortho), so the
+isometric view is fixed for the whole game, as the field/story scenes confirm.
+The board's world matrix is the outlier: in that view the board centre lands at
+view-space `(-3.56,-5.24,-1.95)`, i.e. 228 px left and 335 px down of centre,
+and its 10.25 scale makes it ~2.3x the screen. The engine computes that world
+matrix; the renderer, loader, textures and projection are not implicated.
+
 **Duel 3D captured and located (s537/s538).** The GE trace now also prints the
 model-space extents of every mesh with 100+ vertices. In the duel the board is
 `GE prim 3 x996 vtype 00015F vaddr 09333BEC`: an untextured, alpha-blended
