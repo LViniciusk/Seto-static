@@ -1511,6 +1511,16 @@ for state 23, but the rerun ended at state 1 (`analog: talk state=1`,
 `classroom done=0`), so the state 5/6/23 transition is timing-dependent rather
 than a fixed input sequence.
 
+**Manual session — tutorial complete, normal duel (2026-11-12).** The live
+Win32 window (PID 27812, `SETO_HOLD_WINDOW`) was played by the user after the
+auto travel. The tutorial completed and a normal duel started: frame
+`build/session-2026-11-11/frame-00415.png` shows SP_GAME vs Gillian, LP 8000,
+Turn 1, with the duel board black. The session recorder saved 430 frames and
+`s466-final.err`. The game exited at 07:32:38 after **4,800 bad accesses**:
+the first is `modduel_draw` RNG at address 0 (`0x03028D88`, ra `0x03028CD0`),
+then `0x03028E00`, then EBOOT `vec3_set` `0x08016B1C` with `$a0=0`. The
+tutorial is no longer the blocker; the normal duel's 3D scene/RNG is.
+
 **Position instrument (s533).** Scanning the field `.bss` for the float pair
 `5.75`/`1.75` finds the player position at `0x08C40DD4` (x=5.75) and
 `0x08C40DDC` (z=1.75), with copies at `0x08C40E30`/`0x08C40E38`. Watching the
