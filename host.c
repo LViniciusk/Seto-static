@@ -1021,6 +1021,7 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                                     auto_press(PSP_CTRL_CROSS);
                                                     Sleep(500);
                                                 }
+                                                Sleep(1500);
                                                 if (getenv("SETO_WALK_THEN_TALK"))
                                                     try_walk_down();
                                                 if (getenv("SETO_TALK_START_ONLY"))
