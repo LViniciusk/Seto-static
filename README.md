@@ -1467,7 +1467,9 @@ opening. The world-map travel selects **Map** (four DOWN), so the next CROSS
 opened PDA instead of Talk. The host opens the menu with a one-frame CROSS,
 resets the cursor with four held UP presses and only then selects Talk; this
 is an input-automation fix only (no guest memory write). The `s93-menu-open`
-capture shows the original Talk/Duel/Item/PDA/Map menu.
+capture shows the original Talk/Duel/Item/PDA/Map menu. The headless runs
+still report `box_up=0` after the reset, so the tutorial dialogue trigger is
+not yet proved; the manual window remains the check.
 
 **Store assets are EHP, not PRX/PHE.** The three files the Store opens are
 EHP/EhFolder archives (`0x03504845`, `NOT `, 26 entries) and GIM textures, not
@@ -1475,7 +1477,9 @@ relocatable modules. `build/ehp_list.py` lists `card_frame_all.gim`,
 `card_icon*.gim`, `gx_pda_cover01.tms`, `ocg_packlist_a.bin`,
 `ocg_packname_a.bin`, `pickup_card.tms`, `sp_baloon.gim` and the other shop
 assets. There is no shop PRX to recompile; the missing scene is inside the
-store renderer.
+store renderer. The Store destination is visible in the world-map list
+(`build/s93-map-class.png` shows its preview), but the confirm stays on the
+list before the story flag, so a new save cannot enter the shop to test it.
 
 **COP1 rounding.** The EBOOT's shop layout calls `ceil.w.s` (and `floor.w.s`);
 the emitter used to emit `psp_unimplemented` and leave the FPR stale. The
