@@ -1569,6 +1569,27 @@ duel result was processed. The sampled frames show the duel UI; no
 `modduel_draw` 3D primitive was captured in that run, so the duel board's 3D
 path remains a visual gap, not a progression blocker.
 
+**Duel 3D captured and located (s537/s538).** The GE trace now also prints the
+model-space extents of every mesh with 100+ vertices. In the duel the board is
+`GE prim 3 x996 vtype 00015F vaddr 09333BEC`: an untextured, alpha-blended
+translucent mesh spanning `(-0.671, 0.048, -0.573)..(0.768, 0.347, 0.335)`, so
+it exists and is sane. Its active matrices are a uniform **10.25** world scale
+with translation `(7.75, -3.433, 10)`, an isometric view rotation
+(about 45° yaw and a shallow pitch, translation
+`(-3.182, 2.858, -10.969)`), and the ortho
+projection `0.266663/0.470581` (exactly **64 px per world unit** for 480x272).
+The mesh is drawn, but `bounds x=-533..556 y=77..862 onscreen=40/996`: the
+field is ~2.3x the screen and mostly below it, and the same transform places
+the visible card at the top-left. Scaling only the world matrix by 0.5 (an
+env-gated diagnostic, reverted) moves the same prim to
+`x=-248..296 y=15..407 onscreen=392/996`; scaling the projection by 0.5 breaks
+the classroom, so the projection is right and the duel's world/view pair is
+what is inconsistent. The null accesses are the particle system (RNG globals
+read at address 0 around `0x03028C28`, `vec3_set` called with `$a0=0` from
+`0x03045FD4`), not the board. The duel's 3D is drawn with the same isometric
+ortho the working field/story scenes use, so the remaining fault is the duel
+engine's scene root/camera pose, not the GE, the textures or the loader.
+
 ## Limitations
 
 - `sceReg` serves only the `/DATA/FONT` and `/SYSPROFILE/RESOLUTION` subtrees

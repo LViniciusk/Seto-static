@@ -331,6 +331,26 @@ static void dump_field_state(const char *tag) {
     fprintf(stderr, "\n");
 }
 
+/* After the auto travel, keep the real Win32 window alive and hand the
+ * field the keyboard directly. This is the computer-use surface: capture,
+ * look, press a key, capture again. */
+static void hold_field_input(void) {
+    fprintf(stderr, "window: holding; arrows/Z/X/C/Enter control the field\n");
+    for (;;) {
+        uint32_t fm = 0;
+        if (GetAsyncKeyState(VK_LEFT) & 0x8000)  fm |= 0x00000080u;
+        if (GetAsyncKeyState(VK_RIGHT) & 0x8000) fm |= 0x00000020u;
+        if (GetAsyncKeyState(VK_UP) & 0x8000)    fm |= 0x00000010u;
+        if (GetAsyncKeyState(VK_DOWN) & 0x8000)  fm |= 0x00000040u;
+        if (GetAsyncKeyState('Z') & 0x8000)      fm |= 0x00004000u;
+        if (GetAsyncKeyState('X') & 0x8000)      fm |= 0x00002000u;
+        if (GetAsyncKeyState('C') & 0x8000)      fm |= 0x00001000u;
+        if (GetAsyncKeyState(VK_RETURN) & 0x8000) fm |= 0x00000008u;
+        psp_ctrl_set(fm, 128, 128);
+        Sleep(10);
+    }
+}
+
 static int screen_black(void) {
     static uint32_t px[480 * 272];
     if (psp_display_read(px) != 0) return 0;
@@ -607,6 +627,21 @@ static DWORD WINAPI field_state_monitor(LPVOID unused) {
 }
 
 static volatile int g_input_done;
+
+/* Passive frame recorder for the headless runs: the input thread is inside the
+ * long classroom/menu loops when the duel starts, so it cannot capture it. */
+static DWORD WINAPI shot_thread(LPVOID unused) {
+    (void)unused;
+    const char *dir = getenv("SETO_SHOT_DIR");
+    if (!dir) return 0;
+    for (int i = 0; !psp_exit_requested(); i++) {
+        char path[160];
+        snprintf(path, sizeof path, "%s/frame-%05d.ppm", dir, i);
+        psp_display_capture(path);
+        Sleep(400);
+    }
+    return 0;
+}
 
 static DWORD WINAPI input_thread(LPVOID unused) {
     (void)unused;
@@ -1113,6 +1148,8 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                                     }
                                                     fprintf(stderr, "pos scan %d\n", n);
                                                 }
+                                                if (getenv("SETO_WATCH_READ"))
+                                                    psp_mem_watch_read(0x08C40DD4u);
                                                 if (getenv("SETO_TRACE_ROOM"))
                                                     psp_ge_trace_next_frame();
                                                 static const uint32_t dirs[4] = {
@@ -1332,6 +1369,8 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                         fprintf(stderr, "input: free roam vb=%llu box=%d state=%u\n",
                                                 (unsigned long long)psp_display_vblanks(),
                                                 box_up(), psp_read32(0x093CDAFCu));
+                                        if (getenv("SETO_HOLD_WINDOW"))
+                                            hold_field_input();
                                         g_input_done = 1;
                                         return 0;
                                     }
@@ -1343,6 +1382,8 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                             }
                             if (menu) {
                                 fprintf(stderr, "input: auto menu path done\n");
+                                if (getenv("SETO_HOLD_WINDOW"))
+                                    hold_field_input();
                                 g_input_done = 1;
                                 return 0;
                             }
@@ -1776,6 +1817,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "window: disabled by SETO_NO_WINDOW\n");
     }
     CreateThread(NULL, 0, input_thread, NULL, 0, NULL);
+    if (getenv("SETO_SHOT_DIR"))
+        CreateThread(NULL, 0, shot_thread, NULL, 0, NULL);
     if (getenv("SETO_TRACE_FIELD"))
         CreateThread(NULL, 0, field_state_monitor, NULL, 0, NULL);
     const char *cap = getenv("SETO_BRINGUP_CAP");
