@@ -1592,6 +1592,19 @@ view-space `(-3.56,-5.24,-1.95)`, i.e. 228 px left and 335 px down of centre,
 and its 10.25 scale makes it ~2.3x the screen. The engine computes that world
 matrix; the renderer, loader, textures and projection are not implicated.
 
+**The duel never sets a camera (s552/s557).** Tracing every mode-2 commit at
+`0x08032360` shows that the world matrices are committed by the EBOOT scene
+renderer, with **no duel-module frame on the call stack** (the title's commits
+chain `0x0803239C -> 0x080331C4 -> 0x08027A24 -> 0x08027F34 -> 0x08028EF0`);
+the duel's nodes go through the same renderer. The only view uploads are the
+eight identical isometric ones (mode 1 at `0x0802E7F4`/`0x0802ED78`), so the
+duel inherits the field's fixed view while its scene nodes are authored for a
+duel camera. The missing piece is the duel scene's camera/override, not the
+node data: the board's `10.25` scale and `(7.75,-3.433,10)` translation are the
+values the renderer receives. The next step is the scene/camera setup in
+`modduel_eng` (the renderer is the EBOOT's, so the camera must come from the
+engine's scene graph).
+
 **Duel 3D captured and located (s537/s538).** The GE trace now also prints the
 model-space extents of every mesh with 100+ vertices. In the duel the board is
 `GE prim 3 x996 vtype 00015F vaddr 09333BEC`: an untextured, alpha-blended
