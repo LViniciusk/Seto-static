@@ -997,6 +997,93 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                             Sleep(100);
                                         } else {
                                             quiet = 0;
+                                            /* The analog walk + CROSS can leave the
+                                             * field command menu open (state 6);
+                                             * select Talk (first entry). */
+                                            if (st == 6u) {
+                                                for (int u = 0; u < 4; u++) {
+                                                    field_press(0x00000010u);
+                                                    Sleep(250);
+                                                }
+                                                auto_press(PSP_CTRL_CROSS);
+                                                Sleep(1200);
+                                                psp_display_capture("build/s531-menu-talk.ppm");
+                                                fprintf(stderr,
+                                                        "input: menu talk state=%u box=%d\n",
+                                                        psp_read32(0x093CDAFCu), box_up());
+                                                if (box_up()) {
+                                                    seen_class_box = 1;
+                                                    quiet = 0;
+                                                }
+                                                Sleep(100);
+                                                continue;
+                                            }
+                                            /* State 23 is the story dialogue after
+                                             * Talk; the s435 logs opened the tutorial
+                                             * with START + CROSS here. */
+                                            if (st == 23u) {
+                                                field_press(PSP_CTRL_START);
+                                                Sleep(1200);
+                                                field_press(PSP_CTRL_CROSS);
+                                                Sleep(1200);
+                                                psp_display_capture("build/s532-start-talk.ppm");
+                                                fprintf(stderr,
+                                                        "input: state23 start-talk state=%u box=%d\n",
+                                                        psp_read32(0x093CDAFCu), box_up());
+                                                if (box_up()) {
+                                                    seen_class_box = 1;
+                                                    quiet = 0;
+                                                }
+                                                Sleep(100);
+                                                continue;
+                                            }
+                                            /* Analog-nub walk: the HLE ctrl read
+                                             * showed ax/ay centered while the D-pad
+                                             * buttons arrived, so drive the nub. */
+                                            if (getenv("SETO_ANALOG_WALK") && st == 1u &&
+                                                k == 30) {
+                                                static const int axs[4] = { 0, 255, 128, 128 };
+                                                static const int ays[4] = { 128, 128, 0, 255 };
+                                                static const char *const anames[4] = {
+                                                    "left", "right", "up", "down" };
+                                                dump_field_state("analog-before");
+                                                for (int d = 0; d < 4; d++) {
+                                                    psp_title_walk(0, axs[d], ays[d]);
+                                                    Sleep(1500);
+                                                    psp_title_walk(0, 128, 128);
+                                                    Sleep(300);
+                                                    char apath[64];
+                                                    snprintf(apath, sizeof apath,
+                                                             "build/s530-%s.ppm", anames[d]);
+                                                    psp_display_capture(apath);
+                                                    if (getenv("SETO_TRACE_ROOM"))
+                                                        psp_ge_trace_next_frame();
+                                                    fprintf(stderr,
+                                                            "analog: %s state=%u box=%d\n",
+                                                            anames[d],
+                                                            psp_read32(0x093CDAFCu),
+                                                            box_up());
+                                                }
+                                                auto_press(PSP_CTRL_CROSS);
+                                                Sleep(800);
+                                                psp_display_capture("build/s530-talk.ppm");
+                                                fprintf(stderr, "analog: talk state=%u box=%d\n",
+                                                        psp_read32(0x093CDAFCu), box_up());
+                                                dump_field_state("analog-talk");
+                                                if (psp_read32(0x093CDAFCu) == 6u) {
+                                                    for (int u = 0; u < 4; u++) {
+                                                        field_press(0x00000010u);
+                                                        Sleep(250);
+                                                    }
+                                                    auto_press(PSP_CTRL_CROSS);
+                                                    Sleep(1200);
+                                                    psp_display_capture("build/s530-talk2.ppm");
+                                                    fprintf(stderr,
+                                                            "analog: talk2 state=%u box=%d\n",
+                                                            psp_read32(0x093CDAFCu),
+                                                            box_up());
+                                                }
+                                            }
                                             /* Pure free-roam probe: advance an invisible
                                              * cutscene, then verify each D-pad direction
                                              * with a frame capture and a GE trace. */

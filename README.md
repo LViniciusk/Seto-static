@@ -1499,6 +1499,18 @@ but the first CROSS was still `box=0`. The LEFT face before the CROSS (s514)
 also leaves `box=0`; the player is next to the red student at the door, which
 is not a talkable target, and the walk does not reach the classroom front.
 
+**Analog walk (s530).** Driving `psp_title_walk(0, ax, ay)` through LEFT,
+RIGHT, UP and DOWN and then CROSS reaches field state **5** (a story beat) and
+the class loop later reports state **6** (the command menu); the D-pad-only
+probe stayed at state 1. The HLE ctrl read still shows `ax/ay=128`, so the
+title-hook analog is not reaching the field; the state change comes from the
+CROSS after the analog block's wait. s531's state-6 handler (four UP, then
+CROSS) logs `menu talk state=6 box=0` repeatedly, then one select reaches
+state **23** (the dialogue) with box=0. s532 adds the s435 START+CROSS handler
+for state 23, but the rerun ended at state 1 (`analog: talk state=1`,
+`classroom done=0`), so the state 5/6/23 transition is timing-dependent rather
+than a fixed input sequence.
+
 **HLE ctrl read (s523).** With `PSPRECOMP_TRACE_CTRL`, the field's own
 `sceCtrlReadBufferPositive` (buffer `09FFFB78`) reports
 `buttons=00000040` during the D-pad press, so the pad is not lost before the
