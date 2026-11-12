@@ -477,9 +477,11 @@ static void try_walk_class(void) {
     psp_display_capture("build/s442-walk-end.ppm");
 }
 
-/* Camera-relative: DOWN alone walks from the door; the s490 probe proved this
- * direction moves in the same after-arrival context. */
+/* Camera-relative: the s504 sequence clears the doorway (RIGHT, UP) before
+ * DOWN; a pure DOWN from the spawn is blocked by the door wall. */
 static void try_walk_down(void) {
+    field_press(0x00000020u);
+    field_press(0x00000010u);
     for (int i = 0; i < 12; i++) {
         field_press(0x00000040u);
         if (i % 3 == 2) {

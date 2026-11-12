@@ -1483,10 +1483,10 @@ word `0x093CDB20` becomes `0x0B` (PDA) and `0x093CDB00` becomes `FFFFFFFF`,
 while `0x093CDAFC` stays 1. The full window `0x093CDAD0..0x093CDB30` is logged
 before and after each test. So the CROSS after a spawn direction opens the
 PDA, not the command menu; the red student at the door is not talkable from
-that position. The pure-DOWN walk in the story block did not move (s507),
-although the same `field_press` moves in the `SETO_WALK_PROBE` block; the
-remaining blocker is that story-block input context, not the D-pad or the
-camera.
+that position. The pure-DOWN (s507) and RIGHT+UP+DOWN (s508) walks in the story
+block did not move, although the same `field_press` moves in the
+`SETO_WALK_PROBE` block; the remaining blocker is that story-block input
+context, not the D-pad or the camera.
 
 **Store assets are EHP, not PRX/PHE.** The three files the Store opens are
 EHP/EhFolder archives (`0x03504845`, `NOT `, 26 entries) and GIM textures, not
