@@ -1499,6 +1499,13 @@ but the first CROSS was still `box=0`. The LEFT face before the CROSS (s514)
 also leaves `box=0`; the player is next to the red student at the door, which
 is not a talkable target, and the walk does not reach the classroom front.
 
+**HLE ctrl read (s523).** With `PSPRECOMP_TRACE_CTRL`, the field's own
+`sceCtrlReadBufferPositive` (buffer `09FFFB78`) reports
+`buttons=00000040` during the D-pad press, so the pad is not lost before the
+field. `ax/ay` stay `128` (analog centered): the world-movement path uses the
+analog nub while the D-pad is the menu/facing input. The player billboard stays
+`5.75/1.75`; the talk/facing trigger remains the blocker.
+
 **s431 baseline not reproduced.** The cda9a1c and b52292b hosts, the older
 `tagforce-vhtfm-check` EBOOT corpus and `SETO_VMMUL_OLD_PLAIN=1` (s519/s521)
 still leave `talk dir=2 box=0`, as do the `auto_press`/`k>20` revert (s515)
