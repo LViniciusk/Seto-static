@@ -987,6 +987,8 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                             if (getenv("SETO_TRACE_ROOM") ||
                                                 getenv("SETO_WATCH_CHAR"))
                                                 psp_ge_trace_next_frame();
+                                            if (getenv("SETO_CAPTURE_DUEL"))
+                                                psp_display_capture("build/duel-fix.ppm");
                                             const char *wf = getenv("SETO_WATCH_FIELD");
                                             if (wf) psp_mem_watch_write((uint32_t)strtoul(wf, NULL, 0));
                                             if (getenv("SETO_FACE_TEST")) {
