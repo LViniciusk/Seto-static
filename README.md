@@ -1605,6 +1605,25 @@ values the renderer receives. The next step is the scene/camera setup in
 `modduel_eng` (the renderer is the EBOOT's, so the camera must come from the
 engine's scene graph).
 
+**The 996 mesh is not the board (PPSSPP reference).** A PPSSPP frame of the
+same duel (Turn 1, SP_GAME vs Gillian) shows the duel field as a **2D layer**:
+a purple starfield background, a flat screen-aligned zone grid, the opponent's
+hand at the top, the player's hand at the bottom and the deck at the right. The
+HUD (LP bars, portraits, the big left card, the DP/SP/MP/BP/EP bar, the red
+life sliver, START Help) matches the recompiled frame exactly. The `x996`
+primitive is therefore **not** the board: the same mesh with the same
+`world 10.25 / (7.75,-3.433,10)` appears in a traced **classroom** frame
+(`SETO_CAPTURE_DUEL` at "arrived room" captured the classroom, s560), where the
+scene renders correctly, so it is a shared 3D effect drawn behind the camera.
+The missing duel content is the 2D field layer, not a 3D transform.
+
+**Clear-bit experiment (s559, reverted).** The renderer treated the GE `CLEAR`
+bit as a per-primitive colour-only mode, so textured full-screen quads with the
+bit set were painted solid. Changing it to keep the clear path only for
+untextured fills (`render.c`) left the classroom correct but the captured run
+never reached the duel, so the change was reverted untested rather than shipped
+as a fix. The field layer must be checked against that path on a duel capture.
+
 **Which module owns the camera (s552).** The libehsys matrix API exports are
 `0x5B05F797` (commit current matrix, `0x080326FC`) and `0xD697947E` (view
 builder, `0x0801850C`). `modfield` imports **both**; `modduel_eng` imports
