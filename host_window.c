@@ -177,6 +177,7 @@ static DWORD WINAPI window_thread(LPVOID unused) {
     }
 
     ShowWindow(g_hwnd, SW_SHOW);
+    ShowWindow(g_hwnd, SW_SHOWNORMAL);
     UpdateWindow(g_hwnd);
     SetForegroundWindow(g_hwnd);
     SetEvent(g_ready);

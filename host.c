@@ -643,6 +643,52 @@ static DWORD WINAPI shot_thread(LPVOID unused) {
     return 0;
 }
 
+/* Headless duel detector: the duel HUD is the only screen with the blue LP
+ * bar at (216,10), the red bar at (403,10) and a black field at (236,187).
+ * On that signature, trace the next GE lists and capture the frame. */
+static DWORD WINAPI duel_detect_thread(LPVOID unused) {
+    (void)unused;
+    static uint32_t px[480 * 272];
+    for (int i = 0; !psp_exit_requested(); i++) {
+        if (psp_display_read(px) == 0) {
+            const uint32_t lb = px[10 * 480 + 216];
+            const uint32_t rb = px[10 * 480 + 403];
+            const uint32_t f = px[187 * 480 + 236];
+            const int blue = (int)(lb & 0xFF) < 100 && (int)((lb >> 16) & 0xFF) > 140;
+            const int red = (int)(rb & 0xFF) > 140 && (int)((rb >> 8) & 0xFF) < 100 &&
+                            (int)((rb >> 16) & 0xFF) < 100;
+            const int dark = (int)(f & 0xFF) + (int)((f >> 8) & 0xFF) +
+                             (int)((f >> 16) & 0xFF) < 30;
+            if (blue && red) {
+                fprintf(stderr, "duel: HUD signature at vb %llu\n",
+                        (unsigned long long)psp_display_vblanks());
+                /* The user sees a transition asset mid-screen that disappears
+                 * as the battle settles; grab the first second. */
+                for (int k = 0; k < 12; k++) {
+                    char path[64];
+                    snprintf(path, sizeof path, "build/duel-live-%02d.ppm", k);
+                    psp_display_capture(path);
+                    Sleep(80);
+                }
+                psp_ge_trace_next_frame();
+                Sleep(80);
+                psp_display_capture("build/duel-live.ppm");
+                for (int s = 0; s < 180 && !psp_exit_requested(); s++) {
+                    Sleep(1000);
+                    char spath[64];
+                    snprintf(spath, sizeof spath, "build/duel-settled-%03d.ppm", s);
+                    psp_display_capture(spath);
+                    if (s == 3 || s == 10 || s == 25 || s == 60)
+                        psp_ge_trace_next_frame();
+                }
+                return 0;
+            }
+        }
+        Sleep(40);
+    }
+    return 0;
+}
+
 static DWORD WINAPI input_thread(LPVOID unused) {
     (void)unused;
     const char *auto_start = getenv("SETO_AUTO_START");
@@ -655,6 +701,12 @@ static DWORD WINAPI input_thread(LPVOID unused) {
     int duel_traces = 0;
     DWORD duel_last = 0;
     const int trace_duel = getenv("SETO_TRACE_DUEL") != NULL;
+    /* Full manual: no auto travel, the window keyboard drives the game from
+     * the title. The hold loop maps arrows/Z/X/C/Enter to the pad. */
+    if (getenv("SETO_MANUAL") && getenv("SETO_HOLD_WINDOW")) {
+        hold_field_input();
+        return 0;
+    }
     while (!psp_exit_requested()) {
         if (trace_duel && psp_duel_manager_start_requested()) {
             const DWORD now = GetTickCount();
@@ -859,7 +911,7 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                 Sleep(100);
                             fprintf(stderr, "input: auto story advance field=%d\n",
                                     psp_field_started());
-                            for (int i = 0; i < 100 && !box_up(); i++)
+                            for (int i = 0; i < 200 && !box_up(); i++)
                                 Sleep(100);
                             int guard = 0;
                             for (; guard < 300 && box_up(); guard++) {
@@ -889,7 +941,7 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                     }
                                     psp_title_walk(0, 255, 255);
                                     psp_ctrl_set(0, 255, 255);
-                                    Sleep(2800);
+                                    Sleep(900);
                                     psp_title_walk(0, 128, 128);
                                     psp_ctrl_set(0, 128, 128);
                                     Sleep(800);
@@ -963,6 +1015,8 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                     auto_press(0x00004000u);
                                     for (int t = 0; t < 40 &&
                                             psp_read32(0x093CDAFCu) == 0u; t++) {
+                                        if ((t == 2 || t == 5) && map_list_row() == target_row)
+                                            auto_press(0x00004000u);
                                         if (t % 10 == 9) {
                                             char path[48];
                                             snprintf(path, sizeof path,
@@ -1821,6 +1875,8 @@ int main(int argc, char **argv) {
     CreateThread(NULL, 0, input_thread, NULL, 0, NULL);
     if (getenv("SETO_SHOT_DIR"))
         CreateThread(NULL, 0, shot_thread, NULL, 0, NULL);
+    if (getenv("SETO_DUEL_DETECT"))
+        CreateThread(NULL, 0, duel_detect_thread, NULL, 0, NULL);
     if (getenv("SETO_TRACE_FIELD"))
         CreateThread(NULL, 0, field_state_monitor, NULL, 0, NULL);
     const char *cap = getenv("SETO_BRINGUP_CAP");

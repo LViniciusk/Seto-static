@@ -1667,6 +1667,27 @@ read at address 0 around `0x03028C28`, `vec3_set` called with `$a0=0` from
 ortho the working field/story scenes use, so the remaining fault is the duel
 engine's scene root/camera pose, not the GE, the textures or the loader.
 
+**Duel scene fixed (2026-11-12, s566).** Three runtime faults held the duel
+back, all in the host HLE:
+- `src/hle/ge.c` now implements **bone matrices** (`0x2A/0x2B`), **GE
+  signal/finish callbacks** and **stencil**; the characters' rotation and the
+  field composition render.
+- **16-bit GE colours are ABGR**, not RGB. `psp_color_expand` read them as RGB,
+  swapping red and blue: 16-bit CLUT card faces came out blue. The DXT1 test
+  had encoded the same swap and was corrected.
+- The **PSP has 4 MB of eDRAM**, not 2 MB (`PSP_VRAM_SIZE`). The second 2 MB
+  holds the duel's later textures (opponent hand backs, character models);
+  with the old 2 MB window those reads returned zero.
+Evidence: `build/duel-settled-136.png` (tutorial duel field: starfield, zone
+grid, both hands, deck, HUD) and the PPSSPP reference frame; CTest 21/21.
+Host additions: `SETO_MANUAL` (full manual from the title), the duel-HUD
+detector and the passive BitBlt recorder. The psprecomp change is captured as
+`patches/psprecomp-5ca18fa-s10-duel-scene-full.patch`, a **cumulative** diff
+against the pinned `5ca18fa` (apply to a clean clone instead of the older
+individual patches).
+Not yet verified after the 4 MB change: the real duel's opponent cut-in
+transition and the opponent hand showing faces instead of backs.
+
 ## Limitations
 
 - `sceReg` serves only the `/DATA/FONT` and `/SYSPROFILE/RESOLUTION` subtrees
