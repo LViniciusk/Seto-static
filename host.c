@@ -41,6 +41,9 @@ void psp_deck_prepare(const char *path, uint32_t eboot_info);
 #ifdef HAVE_DECKTUT_CORPUS
 int  psp_decktut_image_load(const char *path, uint32_t eboot_info);
 #endif
+#if defined(HAVE_CHARALIST_CORPUS) || defined(HAVE_SHOP_CORPUS)
+int  psp_store_images_load(const char *charalist_path, const char *shop_path, uint32_t eboot_info);
+#endif
 #ifdef HAVE_DUEL_CORPUS
 int  psp_duel_images_load(const char *const *paths, uint32_t eboot_info);
 int  psp_duel_manager_start_requested(void);
@@ -253,6 +256,25 @@ static int menu_panel(void) {
 }
 
 /* Row of the orange highlight in the destination list, or -1. */
+/* Row of the orange highlight in the 5-item command menu (Talk=0, Duel=1,
+ * Item=2, PDA=3, Map=4; 19 px pitch starting at y=40). */
+static int cmd_menu_row(void) {
+    static uint32_t px[480 * 272];
+    if (psp_display_read(px) != 0) return -1;
+    int first = -1, last = -1;
+    for (int y = 38; y < 142; y++) {
+        const uint32_t c = px[y * 480 + 15];
+        const int r = (int)(c & 0xFF), g = (int)((c >> 8) & 0xFF),
+                  b = (int)((c >> 16) & 0xFF);
+        if (r > 235 && g > 130 && g < 205 && b < 125) {
+            if (first < 0) first = y;
+            last = y;
+        }
+    }
+    if (first < 0) return -1;
+    return ((first + last) / 2 - 40) / 19;
+}
+
 static int menu_row(void) {
     static uint32_t px[480 * 272];
     if (psp_display_read(px) != 0) return -1;
@@ -391,6 +413,31 @@ static int title_confirm_yes(void) {
     psp_title_menu_request(0);
     psp_ctrl_set(0, 128, 128);
     return psp_title_confirm_state() != 3;
+}
+
+/* The "Data loaded." [OK] window is the same message window object as the
+ * name dialog, but it has a single button, so the YES/NO classifier in
+ * title_confirm_yes() cannot accept it. Feed both the title-menu edge and the
+ * digital pad and wait for the window state to leave 2. */
+static int title_confirm_ok(void) {
+    /* The window's confirm byte stays 2 even after it accepts the [OK]; the
+     * scene state/phase is what actually moves. Watch that, and repeat the
+     * press because the first edge can land while the load is still drawing. */
+    const int s0 = psp_title_scene_state(), p0 = psp_title_scene_phase();
+    for (int attempt = 0; attempt < 8; attempt++) {
+        if (psp_title_scene_state() != s0 || psp_title_scene_phase() != p0) return 1;
+        psp_title_menu_request(PSP_CTRL_CROSS);
+        psp_title_pad_request(PSP_CTRL_CROSS);
+        psp_ctrl_set(PSP_CTRL_CROSS, 128, 128);
+        Sleep(300);
+        psp_title_menu_request(0);
+        psp_ctrl_set(0, 128, 128);
+        for (int i = 0; i < 25; i++) {
+            if (psp_title_scene_state() != s0 || psp_title_scene_phase() != p0) return 1;
+            Sleep(20);
+        }
+    }
+    return 0;
 }
 
 static void try_talk_aluno(void) {
@@ -540,6 +587,111 @@ static int title_press_until_change(uint32_t mask) {
     return 0;
 }
 
+static void ensure_field_free_roam(void) {
+    for (int i = 0; i < 16 && !psp_duel_manager_start_requested(); i++) {
+        uint32_t st = psp_read32(0x093CDAFCu);
+        if (st == 1u && !box_up()) break;
+        if (st == 6u) {
+            auto_press(PSP_CTRL_CIRCLE);
+            Sleep(250);
+        } else {
+            auto_press(PSP_CTRL_CROSS);
+            Sleep(250);
+        }
+    }
+}
+
+static int try_talk_here(void) {
+    if (psp_duel_manager_start_requested()) return 1;
+    ensure_field_free_roam();
+    if (psp_duel_manager_start_requested()) return 1;
+    if (psp_read32(0x093CDAFCu) != 1u) return 0;
+    auto_press(PSP_CTRL_CROSS);
+    Sleep(400);
+    if (psp_duel_manager_start_requested()) return 1;
+    if (psp_read32(0x093CDAFCu) == 6u) {
+        int r = cmd_menu_row();
+        for (int u = 0; u < 5 && r > 0; u++) {
+            auto_press(PSP_CTRL_UP);
+            Sleep(200);
+            r = cmd_menu_row();
+        }
+        if (r == 0) {
+            auto_press(PSP_CTRL_CROSS);
+            Sleep(500);
+        } else {
+            ensure_field_free_roam();
+            return 0;
+        }
+    }
+    if (box_up() || psp_read32(0x093CDAFCu) == 23u || psp_read32(0x093CDAFCu) == 10u) {
+        fprintf(stderr, "input: class_sweep talking state=%u\n", psp_read32(0x093CDAFCu));
+        for (int t = 0; t < 80 && !psp_duel_manager_start_requested(); t++) {
+            uint32_t st = psp_read32(0x093CDAFCu);
+            if (st == 1u && !box_up()) break;
+            if (st == 6u) {
+                ensure_field_free_roam();
+                break;
+            }
+            auto_press(PSP_CTRL_CROSS);
+            Sleep(300);
+        }
+        fprintf(stderr, "input: class_sweep talk done state=%u duel=%d\n",
+                psp_read32(0x093CDAFCu), psp_duel_manager_start_requested());
+    }
+    ensure_field_free_roam();
+    return psp_duel_manager_start_requested();
+}
+
+static void analog_walk_ms(int ax, int ay, int ms) {
+    ensure_field_free_roam();
+    if (psp_read32(0x093CDAFCu) != 1u) return;
+    psp_title_walk(0, ax, ay);
+    psp_ctrl_set(0, (uint8_t)ax, (uint8_t)ay);
+    Sleep((DWORD)ms);
+    psp_title_walk(0, 128, 128);
+    psp_ctrl_set(0, 128, 128);
+    Sleep(100);
+}
+
+static void class_sweep_and_talk(void) {
+    /* Classroom spawn sits right inside the hallway doorway with Crowler
+     * blocking down-left; clear Crowler by stepping down-right/down first, then
+     * sweep the desk aisles across the room while closing any stale state=6
+     * menu before each walk step. */
+    static const struct { int ax, ay, chunks, talk; } legs[] = {
+        { 175, 255, 3, 0 }, /* step down-right past Crowler out of doorway */
+        { 255, 220, 2, 0 }, /* clear into open front aisle */
+        {   0, 140, 7, 1 }, /* sweep left across upper desk aisle */
+        {  60, 240, 4, 1 }, /* down-left to middle aisle */
+        { 255, 110, 8, 1 }, /* sweep right across middle desk aisle */
+        { 160, 255, 4, 1 }, /* down-right to lower aisle */
+        {   0, 140, 8, 1 }, /* sweep left across lower desk aisle */
+        { 200,  20, 4, 1 }, /* up-right along desks */
+        { 255, 160, 7, 1 }, /* sweep back right */
+        {  40, 220, 4, 1 }, /* bottom-left desks */
+        { 220,  40, 6, 1 }, /* back up-right toward Crowler */
+        { 128,   0, 3, 1 }, /* step up into doorway near Crowler */
+    };
+    psp_display_capture("build/class-sweep-0.ppm");
+    fprintf(stderr, "input: class_sweep start state=%u\n", psp_read32(0x093CDAFCu));
+    ensure_field_free_roam();
+    for (int l = 0; l < (int)(sizeof(legs) / sizeof(legs[0])) &&
+                    !psp_duel_manager_start_requested(); l++) {
+        for (int s = 0; s < legs[l].chunks && !psp_duel_manager_start_requested(); s++) {
+            analog_walk_ms(legs[l].ax, legs[l].ay, 350);
+            if (legs[l].talk && try_talk_here()) return;
+        }
+        char cap[64];
+        snprintf(cap, sizeof cap, "build/class-sweep-leg-%d.ppm", l);
+        psp_display_capture(cap);
+        if (l == 4) psp_display_capture("build/class-sweep-mid.ppm");
+    }
+    psp_display_capture("build/class-sweep-end.ppm");
+    fprintf(stderr, "input: class_sweep finished state=%u duel=%d\n",
+            psp_read32(0x093CDAFCu), psp_duel_manager_start_requested());
+}
+
 /* Row of the orange highlight on the main menu (Story Mode starts at y 63,
  * one row per 25 px). The main menu does not read the normal pad path, so
  * the caller drives psp_title_menu_request and checks this after each hold. */
@@ -547,13 +699,13 @@ static int main_menu_row(void) {
     static uint32_t px[480 * 272];
     if (psp_display_read(px) != 0) return -1;
     int y0 = -1, y1 = -1;
-    for (int y = 40; y < 180; y++) {
+    for (int y = 40; y < 240; y++) {
         int c = 0;
         for (int x = 140; x < 372; x++) {
             const uint32_t v = px[y * 480 + x];
             const int r = (int)(v & 0xFF), g = (int)((v >> 8) & 0xFF),
                       b = (int)((v >> 16) & 0xFF);
-            if (r > 230 && g > 120 && g < 200 && b < 60) c++;
+            if (r > 195 && g > 85 && g < 165 && b < 70) c++;
         }
         if (c > 80) { if (y0 < 0) y0 = y; y1 = y; }
     }
@@ -569,16 +721,16 @@ static int map_list_row(void) {
     int y0 = -1, y1 = -1;
     for (int y = 45; y < 180; y++) {
         int c = 0;
-        for (int x = 5; x < 150; x++) {
+        for (int x = 70; x < 155; x++) {
             const uint32_t v = px[y * 480 + x];
             const int r = (int)(v & 0xFF), g = (int)((v >> 8) & 0xFF),
                       b = (int)((v >> 16) & 0xFF);
-            if (r > 230 && g > 120 && g < 200 && b < 60) c++;
+            if (r > 220 && g > 140 && g < 200 && b < 110) c++;
         }
-        if (c > 40) { if (y0 < 0) y0 = y; y1 = y; }
+        if (c > 60) { if (y0 < 0) y0 = y; y1 = y; }
     }
     if (y0 < 0) return -1;
-    const int row = ((y0 + y1) / 2 - 68 + 11) / 22;
+    const int row = ((y0 + y1) / 2 - 54 + 12) / 24;
     return row < 0 ? 0 : row > 4 ? 4 : row;
 }
 
@@ -610,6 +762,61 @@ static void auto_menu(uint32_t mask, int by_cursor) {
 /* Read the field state machine word (0x093CDAFC, inside modfield's .bss) and
  * log every change. Headless runs otherwise only see pixels; this names the
  * state the field script is in. */
+#ifdef HAVE_TITLE_CORPUS
+static void enter_free_duel(void) {
+    int row = -1;
+    for (int w = 0; w < 80 && row < 0; w++) {
+        Sleep(100);
+        if (psp_title_scene_state() == 3) row = main_menu_row();
+    }
+    fprintf(stderr, "input: free menu row=%d\n", row);
+    for (int i = 0; i < 10 && row >= 0 && row != 1; i++) {
+        auto_press(row < 1 ? PSP_CTRL_DOWN : PSP_CTRL_UP);
+        Sleep(250);
+        row = main_menu_row();
+        fprintf(stderr, "input: free menu row=%d\n", row);
+    }
+    psp_display_capture("build/s93-free-menu.ppm");
+    if (row != 1) {
+        fprintf(stderr, "input: free duel unavailable (row=%d)\n", row);
+        return;
+    }
+    for (int i = 0; i < 3 && psp_title_scene_state() == 3; i++)
+        auto_menu(PSP_CTRL_CROSS, 0);
+    for (int i = 0; i < 15; i++) {
+        Sleep(1000);
+        if (i == 5 || i == 10 || i == 14) {
+            char path[64];
+            snprintf(path, sizeof path, "build/s93-duel%d.ppm", i);
+            psp_display_capture(path);
+        }
+    }
+    fprintf(stderr, "input: free duel state=%d phase=%d\n",
+            psp_title_scene_state(), psp_title_scene_phase());
+    if (getenv("SETO_FREE_DUEL_PLAY")) {
+        for (int i = 0; i < 20 && !psp_duel_manager_start_requested(); i++) {
+            auto_press(PSP_CTRL_CROSS);
+            Sleep(1200);
+            if (i == 4 || i == 9 || i == 14 || i == 19) {
+                char path[64];
+                snprintf(path, sizeof path, "build/s93-free-play%d.ppm", i);
+                psp_display_capture(path);
+            }
+        }
+        fprintf(stderr, "input: free duel play start=%d\n",
+                psp_duel_manager_start_requested());
+        if (psp_duel_manager_start_requested()) {
+            for (int i = 0; i < 6; i++) {
+                Sleep(3000);
+                char path[64];
+                snprintf(path, sizeof path, "build/s93-free-live%d.ppm", i);
+                psp_display_capture(path);
+            }
+        }
+    }
+}
+#endif
+
 static DWORD WINAPI field_state_monitor(LPVOID unused) {
     (void)unused;
     uint32_t last = 0xFFFFFFFFu;
@@ -739,6 +946,144 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                     if (psp_title_scene3()) {
                         fprintf(stderr, "input: auto scene3 cursor=%d state=%d\n",
                                 psp_title_scene_cursor(), psp_title_scene_state());
+                        if (getenv("SETO_CONTINUE")) {
+                            psp_display_capture("build/s92-continue-menu.ppm");
+                            for (int t = 0; t < 4 && psp_title_scene_cursor() != 1; t++)
+                                auto_menu(PSP_CTRL_DOWN, 1);
+                            auto_menu(PSP_CTRL_CROSS, 0);
+                            fprintf(stderr, "input: continue CROSS state=%d phase=%d cursor=%d\n",
+                                    psp_title_scene_state(), psp_title_scene_phase(),
+                                    psp_title_scene_cursor());
+                            int prev_s = psp_title_scene_state(), prev_p = psp_title_scene_phase(), ok_sent = 0;
+                            for (int i = 0; i < 150 && !psp_story_started(); i++) {
+                                Sleep(100);
+                                int s = psp_title_scene_state(), p = psp_title_scene_phase();
+                                if (s != prev_s || p != prev_p) {
+                                    fprintf(stderr, "input: continue state %d->%d phase %d->%d\n",
+                                            prev_s, s, prev_p, p);
+                                    prev_s = s; prev_p = p;
+                                }
+                                if (s == 4 && p == 3 && !ok_sent) {
+                                    ok_sent = 1;
+                                    Sleep(400);
+                                    psp_display_capture("build/s92-continue-after.ppm");
+                                    title_confirm_ok();
+                                    fprintf(stderr, "input: continue OK pressed state=%d phase=%d confirm=%d\n",
+                                            psp_title_scene_state(), psp_title_scene_phase(),
+                                            psp_title_confirm_state());
+                                } else if (ok_sent && s == 3 && p == 0) {
+                                    Sleep(400);
+                                    break;
+                                }
+                            }
+                            psp_display_capture("build/s92-continue-main.ppm");
+                            fprintf(stderr, "input: continue settled state=%d phase=%d cursor=%d story=%d row=%d\n",
+                                    psp_title_scene_state(), psp_title_scene_phase(),
+                                    psp_title_scene_cursor(), psp_story_started(),
+                                    main_menu_row());
+                            if (getenv("SETO_SAVE_TEST") && psp_title_scene_state() == 3) {
+                                /* The menu fades in after the load; pressing before
+                                 * it is drawn selects whatever row happens to be
+                                 * highlighted and derails the test. */
+                                int row = -1;
+                                for (int w = 0; w < 80 && row < 0; w++) {
+                                    Sleep(100);
+                                    if (psp_title_scene_state() == 3)
+                                        row = main_menu_row();
+                                }
+                                fprintf(stderr, "input: save_test start row=%d\n", row);
+                                for (int i = 0; i < 12 && row != 6; i++) {
+                                    if (row < 0) break;
+                                    /* menu_hold() relies on the title vblank hook
+                                     * toggling g_menu_on; an 8 ms window can miss
+                                     * the release and leave the pad held, so the
+                                     * list runs to the last row and stops. The
+                                     * one-frame pad request always releases. */
+                                    auto_press(row < 6 ? PSP_CTRL_DOWN : PSP_CTRL_UP);
+                                    row = main_menu_row();
+                                    fprintf(stderr, "input: save_test row=%d\n", row);
+                                }
+                                psp_display_capture("build/s92-save-menu.ppm");
+                                auto_menu(PSP_CTRL_CROSS, 0);
+                                int sp = psp_title_scene_phase(), ss = psp_title_scene_state();
+                                int yes_sent = 0, ok2_sent = 0, p20 = 0;
+                                for (int i = 0; i < 300; i++) {
+                                    Sleep(100);
+                                    int s = psp_title_scene_state(), p = psp_title_scene_phase();
+                                    if (s != ss || p != sp) {
+                                        fprintf(stderr, "input: save_test state %d->%d phase %d->%d\n", ss, s, sp, p);
+                                        ss = s; sp = p;
+                                    }
+                                    if (s == 4 && p == 20) {
+                                        /* Save Data menu: walk the entry list with a
+                                         * periodic CROSS until the confirm appears. */
+                                        if (++p20 % 15 == 0) auto_press(PSP_CTRL_CROSS);
+                                    } else if (s == 4 && p == 2 && !yes_sent) {
+                                        yes_sent = 1;
+                                        Sleep(400);
+                                        psp_display_capture("build/s92-save-prompt.ppm");
+                                        auto_press(PSP_CTRL_LEFT);
+                                        Sleep(250);
+                                        title_confirm_yes();
+                                    } else if (yes_sent && s == 4 && p == 3 && !ok2_sent) {
+                                        ok2_sent = 1;
+                                        Sleep(400);
+                                        psp_display_capture("build/s92-save-done.ppm");
+                                        title_confirm_ok();
+                                    } else if (ok2_sent && s == 3 && p == 0) {
+                                        Sleep(300);
+                                        break;
+                                    }
+                                }
+                                fprintf(stderr, "input: save_test end state=%d phase=%d row=%d\n",
+                                        psp_title_scene_state(), psp_title_scene_phase(), main_menu_row());
+                                g_input_done = 1;
+                                return 0;
+                            }
+                            if (!getenv("SETO_CONTINUE_STORY")) {
+                                if (getenv("SETO_FREE_DUEL") && psp_title_scene_state() == 3)
+                                    enter_free_duel();
+                                g_input_done = 1;
+                                return 0;
+                            }
+                            if (psp_title_scene_state() == 3) {
+                                int row = -1;
+                                for (int w = 0; w < 80 && row < 0; w++) {
+                                    Sleep(100);
+                                    if (psp_title_scene_state() == 3)
+                                        row = main_menu_row();
+                                }
+                                for (int i = 0; i < 10 && row > 0; i++) {
+                                    auto_press(PSP_CTRL_UP);
+                                    row = main_menu_row();
+                                }
+                                fprintf(stderr, "input: continue_story menu row=%d\n", row);
+                                auto_menu(PSP_CTRL_CROSS, 0);
+                            }
+                            int part_up = 0;
+                            for (int i = 0; i < 200 && !psp_story_started(); i++) {
+                                const int ts = psp_title_scene_state();
+                                if (ts == 2 && !part_up) {
+                                    Sleep(250);
+                                    auto_press(PSP_CTRL_UP); /* From Last Continue */
+                                    Sleep(150);
+                                    part_up = 1;
+                                }
+                                if (ts == 2 || ts == 4)
+                                    auto_press(PSP_CTRL_CROSS);
+                                Sleep(100);
+                            }
+                            psp_display_capture("build/s92-continue-story.ppm");
+                            fprintf(stderr, "input: continue story=%d state=%d phase=%d\n",
+                                    psp_story_started(), psp_title_scene_state(),
+                                    psp_title_scene_phase());
+                            if (!getenv("SETO_CLASS_SWEEP") && !getenv("SETO_DUEL") &&
+                                !getenv("SETO_TRAVEL_STORE")) {
+                                g_input_done = 1;
+                                return 0;
+                            }
+                            if (psp_story_started()) goto story_started;
+                        }
                         for (int t = 0; t < 4 && psp_title_scene_cursor() != 0; t++)
                             auto_menu(PSP_CTRL_UP, 1);
                         if (psp_title_scene_cursor() != 0) {
@@ -870,29 +1215,7 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                             fprintf(stderr, "input: auto main menu cursor=%d\n",
                                     psp_title_scene_cursor());
                             if (getenv("SETO_FREE_DUEL")) {
-                                int row = main_menu_row();
-                                fprintf(stderr, "input: free menu row=%d\n", row);
-                                for (int i = 0; i < 12 && row != 1; i++) {
-                                    if (row < 0) break;
-                                    menu_hold(row < 1 ? PSP_CTRL_DOWN : PSP_CTRL_UP,
-                                              8 + (i % 3) * 6);
-                                    row = main_menu_row();
-                                    fprintf(stderr, "input: free menu row=%d\n", row);
-                                }
-                                psp_display_capture("build/s93-free-menu.ppm");
-                                for (int i = 0; i < 3 &&
-                                                psp_title_scene_state() == 3; i++)
-                                    menu_hold(PSP_CTRL_CROSS, 8);
-                                for (int i = 0; i < 15; i++) {
-                                    Sleep(1000);
-                                    if (i == 5 || i == 10) {
-                                        char path[64];
-                                        snprintf(path, sizeof path, "build/s93-duel%d.ppm", i);
-                                        psp_display_capture(path);
-                                    }
-                                }
-                                fprintf(stderr, "input: auto duel state=%d phase=%d\n",
-                                        psp_title_scene_state(), psp_title_scene_phase());
+                                enter_free_duel();
                             } else {
                             auto_press(0x00004000u);
                             for (int i = 0; i < 40 && !psp_story_started(); i++) {
@@ -906,6 +1229,9 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                         }
                         if (psp_display_capture("build/s92-name.ppm") == 0)
                             fprintf(stderr, "capture: build/s92-name.ppm\n");
+story_started:
+                        for (int w = 0; w < 60 && !psp_story_started() && !psp_field_started(); w++)
+                            Sleep(100);
                         if (psp_story_started()) {
                             for (int i = 0; i < 200 && !psp_field_started(); i++)
                                 Sleep(100);
@@ -920,6 +1246,22 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                             }
                             fprintf(stderr, "input: auto advance guard=%d box=%d\n",
                                     guard, box_up());
+                            if (getenv("SETO_CONTINUE") && getenv("SETO_TRAVEL_STORE") &&
+                                psp_read32(0x093CDAFCu) == 0u) {
+                                Sleep(500);
+                                for (int step = 0; step < 6 && map_list_row() < 0; step++) {
+                                    psp_title_walk(PSP_CTRL_RIGHT | PSP_CTRL_UP, 215, 65);
+                                    Sleep(400);
+                                    psp_title_walk(0, 128, 128);
+                                    Sleep(250);
+                                    psp_display_capture("build/s93-map-move.ppm");
+                                    auto_press(PSP_CTRL_CROSS);
+                                    Sleep(900);
+                                }
+                                if (map_list_row() >= 0) {
+                                    goto map_list_open;
+                                }
+                            }
                             /* The command menu opens after an analog
                              * down-right walk (255,255) followed by CROSS. */
                             int menu = 0, seen_script = 0;
@@ -973,7 +1315,7 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                         Sleep(1500);
                                     }
                                     psp_display_capture("build/s93-map.ppm");
-                                    field_press(0x00004000u);
+                                    auto_press(0x00004000u);
                                     Sleep(4000);
                                     psp_display_capture("build/s93-exit-yes.ppm");
                                     /* Confirm the highlighted destination on
@@ -985,25 +1327,25 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                      * blind CROSS on the map travels somewhere
                                      * else. Row 0 is Main Gate, so one DOWN is
                                      * Classroom. */
-                                    Sleep(5000);
+                                    Sleep(4000);
+                                    for (int w = 0; w < 30 && screen_black(); w++) Sleep(500);
+                                    Sleep(800);
                                     psp_display_capture("build/s93-map-world.ppm");
                                     fprintf(stderr, "input: travel map state=%u\n",
                                             psp_read32(0x093CDAFCu));
                                     if (getenv("SETO_TRACE_FIELD")) psp_ge_trace_next_frame();
-                                    /* The destination list is drawn over the
-                                     * last field frame while the field unloads.
-                                     * Row 0 is Main Gate, so one DOWN picks
-                                     * Classroom; then CROSS confirms. A travel
-                                     * takes about twenty seconds to reload. */
-                                    Sleep(2000);
                                     psp_display_capture("build/s93-map-list.ppm");
-                                    /* CROSS first: the prompt/fade has to clear
-                                     * before the list takes the D-pad. */
-                                    auto_press(0x00004000u);
-                                    Sleep(900);
+                                    for (int wait_row = 0; wait_row < 24 && map_list_row() < 0; wait_row++) {
+                                        if (!screen_black()) auto_press(0x00004000u);
+                                        Sleep(800);
+                                        for (int w = 0; w < 20 && screen_black(); w++) Sleep(500);
+                                    }
+map_list_open:
                                     const int target_row = getenv("SETO_TRAVEL_STORE") ? 2 : 1;
-                                    auto_press(0x00000040u);
-                                    Sleep(900);
+                                    if (map_list_row() >= 0 && map_list_row() != target_row) {
+                                        auto_press(map_list_row() < target_row ? 0x00000040u : 0x00000010u);
+                                        Sleep(900);
+                                    }
                                     for (int i = 0; i < 6; i++) {
                                         const int row = map_list_row();
                                         if (row < 0 || row == target_row) break;
@@ -1013,8 +1355,10 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                     }
                                     psp_display_capture("build/s93-map-class.ppm");
                                     auto_press(0x00004000u);
-                                    for (int t = 0; t < 40 &&
-                                            psp_read32(0x093CDAFCu) == 0u; t++) {
+                                    Sleep(1500);
+                                    for (int t = 0; t < 60 &&
+                                            (psp_read32(0x093CDAFCu) == 0u ||
+                                             map_list_row() >= 0 || screen_black()); t++) {
                                         if ((t == 2 || t == 5) && map_list_row() == target_row)
                                             auto_press(0x00004000u);
                                         if (t % 10 == 9) {
@@ -1083,7 +1427,7 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                                          "build/s93-class%d.ppm", k + 1);
                                                 psp_display_capture(path);
                                             }
-                                        } else if (seen_class_box && st == 1u) {
+                                        } else if ((seen_class_box || getenv("SETO_DUEL")) && st == 1u) {
                                             if (++quiet >= 30) class_done = 1;
                                             Sleep(100);
                                         } else {
@@ -1140,8 +1484,10 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                                 dump_field_state("analog-before");
                                                 for (int d = 0; d < 4; d++) {
                                                     psp_title_walk(0, axs[d], ays[d]);
+                                                    psp_ctrl_set(0, (uint8_t)axs[d], (uint8_t)ays[d]);
                                                     Sleep(1500);
                                                     psp_title_walk(0, 128, 128);
+                                                    psp_ctrl_set(0, 128, 128);
                                                     Sleep(300);
                                                     char apath[64];
                                                     snprintf(apath, sizeof apath,
@@ -1298,6 +1644,33 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                                     }
                                                 }
                                             }
+                                            if (getenv("SETO_TRAVEL_STORE") && !talk_done &&
+                                                st == 1u && k > 10) {
+                                                talk_done = 1;
+                                                psp_title_walk(0, 128, 0);
+                                                psp_ctrl_set(0, 128, 0);
+                                                Sleep(2200);
+                                                psp_title_walk(0, 128, 128);
+                                                psp_ctrl_set(0, 128, 128);
+                                                Sleep(400);
+                                                auto_press(PSP_CTRL_CROSS);
+                                                Sleep(1200);
+                                                psp_display_capture("build/s93-store-talk.ppm");
+                                                fprintf(stderr, "input: store talk state=%u box=%d\n",
+                                                        psp_read32(0x093CDAFCu), box_up());
+                                                for (int s = 0; s < 10; s++) {
+                                                    if (box_up()) auto_press(PSP_CTRL_CROSS);
+                                                    Sleep(1500);
+                                                    if (s == 2 || s == 5 || s == 9) {
+                                                        char spath[64];
+                                                        snprintf(spath, sizeof spath,
+                                                                 "build/s93-store-ui%d.ppm", s);
+                                                        psp_display_capture(spath);
+                                                    }
+                                                }
+                                                fprintf(stderr, "input: store ui done state=%u box=%d\n",
+                                                        psp_read32(0x093CDAFCu), box_up());
+                                            }
                                             if (getenv("SETO_TALK_ALUNO") && !talk_done &&
                                                 st == 1u && k > 20) {
                                                 talk_done = 1;
@@ -1344,6 +1717,10 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                             }
                                             psp_display_capture("build/s440-pda-end.ppm");
                                         }
+                                        if (getenv("SETO_CLASS_SWEEP") &&
+                                            !psp_duel_manager_start_requested()) {
+                                            class_sweep_and_talk();
+                                        }
                                         if (getenv("SETO_DUEL")) {
                                             char path[64];
                                             for (int attempt = 0; attempt < 2 &&
@@ -1360,8 +1737,14 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                                         "input: duel menu attempt=%d state=%u\n",
                                                         attempt, psp_read32(0x093CDAFCu));
                                                 if (psp_read32(0x093CDAFCu) == 6u) {
-                                                    field_press(PSP_CTRL_DOWN);
-                                                    Sleep(600);
+                                                    for (int u = 0; u < 8; u++) {
+                                                        int r = cmd_menu_row();
+                                                        fprintf(stderr, "input: cmd_menu row=%d\n", r);
+                                                        if (r == 1) break;
+                                                        field_press((r < 0 || r > 1) ? PSP_CTRL_UP : PSP_CTRL_DOWN);
+                                                        Sleep(350);
+                                                    }
+                                                    Sleep(300);
                                                     snprintf(path, sizeof path,
                                                              "build/s435-sel-%d.ppm", attempt);
                                                     psp_display_capture(path);
@@ -1403,6 +1786,14 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                             fprintf(stderr, "input: duel start=%d state=%u\n",
                                                     psp_duel_manager_start_requested(),
                                                     psp_read32(0x093CDAFCu));
+                                            if (getenv("SETO_DUEL_ADVANCE") &&
+                                                psp_duel_manager_start_requested()) {
+                                                fprintf(stderr, "input: advancing duel dialogue...\n");
+                                                for (int i = 0; i < 65 && !psp_exit_requested(); i++) {
+                                                    auto_press(PSP_CTRL_CROSS);
+                                                    Sleep(800);
+                                                }
+                                            }
                                         }
                                         if (getenv("SETO_TRACE_FIELD")) psp_ge_trace_next_frame();
                                         /* Two display buffers alternate at 30 fps;
@@ -1732,6 +2123,8 @@ int main(int argc, char **argv) {
     const char *duel_swap = argc > 12 ? argv[12] : NULL;
     const char *duel_tut = argc > 13 ? argv[13] : NULL;
     const char *duel_rec = argc > 14 ? argv[14] : NULL;
+    const char *charalist = argc > 15 ? argv[15] : NULL;
+    const char *shop = argc > 16 ? argv[16] : NULL;
     const int free_duel = getenv("SETO_FREE_DUEL") != NULL;
 
     if (psp_mem_init() != 0) { fprintf(stderr, "memory init failed\n"); return 1; }
@@ -1744,6 +2137,7 @@ int main(int argc, char **argv) {
     psp_cpu_reset();
     psp_hle_init();
     const char *ww = getenv("SETO_WATCH_WRITE");
+    psp_io_set_root(getenv("SETO_IO_ROOT") ? getenv("SETO_IO_ROOT") : "build");
     if (ww) psp_mem_watch_write((uint32_t)strtoul(ww, NULL, 0));
     psp_umd_set_iso(iso);
     psp_umd_register();
@@ -1820,6 +2214,14 @@ int main(int argc, char **argv) {
         return 1;
     }
 #endif
+#if defined(HAVE_CHARALIST_CORPUS) || defined(HAVE_SHOP_CORPUS)
+    if (psp_store_images_load(charalist, shop, m.info) != 0) return 1;
+#else
+    if (charalist || shop) {
+        fprintf(stderr, "store PRX: this build has no store corpora (build/s9charalist-reloc, build/s9shop-reloc)\n");
+        return 1;
+    }
+#endif
 #ifdef HAVE_DUEL_CORPUS
     {
         const char *duel[6] = { duel_mgr, duel_eng, duel_draw,
@@ -1848,6 +2250,8 @@ int main(int argc, char **argv) {
     if (field) printf("field   \"%s\"\n", field);
     if (deck) printf("deck    \"%s\"\n", deck);
     if (decktut) printf("decktut \"%s\"\n", decktut);
+    if (charalist) printf("charalist \"%s\"\n", charalist);
+    if (shop) printf("shop    \"%s\"\n", shop);
     printf("image   0x%08X..0x%08X  entry 0x%08X  gp 0x%08X  ctors %d\n",
            m.base, m.image_end, m.entry, m.gp, m.nctors);
     printf("dispatch %u functions/labels registered\n", psp_dispatch_count());
@@ -1893,8 +2297,7 @@ int main(int argc, char **argv) {
      * short grace slice so the last presses can request modules. */
     int idle = 0;
     while (!psp_exit_requested() && idle < 5000) {
-        psp_threadman_yield();
-        Sleep(1);
+        psp_threadman_host_sleep_ms(g_input_done ? 1u : 16u);
         idle = g_input_done ? idle + 1 : 0;
     }
     seto_window_stop();

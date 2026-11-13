@@ -196,6 +196,9 @@ static void title_osk(uint32_t nid) {
 static _Atomic int g_scene_state;
 static _Atomic int g_scene_phase;
 
+#if defined(HAVE_CHARALIST_CORPUS) || defined(HAVE_SHOP_CORPUS)
+uint32_t psp_store_export(uint32_t nid, uint32_t *gp_out);
+#endif
 void title_import_forward(uint32_t nid) {
     if (getenv("SETO_TRACE_CONFIRM") && atomic_load(&g_scene_state) == 4 &&
         atomic_load(&g_scene_phase) == 6) {
@@ -215,6 +218,10 @@ void title_import_forward(uint32_t nid) {
         return;
     }
     uint32_t addr = title_export(nid);
+    uint32_t gp = g_eboot_gp;
+#if defined(HAVE_CHARALIST_CORPUS) || defined(HAVE_SHOP_CORPUS)
+    if (!addr) addr = psp_store_export(nid, &gp);
+#endif
     if (!addr) {
         static unsigned logged;
         if (logged++ < 20)
@@ -226,7 +233,7 @@ void title_import_forward(uint32_t nid) {
      * title code has no $gp-relative access, but the EBOOT does. */
     uint32_t caller_gp = psp_cpu.r[PSP_REG_GP];
     uint32_t win = psp_cpu.r[PSP_REG_A0];
-    psp_cpu.r[PSP_REG_GP] = g_eboot_gp;
+    psp_cpu.r[PSP_REG_GP] = gp;
     psp_call_from_host(addr);
     psp_cpu.r[PSP_REG_GP] = caller_gp;
     if (nid == 0x39ADDA9Fu && getenv("SETO_TRACE_CONFIRM") &&

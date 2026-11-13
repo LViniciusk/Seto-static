@@ -125,6 +125,9 @@ uint32_t psp_field_export(uint32_t nid);
 uint32_t psp_field_gp(void);
 #endif
 
+#if defined(HAVE_CHARALIST_CORPUS) || defined(HAVE_SHOP_CORPUS)
+uint32_t psp_store_export(uint32_t nid, uint32_t *gp_out);
+#endif
 void story_import_forward(uint32_t nid) {
     uint32_t addr = story_export(nid);
     uint32_t gp = g_eboot_gp;
@@ -133,6 +136,9 @@ void story_import_forward(uint32_t nid) {
         addr = psp_field_export(nid);
         if (addr) gp = psp_field_gp();
     }
+#endif
+#if defined(HAVE_CHARALIST_CORPUS) || defined(HAVE_SHOP_CORPUS)
+    if (!addr) addr = psp_store_export(nid, &gp);
 #endif
     if (!addr) {
         static unsigned logged;

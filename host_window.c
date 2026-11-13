@@ -18,7 +18,7 @@
 #define WINDOW_W 960
 #define WINDOW_H 544
 #define TIMER_ID 1
-#define TIMER_MS 33                 /* ~30 FPS */
+#define TIMER_MS 16                 /* ~60 FPS */
 
 static HWND g_hwnd;
 static HANDLE g_thread;

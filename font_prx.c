@@ -36,6 +36,10 @@ int psp_decktut_start(uint32_t uid, uint32_t status_ptr);
 int psp_duel_load_uid(const char *path, uint32_t *uid);
 int psp_duel_start(uint32_t uid, uint32_t status_ptr);
 #endif
+#if defined(HAVE_CHARALIST_CORPUS) || defined(HAVE_SHOP_CORPUS)
+int psp_store_load_uid(const char *path, uint32_t *uid);
+int psp_store_start(uint32_t uid, uint32_t status_ptr);
+#endif
 
 static uint16_t rd16(const uint8_t *p) {
     return (uint16_t)(p[0] | (p[1] << 8));
@@ -292,11 +296,27 @@ static void hle_LoadModule(void) {
         return;
     }
 #endif
+#if defined(HAVE_CHARALIST_CORPUS) || defined(HAVE_SHOP_CORPUS)
+    uint32_t storeuid;
+    if (psp_store_load_uid(path, &storeuid)) {
+        psp_ret(storeuid);
+        return;
+    }
+#endif
     if (!g_font_loaded || strcmp(path, FONT_LBN_PATH) != 0) {
         /* A module the game loads at run time and this host does not carry.
-         * Naming it is the difference between "the scene is stuck" and why. */
-        static unsigned logged;
-        if (logged++ < 4) fprintf(stderr, "ModuleMgr: '%s' not integrated (ENOENT)\n", path);
+         * Naming it is the difference between "the scene is stuck" and why.
+         * Deduplicate by path so repeated polls cannot hide the next missing PRX. */
+        static char seen[16][128];
+        static int nseen;
+        int known = 0;
+        for (int i = 0; i < nseen; i++) {
+            if (strcmp(seen[i], path) == 0) { known = 1; break; }
+        }
+        if (!known && nseen < 16) {
+            snprintf(seen[nseen++], sizeof seen[0], "%s", path);
+            fprintf(stderr, "ModuleMgr: '%s' not integrated (ENOENT)\n", path);
+        }
         psp_ret(0x80010002u);          /* ENOENT */
         return;
     }
@@ -322,6 +342,9 @@ static void hle_StartModule(void) {
 #endif
 #ifdef HAVE_DUEL_CORPUS
     if (psp_duel_start(psp_arg(0), psp_arg(3))) return;
+#endif
+#if defined(HAVE_CHARALIST_CORPUS) || defined(HAVE_SHOP_CORPUS)
+    if (psp_store_start(psp_arg(0), psp_arg(3))) return;
 #endif
     if (psp_arg(0) != g_font_uid) {
         psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID);

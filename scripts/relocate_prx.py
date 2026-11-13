@@ -251,6 +251,9 @@ def main(argv):
         if not ok:
             fail("relocation %d (type %d) failed verification" % (i, e["type"]))
 
+    vstub_count = resolve_vstub_imports(data, segs, _EXPORT_ELFS)
+    if vstub_count:
+        print("  vstub %d variable import fixups" % vstub_count)
     open(argv[2], "wb").write(data)
     print("relocated: %d segments, base 0x%08X, %d relocations" % (len(segs), base, n))
     for i, s in enumerate(segs):
@@ -261,5 +264,155 @@ def main(argv):
     return 0
 
 
+_EXPORT_ELFS = []
+
+
+def _elf_segs(buf):
+    e_phoff = struct.unpack_from("<I", buf, 0x1C)[0]
+    e_phnum = struct.unpack_from("<H", buf, 0x2C)[0]
+    out = []
+    for i in range(e_phnum):
+        p_type, p_off, p_vaddr, _, p_filesz, _ = struct.unpack_from("<6I", buf, e_phoff + i * 32)
+        if p_type == 1:
+            out.append((p_vaddr, p_off, p_filesz))
+    return out
+
+
+def _elf_v2o(segs, va):
+    for bva, off, fsz in segs:
+        if bva <= va < bva + fsz:
+            return off + (va - bva)
+    return None
+
+
+def _elf_sections(buf):
+    e_shoff = struct.unpack_from("<I", buf, 0x20)[0]
+    e_shnum = struct.unpack_from("<H", buf, 0x30)[0]
+    e_shstrndx = struct.unpack_from("<H", buf, 0x32)[0]
+    if not e_shoff or not e_shnum or e_shstrndx >= e_shnum:
+        return {}
+    str_off = struct.unpack_from("<I", buf, e_shoff + e_shstrndx * 40 + 16)[0]
+    secs = {}
+    for i in range(e_shnum):
+        sh_name, sh_type, _, sh_addr, sh_off, sh_size = struct.unpack_from("<6I", buf, e_shoff + i * 40)
+        end = buf.find(b"\0", str_off + sh_name)
+        name = buf[str_off + sh_name:end].decode("ascii", "replace")
+        secs[name] = (sh_type, sh_addr, sh_off, sh_size)
+    return secs
+
+
+def _read_var_exports(elf_path):
+    buf = open(elf_path, "rb").read()
+    secs = _elf_sections(buf)
+    if ".lib.ent" not in secs:
+        return {}
+    esegs = _elf_segs(buf)
+    _, _, off, size = secs[".lib.ent"]
+    exports = {}
+    pos = off
+    while pos < off + size:
+        libnamep, _, _, sl, nvar, nfunc, tbl = struct.unpack_from("<IHHBBHI", buf, pos)
+        if libnamep and nvar:
+            no = _elf_v2o(esegs, libnamep)
+            libn = buf[no:buf.find(b"\0", no)].decode("ascii", "replace") if no is not None else ""
+            to = _elf_v2o(esegs, tbl)
+            if libn and to is not None:
+                for vi in range(nvar):
+                    nid = struct.unpack_from("<I", buf, to + (nfunc + vi) * 4)[0]
+                    addr = struct.unpack_from("<I", buf, to + (nfunc + nvar + nfunc + vi) * 4)[0]
+                    exports[(libn, nid)] = addr
+        pos += max(sl, 4) * 4
+    return exports
+
+
+def resolve_vstub_imports(data, segs, export_elfs):
+    if not export_elfs:
+        return 0
+    exports = {}
+    for ep in export_elfs:
+        exports.update(_read_var_exports(ep))
+    secs = _elf_sections(data)
+    if ".lib.stub" not in secs:
+        return 0
+    vsegs = _elf_segs(data) if segs else []
+    if not vsegs:
+        return 0
+    _, _, off, size = secs[".lib.stub"]
+    total = 0
+    pos = off
+    while pos < off + size:
+        libnamep, _, _, sl, vsc, _, _, _ = struct.unpack_from("<IHHBBHII", data, pos)
+        vstubp = u32(data, pos + 20) if sl >= 6 else 0
+        if vsc and vstubp:
+            no = _elf_v2o(vsegs, libnamep) if libnamep else None
+            libn = data[no:data.find(b"\0", no)].decode("ascii", "replace") if no is not None else ""
+            vso = _elf_v2o(vsegs, vstubp)
+            if vso is None:
+                fail("vstubp 0x%08X outside segments" % vstubp)
+            for vi in range(vsc):
+                vp = u32(data, vso + vi * 8)
+                vnid = u32(data, vso + vi * 8 + 4)
+                if (libn, vnid) not in exports:
+                    fail("missing exported variable %s:0x%08X" % (libn, vnid))
+                target = exports[(libn, vnid)]
+                vpo = _elf_v2o(vsegs, vp)
+                if vpo is None:
+                    fail("vstub list 0x%08X outside segments" % vp)
+                fixups = []
+                cur = vpo
+                while True:
+                    w = u32(data, cur)
+                    if w == 0:
+                        break
+                    typ = (w >> 26) & 0x3F
+                    va = ((w & 0x03FFFFFF) << 2) & 0xFFFFFFFF
+                    fo = _elf_v2o(vsegs, va)
+                    if fo is None:
+                        fail("vstub target 0x%08X outside segments" % va)
+                    fixups.append((typ, va, fo, u32(data, fo)))
+                    cur += 4
+                hi_queue = []
+                for idx, (typ, va, fo, orig_op) in enumerate(fixups):
+                    if typ == R_MIPS_HI16:
+                        hi_queue.append(idx)
+                    elif typ == R_MIPS_LO16:
+                        lo_s = struct.unpack("<h", struct.pack("<H", orig_op & 0xFFFF))[0]
+                        full = (((orig_op & 0xFFFF) + target) & 0xFFFFFFFF)
+                        for hi_i in hi_queue:
+                            _, _, hfo, hop = fixups[hi_i]
+                            addr = (((hop & 0xFFFF) << 16) + lo_s + target) & 0xFFFFFFFF
+                            hi = ((addr + 0x8000) & 0xFFFFFFFF) >> 16
+                            pu32(data, hfo, (hop & 0xFFFF0000) | (hi & 0xFFFF))
+                        hi_queue.clear()
+                        pu32(data, fo, (orig_op & 0xFFFF0000) | (full & 0xFFFF))
+                    elif typ == R_MIPS_32:
+                        pu32(data, fo, (orig_op + target) & 0xFFFFFFFF)
+                    else:
+                        fail("unsupported vstub relocation type %d at 0x%08X" % (typ, va))
+                if hi_queue:
+                    fail("unpaired R_MIPS_HI16 in vstub %s:0x%08X" % (libn, vnid))
+                total += len(fixups)
+        pos += max(sl, 5) * 4
+    return total
+
+
+def _parse_export_args(argv):
+    clean = [argv[0]]
+    i = 1
+    while i < len(argv):
+        if argv[i] == "--export-elf":
+            if i + 1 >= len(argv):
+                fail("--export-elf requires a path")
+            _EXPORT_ELFS.append(argv[i + 1])
+            i += 2
+        elif argv[i].startswith("--export-elf="):
+            _EXPORT_ELFS.append(argv[i].split("=", 1)[1])
+            i += 1
+        else:
+            clean.append(argv[i])
+            i += 1
+    return clean
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    sys.exit(main(_parse_export_args(sys.argv)))

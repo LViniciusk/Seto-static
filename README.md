@@ -1688,6 +1688,39 @@ individual patches).
 Not yet verified after the 4 MB change: the real duel's opponent cut-in
 transition and the opponent hand showing faces instead of backs.
 
+**Store PRXs, Atrac/Savedata, virtual-time audio sync, and speed (2026-11-13, Seto-static12).**
+- **Store & Character List (`modcharalist`, `modshop`)**: integrated via
+  `store_prx.c` and `psp_store_export` forwarding in `story_prx.c` and
+  `title_prx.c`, with `build/run-manual.ps1` passing `s9charalist-reloc.elf`
+  and `s9shop-reloc.elf`. Verified live in-game (Card Shop functional; save/load
+  round-trip unlocks Free Duel).
+- **Audio & Atrac pacing (`src/hle/atrac.c`, `src/hle/misc.c`)**: real `sceAtrac`
+  decode/loop handling plus switching `sceAudioOutputPannedBlocking` (`hle_OutputBlocking`)
+  to pace against guest virtual time (`psp_threadman_vtime_us()`) instead of
+  wall-clock `host_now_us()`, keeping audio synchronized during heavy 3D
+  combat animations.
+- **Scheduler, trace scoping, and 3D raster (`CMakeLists.txt`, `threadman.c`,
+  `host.c`, `host_window.c`, `ge.c`, `render.c`)**:
+  - Restricted `PSPRECOMP_TRACE` to the 4 watchpoint translation units
+    (`tagforce_funcs_000.c`, `tagforce_funcs_040.c`, `title_funcs_000.c`,
+    `title_funcs_005.c`), removing trace instrumentation across the rest of the
+    recompiled corpus.
+  - Added `psp_threadman_host_sleep_ms()` so the idle `boot` loop in `host.c`
+    releases the CPU baton before sleeping (`boot` parks dropped from `12,826`
+    / `7,649` to `0`) and increased the `wait_loop` cap for long unbounded waits.
+  - Added nearest-neighbor / modulate-white fast paths in `sw_tri_tex` and a
+    dedicated `sw_tri_tex_ab` rasterizer for alpha-tested/blended 3D triangles,
+    skipped `0xFF` padding in `ge.c`, and raised `host_window.c` refresh to
+    ~60 FPS (`16 ms`).
+- **Verification**: `ctest` passes **21/21** (`4.82 s`), `scratch-bench-all.exe`
+  matches all 6 workload CRCs (`823B687F`, `43BAB556`, `1E6044B1`, `137307BB`,
+  `CBDFDFD2`, `6300F5C5`, `bad=0`) and the 400-draw mixed-state oracle (`0813E1B7`,
+  `480089` px) bit-exactly against fallback. Headless runs on `Seto-static12.exe`:
+  90s `SETO_TRAVEL_STORE=1` (`5,254` vblanks, `0` boot parks, `0` dispatch misses,
+  `0` bad accesses) and 45s `SETO_AUTO_STORY=1` (`2,506` vblanks, `1,254` frames,
+  `0` boot parks, `0` dispatch misses, `0` bad accesses). Updated cumulative patch:
+  `patches/psprecomp-5ca18fa-s10-duel-scene-full.patch`.
+
 ## Limitations
 
 - `sceReg` serves only the `/DATA/FONT` and `/SYSPROFILE/RESOLUTION` subtrees
@@ -1695,26 +1728,24 @@ transition and the opponent hand showing faces instead of backs.
   uses defaults. Fonts need a flash0 tree via `PSPRECOMP_FLASH0`; without it the
   game runs but `sceFont` strings are blank.
 - `libtitle.prx`, `libstory.prx`, `libfield.prx`, `libdeck.prx`,
-  `libdeck_tutorial.prx` and the six duel PRXs are integrated; `libcharalist`
-  and the recipe viewers are not. The manual tutorial duel completed (six
-  `input: duel trace` samples followed by the post-duel story/field reload);
-  the duel board's 3D draw was not captured in that run.
+  `libdeck_tutorial.prx`, `libcharalist`, `libshop`, and the six duel PRXs are
+  integrated (`modcharalist` and `modshop` via `store_prx.c`).
 - The rebased corpus relocates the EBOOT into the PSP user RAM window. The host
   refuses the unrelocated image instead of guessing its base.
-- Audio is paced by the runtime but not played; the Atrac stream calls remain
-  unimplemented. START, the D-pad, CROSS and CIRCLE are mapped.
+- Audio is paced by the runtime in virtual time (with Atrac/SasCore HLE) rather
+  than played out to host speakers. START, the D-pad, CROSS, CIRCLE, TRIANGLE,
+  and analog stick are mapped.
 - `vcmov` is implemented; 270 other VFPU instructions remain traps in the
   rebased EBOOT corpus (0.25%), unreached by the story run. The title corpus has
   22 VFPU traps, also unreached.
 - 2,889 functions without `jr $ra` and 176 `scattered` functions remain discovery
   caveats; they did not affect the EBOOT run.
-- No window; the goal is the real code path, not play.
 
 ## Repo contents
 
-Tracked: this README, `.gitignore`, `host.c`, `umd.c`, `fpl.c`, `font_prx.c`,
-`title_prx.c`, `story_prx.c`, `field_prx.c`, `deck_prx.c`, `decktut_prx.c`,
-`duel_prx.c`, `scripts/relocate_prx.py`, `CMakeLists.txt`, `tests/lbn_seek.c`,
-and fifteen small patches against the pinned psprecomp. `build/` (tool clone, generated C,
-relocated ELF, objects, executable) and `private/` (decrypted EBOOT, ISO) are
-ignored.
+Tracked: this README, `.gitignore`, `host.c`, `host_window.c`, `umd.c`, `fpl.c`,
+`font_prx.c`, `title_prx.c`, `story_prx.c`, `field_prx.c`, `deck_prx.c`,
+`decktut_prx.c`, `store_prx.c`, `duel_prx.c`, `scripts/relocate_prx.py`,
+`CMakeLists.txt`, `tests/lbn_seek.c`, and cumulative/step patches against the
+pinned psprecomp in `patches/`. `build/` (tool clone, generated C, relocated ELF,
+objects, executable) and `private/` (decrypted EBOOT, ISO) are ignored.

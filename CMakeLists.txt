@@ -15,7 +15,7 @@ file(GLOB TAGFORCE_SOURCES CONFIGURE_DEPENDS
 add_library(tagforce STATIC ${TAGFORCE_SOURCES})
 target_include_directories(tagforce PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/build/tagforce)
 # Function-entry tracing is what proves translated code ran.
-target_compile_definitions(tagforce PUBLIC PSPRECOMP_TRACE)
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/build/tagforce/tagforce_funcs_000.c ${CMAKE_CURRENT_SOURCE_DIR}/build/tagforce/tagforce_funcs_040.c PROPERTIES COMPILE_DEFINITIONS PSPRECOMP_TRACE)
 target_link_libraries(tagforce PUBLIC psprecomp)
 
 # S5: the offline-relocated sceFont_Library corpus. Generated, not committed;
@@ -25,7 +25,7 @@ file(GLOB FONT_SOURCES CONFIGURE_DEPENDS
 
 if(FONT_SOURCES)
     add_library(fontprx OBJECT ${FONT_SOURCES})
-    target_compile_definitions(fontprx PRIVATE PSPRECOMP_NAMESPACE=font_ PSPRECOMP_TRACE)
+    target_compile_definitions(fontprx PRIVATE PSPRECOMP_NAMESPACE=font_)
     target_include_directories(fontprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s5-font-reloc)
     target_link_libraries(fontprx PRIVATE psprecomp)
 endif()
@@ -37,8 +37,9 @@ file(GLOB TITLE_SOURCES CONFIGURE_DEPENDS
 if(TITLE_SOURCES)
     add_library(titleprx OBJECT ${TITLE_SOURCES})
     target_compile_definitions(titleprx PRIVATE
-        PSPRECOMP_NAMESPACE=title_ PSPRECOMP_TRACE
+        PSPRECOMP_NAMESPACE=title_
         psp_hle_call=title_import_forward)
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/build/s6-title-reloc/title_funcs_000.c ${CMAKE_CURRENT_SOURCE_DIR}/build/s6-title-reloc/title_funcs_005.c PROPERTIES COMPILE_DEFINITIONS PSPRECOMP_TRACE)
     target_include_directories(titleprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s6-title-reloc)
     target_link_libraries(titleprx PRIVATE psprecomp)
 endif()
@@ -50,7 +51,7 @@ file(GLOB STORY_SOURCES CONFIGURE_DEPENDS
 if(STORY_SOURCES)
     add_library(storyprx OBJECT ${STORY_SOURCES})
     target_compile_definitions(storyprx PRIVATE
-        PSPRECOMP_NAMESPACE=story_ PSPRECOMP_TRACE
+        PSPRECOMP_NAMESPACE=story_
         psp_hle_call=story_import_forward)
     target_include_directories(storyprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s93-story-reloc)
     target_link_libraries(storyprx PRIVATE psprecomp)
@@ -63,7 +64,7 @@ file(GLOB FIELD_SOURCES CONFIGURE_DEPENDS
 if(FIELD_SOURCES)
     add_library(fieldprx OBJECT ${FIELD_SOURCES})
     target_compile_definitions(fieldprx PRIVATE
-        PSPRECOMP_NAMESPACE=field_ PSPRECOMP_TRACE
+        PSPRECOMP_NAMESPACE=field_
         psp_hle_call=field_import_forward)
     target_include_directories(fieldprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s93-field-reloc)
     target_link_libraries(fieldprx PRIVATE psprecomp)
@@ -75,7 +76,7 @@ file(GLOB DECK_SOURCES CONFIGURE_DEPENDS
 if(DECK_SOURCES)
     add_library(deckprx OBJECT ${DECK_SOURCES})
     target_compile_definitions(deckprx PRIVATE
-        PSPRECOMP_NAMESPACE=deck_ PSPRECOMP_TRACE
+        PSPRECOMP_NAMESPACE=deck_
         psp_hle_call=deck_import_forward)
     target_include_directories(deckprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s93-deck-reloc)
     target_link_libraries(deckprx PRIVATE psprecomp)
@@ -87,7 +88,7 @@ file(GLOB DECKTUT_SOURCES CONFIGURE_DEPENDS
 if(DECKTUT_SOURCES)
     add_library(decktutprx OBJECT ${DECKTUT_SOURCES})
     target_compile_definitions(decktutprx PRIVATE
-        PSPRECOMP_NAMESPACE=decktut_ PSPRECOMP_TRACE
+        PSPRECOMP_NAMESPACE=decktut_
         psp_hle_call=decktut_import_forward)
     target_include_directories(decktutprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s93-decktut-reloc)
     target_link_libraries(decktutprx PRIVATE psprecomp)
@@ -111,7 +112,7 @@ file(GLOB DUELREC_SOURCES CONFIGURE_DEPENDS
 if(DUELMGR_SOURCES)
     add_library(duelmgrprx OBJECT ${DUELMGR_SOURCES})
     target_compile_definitions(duelmgrprx PRIVATE
-        PSPRECOMP_NAMESPACE=duelmgr_ PSPRECOMP_TRACE
+        PSPRECOMP_NAMESPACE=duelmgr_
         psp_hle_call=duel_import_forward)
     target_include_directories(duelmgrprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s9duel-mgr-reloc)
     target_link_libraries(duelmgrprx PRIVATE psprecomp)
@@ -119,7 +120,7 @@ endif()
 if(DUELENG_SOURCES)
     add_library(duelengprx OBJECT ${DUELENG_SOURCES})
     target_compile_definitions(duelengprx PRIVATE
-        PSPRECOMP_NAMESPACE=dueleng_ PSPRECOMP_TRACE
+        PSPRECOMP_NAMESPACE=dueleng_
         psp_hle_call=duel_import_forward)
     target_include_directories(duelengprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s9duel-eng-reloc)
     target_link_libraries(duelengprx PRIVATE psprecomp)
@@ -127,7 +128,7 @@ endif()
 if(DUELDRAW_SOURCES)
     add_library(dueldrawprx OBJECT ${DUELDRAW_SOURCES})
     target_compile_definitions(dueldrawprx PRIVATE
-        PSPRECOMP_NAMESPACE=dueldraw_ PSPRECOMP_TRACE
+        PSPRECOMP_NAMESPACE=dueldraw_
         psp_hle_call=duel_import_forward)
     target_include_directories(dueldrawprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s9duel-draw-reloc)
     target_link_libraries(dueldrawprx PRIVATE psprecomp)
@@ -135,7 +136,7 @@ endif()
 if(DUELSWAP_SOURCES)
     add_library(duelswapprx OBJECT ${DUELSWAP_SOURCES})
     target_compile_definitions(duelswapprx PRIVATE
-        PSPRECOMP_NAMESPACE=duelswap_ PSPRECOMP_TRACE
+        PSPRECOMP_NAMESPACE=duelswap_
         psp_hle_call=duel_import_forward)
     target_include_directories(duelswapprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s9duel-swap-reloc)
     target_link_libraries(duelswapprx PRIVATE psprecomp)
@@ -143,7 +144,7 @@ endif()
 if(DUELTUT_SOURCES)
     add_library(dueltutprx OBJECT ${DUELTUT_SOURCES})
     target_compile_definitions(dueltutprx PRIVATE
-        PSPRECOMP_NAMESPACE=dueltut_ PSPRECOMP_TRACE
+        PSPRECOMP_NAMESPACE=dueltut_
         psp_hle_call=duel_import_forward)
     target_include_directories(dueltutprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s9duel-tut-reloc)
     target_link_libraries(dueltutprx PRIVATE psprecomp)
@@ -151,10 +152,32 @@ endif()
 if(DUELREC_SOURCES)
     add_library(duelrecprx OBJECT ${DUELREC_SOURCES})
     target_compile_definitions(duelrecprx PRIVATE
-        PSPRECOMP_NAMESPACE=duelrec_ PSPRECOMP_TRACE
+        PSPRECOMP_NAMESPACE=duelrec_
         psp_hle_call=duel_import_forward)
     target_include_directories(duelrecprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s9duel-rec-reloc)
     target_link_libraries(duelrecprx PRIVATE psprecomp)
+endif()
+
+# Store & character-list overlays loaded when talking to the card shopkeeper.
+file(GLOB CHARALIST_SOURCES CONFIGURE_DEPENDS
+     ${CMAKE_CURRENT_SOURCE_DIR}/build/s9charalist-reloc/*.c)
+file(GLOB SHOP_SOURCES CONFIGURE_DEPENDS
+     ${CMAKE_CURRENT_SOURCE_DIR}/build/s9shop-reloc/*.c)
+if(CHARALIST_SOURCES)
+    add_library(charalistprx OBJECT ${CHARALIST_SOURCES})
+    target_compile_definitions(charalistprx PRIVATE
+        PSPRECOMP_NAMESPACE=charalist_
+        psp_hle_call=store_import_forward)
+    target_include_directories(charalistprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s9charalist-reloc)
+    target_link_libraries(charalistprx PRIVATE psprecomp)
+endif()
+if(SHOP_SOURCES)
+    add_library(shopprx OBJECT ${SHOP_SOURCES})
+    target_compile_definitions(shopprx PRIVATE
+        PSPRECOMP_NAMESPACE=shop_
+        psp_hle_call=store_import_forward)
+    target_include_directories(shopprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s9shop-reloc)
+    target_link_libraries(shopprx PRIVATE psprecomp)
 endif()
 
 set(SETO_SOURCES host.c host_window.c umd.c fpl.c font_prx.c)
@@ -176,6 +199,9 @@ endif()
 if(DUELMGR_SOURCES AND DUELENG_SOURCES AND DUELDRAW_SOURCES AND
    DUELSWAP_SOURCES AND DUELTUT_SOURCES AND DUELREC_SOURCES)
     list(APPEND SETO_SOURCES duel_prx.c)
+endif()
+if(CHARALIST_SOURCES OR SHOP_SOURCES)
+    list(APPEND SETO_SOURCES store_prx.c)
 endif()
 add_executable(Seto-static ${SETO_SOURCES})
 if(FONT_SOURCES)
@@ -223,6 +249,18 @@ if(DUELMGR_SOURCES AND DUELENG_SOURCES AND DUELDRAW_SOURCES AND
     target_compile_definitions(Seto-static PRIVATE HAVE_DUEL_CORPUS)
 else()
     message(STATUS "S9.9 duel corpora not found under build/s9duel-*-reloc; building without the duel subsystem")
+endif()
+if(CHARALIST_SOURCES)
+    target_sources(Seto-static PRIVATE $<TARGET_OBJECTS:charalistprx>)
+    target_compile_definitions(Seto-static PRIVATE HAVE_CHARALIST_CORPUS)
+else()
+    message(STATUS "charalist corpus not found under build/s9charalist-reloc; building without modcharalist")
+endif()
+if(SHOP_SOURCES)
+    target_sources(Seto-static PRIVATE $<TARGET_OBJECTS:shopprx>)
+    target_compile_definitions(Seto-static PRIVATE HAVE_SHOP_CORPUS)
+else()
+    message(STATUS "shop corpus not found under build/s9shop-reloc; building without modshop")
 endif()
 target_link_libraries(Seto-static PRIVATE tagforce gdi32)
 
