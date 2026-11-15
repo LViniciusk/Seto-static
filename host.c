@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <windows.h>
+#include <mmsystem.h>
 
 void psp_recomp_register(void);   /* generated tagforce_register.c */
 int  seto_window_start(void);
@@ -146,14 +147,49 @@ static DWORD WINAPI bringup_cap(LPVOID unused) {
 /* Real Windows keyboard, sampled without a window or message loop. START only;
  * the rest of the pad is added when a scene asks for it. The thread ends with
  * the process (or when the game exits) and releases what it held. */
-#define PSP_CTRL_START 0x00000008u
-#define PSP_CTRL_LEFT  0x00000080u
-#define PSP_CTRL_UP    0x00000010u
-#define PSP_CTRL_DOWN  0x00000040u
-#define PSP_CTRL_CROSS 0x00004000u
-#define PSP_CTRL_CIRCLE 0x00002000u
+#define PSP_CTRL_SELECT   0x00000001u
+#define PSP_CTRL_START    0x00000008u
+#define PSP_CTRL_UP       0x00000010u
+#define PSP_CTRL_RIGHT    0x00000020u
+#define PSP_CTRL_DOWN     0x00000040u
+#define PSP_CTRL_LEFT     0x00000080u
+#define PSP_CTRL_LTRIGGER 0x00000100u
+#define PSP_CTRL_RTRIGGER 0x00000200u
 #define PSP_CTRL_TRIANGLE 0x00001000u
-#define PSP_CTRL_RIGHT 0x00000020u
+#define PSP_CTRL_CIRCLE   0x00002000u
+#define PSP_CTRL_CROSS    0x00004000u
+#define PSP_CTRL_SQUARE   0x00008000u
+
+/* Keyboard state, only while one of our own windows has the foreground, so
+ * typing in another application does not drive the game. */
+static SHORT host_key_state(int vk) {
+    DWORD pid = 0;
+    const HWND fg = GetForegroundWindow();
+    if (!fg) return 0;
+    GetWindowThreadProcessId(fg, &pid);
+    if (pid != GetCurrentProcessId()) return 0;
+    return GetAsyncKeyState(vk);
+}
+
+static uint32_t poll_host_pad(void) {
+    uint32_t fm = 0;
+    if (host_key_state(VK_LEFT) & 0x8000)   fm |= PSP_CTRL_LEFT;
+    if (host_key_state(VK_RIGHT) & 0x8000)  fm |= PSP_CTRL_RIGHT;
+    if (host_key_state(VK_UP) & 0x8000)     fm |= PSP_CTRL_UP;
+    if (host_key_state(VK_DOWN) & 0x8000)   fm |= PSP_CTRL_DOWN;
+    if (host_key_state('Z') & 0x8000)       fm |= PSP_CTRL_CROSS;
+    if (host_key_state('X') & 0x8000)       fm |= PSP_CTRL_CIRCLE;
+    if (host_key_state('C') & 0x8000)       fm |= PSP_CTRL_TRIANGLE;
+    if (host_key_state('A') & 0x8000)       fm |= PSP_CTRL_SQUARE;
+    if (host_key_state('V') & 0x8000)       fm |= PSP_CTRL_SQUARE;
+    if (host_key_state('Q') & 0x8000)       fm |= PSP_CTRL_LTRIGGER;
+    if (host_key_state('W') & 0x8000)       fm |= PSP_CTRL_RTRIGGER;
+    if (host_key_state('E') & 0x8000)       fm |= PSP_CTRL_RTRIGGER;
+    if (host_key_state(VK_RETURN) & 0x8000) fm |= PSP_CTRL_START;
+    if (host_key_state(VK_BACK) & 0x8000)   fm |= PSP_CTRL_SELECT;
+    if (host_key_state(VK_SPACE) & 0x8000)  fm |= PSP_CTRL_SELECT;
+    return fm;
+}
 
 #ifdef HAVE_TITLE_CORPUS
 /* Send one menu button until the guest changes the observed cursor or scene
@@ -358,17 +394,16 @@ static void dump_field_state(const char *tag) {
  * look, press a key, capture again. */
 static void hold_field_input(void) {
     fprintf(stderr, "window: holding; arrows/Z/X/C/Enter control the field\n");
+    int t_down = 0;
     for (;;) {
-        uint32_t fm = 0;
-        if (GetAsyncKeyState(VK_LEFT) & 0x8000)  fm |= 0x00000080u;
-        if (GetAsyncKeyState(VK_RIGHT) & 0x8000) fm |= 0x00000020u;
-        if (GetAsyncKeyState(VK_UP) & 0x8000)    fm |= 0x00000010u;
-        if (GetAsyncKeyState(VK_DOWN) & 0x8000)  fm |= 0x00000040u;
-        if (GetAsyncKeyState('Z') & 0x8000)      fm |= 0x00004000u;
-        if (GetAsyncKeyState('X') & 0x8000)      fm |= 0x00002000u;
-        if (GetAsyncKeyState('C') & 0x8000)      fm |= 0x00001000u;
-        if (GetAsyncKeyState(VK_RETURN) & 0x8000) fm |= 0x00000008u;
-        psp_ctrl_set(fm, 128, 128);
+        psp_ctrl_set(poll_host_pad(), 128, 128);
+        /* T: log every GE primitive of the next frame to stderr. */
+        const int t = (host_key_state('T') & 0x8000) != 0;
+        if (t && !t_down) {
+            psp_ge_trace_next_frame();
+            fprintf(stderr, "input: manual GE trace requested\n");
+        }
+        t_down = t;
         Sleep(10);
     }
 }
@@ -763,18 +798,66 @@ static void auto_menu(uint32_t mask, int by_cursor) {
  * log every change. Headless runs otherwise only see pixels; this names the
  * state the field script is in. */
 #ifdef HAVE_TITLE_CORPUS
+static int is_normal_duel_teal(void) {
+    static uint32_t px[480 * 272];
+    if (psp_display_read(px) != 0) return 0;
+    int teal = 0;
+    for (int y = 70; y < 220; y += 10) {
+        for (int x = 100; x < 380; x += 14) {
+            const uint32_t v = px[y * 480 + x];
+            const int r = (int)(v & 0xFF), g = (int)((v >> 8) & 0xFF),
+                      b = (int)((v >> 16) & 0xFF);
+            if (r < 140 && g > 140 && b > 120) teal++;
+        }
+    }
+    return teal >= 60;
+}
+
+static int is_cream_list(void) {
+    static uint32_t px[480 * 272];
+    if (psp_display_read(px) != 0) return 0;
+    int cream = 0;
+    for (int y = 70; y < 220; y += 10) {
+        for (int x = 100; x < 380; x += 14) {
+            const uint32_t v = px[y * 480 + x];
+            const int r = (int)(v & 0xFF), g = (int)((v >> 8) & 0xFF),
+                      b = (int)((v >> 16) & 0xFF);
+            if (r > 230 && g > 230 && b > 210) cream++;
+        }
+    }
+    return cream >= 200;
+}
+
+/* Hold button across multiple vblanks so 30Hz title/menu loops always sample the edge. */
+static void hold_pad(uint32_t mask, int ms) {
+    if (psp_duel_manager_start_requested()) return;
+    psp_title_walk(mask, 128, 128);
+    psp_ctrl_set(mask, 128, 128);
+    Sleep(ms);
+    psp_title_walk(0, 128, 128);
+    psp_ctrl_set(0, 128, 128);
+}
+
+static void hold_pad_direct(uint32_t mask, int ms) {
+    if (psp_duel_manager_start_requested()) return;
+    psp_ctrl_set(mask, 128, 128);
+    Sleep(ms);
+    psp_ctrl_set(0, 128, 128);
+    Sleep(120);
+}
+
 static void enter_free_duel(void) {
     int row = -1;
     for (int w = 0; w < 80 && row < 0; w++) {
         Sleep(100);
         if (psp_title_scene_state() == 3) row = main_menu_row();
     }
-    fprintf(stderr, "input: free menu row=%d\n", row);
-    for (int i = 0; i < 10 && row >= 0 && row != 1; i++) {
-        auto_press(row < 1 ? PSP_CTRL_DOWN : PSP_CTRL_UP);
-        Sleep(250);
+    fprintf(stderr, "input: free menu row=%d cursor=%d\n", row, psp_title_scene_cursor());
+    for (int i = 0; i < 6 && row >= 0 && row != 1; i++) {
+        auto_menu(row < 1 ? PSP_CTRL_DOWN : PSP_CTRL_UP, 1);
+        Sleep(150);
         row = main_menu_row();
-        fprintf(stderr, "input: free menu row=%d\n", row);
+        fprintf(stderr, "input: free menu row=%d cursor=%d\n", row, psp_title_scene_cursor());
     }
     psp_display_capture("build/s93-free-menu.ppm");
     if (row != 1) {
@@ -783,9 +866,9 @@ static void enter_free_duel(void) {
     }
     for (int i = 0; i < 3 && psp_title_scene_state() == 3; i++)
         auto_menu(PSP_CTRL_CROSS, 0);
-    for (int i = 0; i < 15; i++) {
-        Sleep(1000);
-        if (i == 5 || i == 10 || i == 14) {
+    for (int i = 0; i < 6; i++) {
+        Sleep(700);
+        if (i == 2 || i == 5) {
             char path[64];
             snprintf(path, sizeof path, "build/s93-duel%d.ppm", i);
             psp_display_capture(path);
@@ -794,20 +877,72 @@ static void enter_free_duel(void) {
     fprintf(stderr, "input: free duel state=%d phase=%d\n",
             psp_title_scene_state(), psp_title_scene_phase());
     if (getenv("SETO_FREE_DUEL_PLAY")) {
-        for (int i = 0; i < 20 && !psp_duel_manager_start_requested(); i++) {
-            auto_press(PSP_CTRL_CROSS);
-            Sleep(1200);
-            if (i == 4 || i == 9 || i == 14 || i == 19) {
+        for (int w = 0; w < 40 && !is_normal_duel_teal() && psp_title_scene_phase() != 6; w++)
+            Sleep(100);
+        for (int i = 0; i < 10 && !is_normal_duel_teal() && !psp_duel_manager_start_requested(); i++) {
+            hold_pad_direct(PSP_CTRL_CROSS, 150);
+            for (int w = 0; w < 8 && !is_normal_duel_teal(); w++) Sleep(100);
+        }
+        if (is_normal_duel_teal()) {
+            Sleep(2000);
+            hold_pad_direct(PSP_CTRL_CROSS, 180);
+            Sleep(800);
+            psp_display_capture("build/s93-free-play4.ppm");
+        }
+        for (int i = 0; i < 35 && !psp_duel_manager_start_requested(); i++) {
+            int ph = psp_title_scene_phase();
+            int cream = is_cream_list();
+            if (i < 4 || i == 6 || i == 11 || i == 15) {
                 char path[64];
                 snprintf(path, sizeof path, "build/s93-free-play%d.ppm", i);
                 psp_display_capture(path);
             }
+            fprintf(stderr,
+                    "input: free try=%d ph=%d cream=%d state=%d start=%d pad=0x%08x\n",
+                    i, ph, cream, psp_title_scene_state(),
+                    psp_duel_manager_start_requested(),
+                    psp_read32(0x08101540u));
+            if (ph == 11) {
+                Sleep(500);
+                continue;
+            }
+            if (ph == 6 || cream) {
+                if (cream && i >= 6 && i < 9) {
+                    hold_pad_direct(PSP_CTRL_DOWN, 120);
+                    Sleep(200);
+                    hold_pad_direct(PSP_CTRL_CROSS, 180);
+                    Sleep(800);
+                } else if (cream && i >= 9) {
+                    hold_pad_direct((i & 1) ? PSP_CTRL_START : PSP_CTRL_CROSS, 180);
+                    Sleep(800);
+                } else {
+                    hold_pad_direct(PSP_CTRL_CROSS, 180);
+                    Sleep(800);
+                }
+                continue;
+            }
+            uint32_t btn = (i & 1) ? PSP_CTRL_CROSS : PSP_CTRL_START;
+            hold_pad_direct(btn, 250);
+            for (int w = 0; w < 12 && !psp_duel_manager_start_requested(); w++)
+                Sleep(50);
         }
         fprintf(stderr, "input: free duel play start=%d\n",
                 psp_duel_manager_start_requested());
         if (psp_duel_manager_start_requested()) {
-            for (int i = 0; i < 6; i++) {
-                Sleep(3000);
+            for (int i = 0; i < 20 && !psp_exit_requested(); i++) {
+                Sleep(2500);
+                if (getenv("SETO_DUEL_ADVANCE") && (i == 2 || i == 4 || i == 6 || i == 8)) {
+                    psp_ctrl_set(PSP_CTRL_CROSS, 128, 128);
+                    Sleep(60);
+                    psp_ctrl_set(0, 128, 128);
+                }
+                if (getenv("SETO_DUEL_ADVANCE") && i == 13) {
+                    psp_ctrl_set(PSP_CTRL_TRIANGLE, 128, 128);
+                    Sleep(60);
+                    psp_ctrl_set(0, 128, 128);
+                }
+                if (getenv("SETO_TRACE_DUEL") && (i == 3 || i == 7 || i == 11 || i == 14 || i == 16))
+                    psp_ge_trace_next_frame();
                 char path[64];
                 snprintf(path, sizeof path, "build/s93-free-live%d.ppm", i);
                 psp_display_capture(path);
@@ -899,12 +1034,7 @@ static DWORD WINAPI duel_detect_thread(LPVOID unused) {
 static DWORD WINAPI input_thread(LPVOID unused) {
     (void)unused;
     const char *auto_start = getenv("SETO_AUTO_START");
-    int sent = 0, held = 0, timed_out = 0;
-    int held_up = 0, held_down = 0, held_cross = 0;
-    uint32_t menu_mask = 0;
-    int menu_cursor = 0, menu_state = 0;
-    DWORD menu_deadline = 0;
-    DWORD press_ms = 0;
+    int sent = 0;
     int duel_traces = 0;
     DWORD duel_last = 0;
     const int trace_duel = getenv("SETO_TRACE_DUEL") != NULL;
@@ -1264,7 +1394,7 @@ story_started:
                             }
                             /* The command menu opens after an analog
                              * down-right walk (255,255) followed by CROSS. */
-                            int menu = 0, seen_script = 0;
+                            int menu = 0, seen_script = guard > 0;
                             for (int i = 0; i < 1500 && !menu; i++) {
                                 const uint32_t st = psp_read32(0x093CDAFCu);
                                 if (st == 5u || st == 6u || st == 23u) seen_script = 1;
@@ -1945,149 +2075,9 @@ map_list_open:
         } else
 #endif
         {
-            /* Field free roam: direct pad, so the player can walk and talk
-             * without the automation. */
-            const uint32_t fst = psp_read32(0x093CDAFCu);
-            if (fst == 1u || fst == 6u || fst == 11u || fst == 12u || fst == 23u) {
-                uint32_t fm = 0;
-                if (GetAsyncKeyState(VK_LEFT) & 0x8000)  fm |= 0x00000080u;
-                if (GetAsyncKeyState(VK_RIGHT) & 0x8000) fm |= 0x00000020u;
-                if (GetAsyncKeyState(VK_UP) & 0x8000)    fm |= 0x00000010u;
-                if (GetAsyncKeyState(VK_DOWN) & 0x8000)  fm |= 0x00000040u;
-                if (GetAsyncKeyState('Z') & 0x8000)      fm |= 0x00004000u;
-                if (GetAsyncKeyState('X') & 0x8000)      fm |= 0x00002000u;
-                if (GetAsyncKeyState('C') & 0x8000)      fm |= 0x00001000u;
-                if (GetAsyncKeyState(VK_RETURN) & 0x8000) fm |= 0x00000008u;
-                psp_ctrl_set(fm, 128, 128);
-                Sleep(10);
-                continue;
-            }
-#ifdef HAVE_TITLE_CORPUS
-            const int state = psp_title_scene_state();
-            /* Story/part menus and other screens do not use the title's
-             * menu_request path; send the pad directly there. */
-            if (state != 3 && state != 4) {
-                uint32_t fm = 0;
-                if (GetAsyncKeyState(VK_LEFT) & 0x8000)  fm |= PSP_CTRL_LEFT;
-                if (GetAsyncKeyState(VK_RIGHT) & 0x8000) fm |= PSP_CTRL_RIGHT;
-                if (GetAsyncKeyState(VK_UP) & 0x8000)    fm |= PSP_CTRL_UP;
-                if (GetAsyncKeyState(VK_DOWN) & 0x8000)  fm |= PSP_CTRL_DOWN;
-                if (GetAsyncKeyState('Z') & 0x8000)      fm |= PSP_CTRL_CROSS;
-                if (GetAsyncKeyState('X') & 0x8000)      fm |= PSP_CTRL_CIRCLE;
-                if (GetAsyncKeyState('C') & 0x8000)      fm |= PSP_CTRL_TRIANGLE;
-                if (GetAsyncKeyState(VK_RETURN) & 0x8000) fm |= PSP_CTRL_START;
-                psp_ctrl_set(fm, 128, 128);
-                Sleep(10);
-                continue;
-            }
-            if (state == 4) {
-                /* Name/confirmation and the story part selector: direct pad
-                 * with both axes, held while the key is down. */
-                uint32_t fm = 0;
-                if (GetAsyncKeyState(VK_LEFT) & 0x8000)  fm |= PSP_CTRL_LEFT;
-                if (GetAsyncKeyState(VK_RIGHT) & 0x8000) fm |= PSP_CTRL_RIGHT;
-                if (GetAsyncKeyState(VK_UP) & 0x8000)    fm |= PSP_CTRL_UP;
-                if (GetAsyncKeyState(VK_DOWN) & 0x8000)  fm |= PSP_CTRL_DOWN;
-                if (GetAsyncKeyState('Z') & 0x8000)      fm |= PSP_CTRL_CROSS;
-                if (GetAsyncKeyState('X') & 0x8000)      fm |= PSP_CTRL_CIRCLE;
-                if (GetAsyncKeyState('C') & 0x8000)      fm |= PSP_CTRL_TRIANGLE;
-                if (GetAsyncKeyState(VK_RETURN) & 0x8000) fm |= PSP_CTRL_START;
-                psp_ctrl_set(fm, 128, 128);
-                Sleep(10);
-                continue;
-            }
-            if (menu_mask) {
-                const int c = psp_title_scene_cursor();
-                const int s = psp_title_scene_state();
-                if (s != menu_state ||
-                    (menu_mask != PSP_CTRL_CROSS && c != menu_cursor) ||
-                    GetTickCount() > menu_deadline) {
-                    psp_title_menu_request(0);
-                    fprintf(stderr, "input: menu 0x%04X done state=%d cursor=%d\n",
-                            menu_mask, s, c);
-                    menu_mask = 0;
-                }
-            }
-            const int kup = (GetAsyncKeyState(VK_UP) & 0x8000) != 0;
-            const int kdown = (GetAsyncKeyState(VK_DOWN) & 0x8000) != 0;
-            const int kcross = (GetAsyncKeyState('Z') & 0x8000) != 0;
-            if (kup && !held_up) {
-                held_up = 1;
-                if (state == 3 && !menu_mask) {
-                    menu_mask = PSP_CTRL_UP;
-                    menu_cursor = psp_title_scene_cursor();
-                    menu_state = state;
-                    menu_deadline = GetTickCount() + 800;
-                    psp_title_menu_request(menu_mask);
-                    fprintf(stderr, "input: UP press\n");
-                }
-            } else if (!kup) held_up = 0;
-            if (kdown && !held_down) {
-                held_down = 1;
-                if (state == 3 && !menu_mask) {
-                    menu_mask = PSP_CTRL_DOWN;
-                    menu_cursor = psp_title_scene_cursor();
-                    menu_state = state;
-                    menu_deadline = GetTickCount() + 800;
-                    psp_title_menu_request(menu_mask);
-                    fprintf(stderr, "input: DOWN press\n");
-                }
-            } else if (!kdown) held_down = 0;
-            if (kcross && !held_cross) {
-                held_cross = 1;
-                if (state == 3 && !menu_mask) {
-                    menu_mask = PSP_CTRL_CROSS;
-                    menu_cursor = psp_title_scene_cursor();
-                    menu_state = state;
-                    menu_deadline = GetTickCount() + 800;
-                    psp_title_menu_request(menu_mask);
-                    fprintf(stderr, "input: CROSS press\n");
-                } else if (state == 4) {
-                    psp_ctrl_set(PSP_CTRL_CROSS, 128, 128);
-                    Sleep(100);
-                    psp_ctrl_set(0, 128, 128);
-                    fprintf(stderr, "input: CROSS name press\n");
-                }
-            } else if (!kcross) held_cross = 0;
-#endif
-            int down = (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0;
-            /* One request per physical press. The title re-issues the pad edge
-             * until its own step advances, so a slow frame cannot lose it;
-             * release clears the request. */
-            if (down && !held) {
-                held = 1;
-                timed_out = 0;
-                press_ms = GetTickCount();
-#ifdef HAVE_TITLE_CORPUS
-                if (state == 4) {
-                    psp_ctrl_set(PSP_CTRL_START, 128, 128);
-                    Sleep(100);
-                    psp_ctrl_set(0, 128, 128);
-                } else {
-                    psp_title_start_request(1);
-                }
-#else
-                psp_ctrl_set(PSP_CTRL_START, 128, 128);
-#endif
-                fprintf(stderr, "input: START press\n");
-            } else if (!down && held) {
-                held = 0;
-                timed_out = 0;
-#ifdef HAVE_TITLE_CORPUS
-                psp_title_start_request(0);
-#else
-                psp_ctrl_set(0, 128, 128);
-#endif
-                fprintf(stderr, "input: START release\n");
-            }
-#ifdef HAVE_TITLE_CORPUS
-            else if (held && !timed_out && !psp_title_start_done() &&
-                     GetTickCount() - press_ms > 5000) {
-                timed_out = 1;
-                psp_title_start_request(0);
-                fprintf(stderr, "input: START timeout\n");
-            }
-#endif
+            /* Manual play: always forward focused host pad state directly across
+             * all screens (title, menus, field, duel) without scene-state locks. */
+            psp_ctrl_set(poll_host_pad(), 128, 128);
         }
         Sleep(10);
     }
@@ -2125,9 +2115,11 @@ int main(int argc, char **argv) {
     const char *duel_rec = argc > 14 ? argv[14] : NULL;
     const char *charalist = argc > 15 ? argv[15] : NULL;
     const char *shop = argc > 16 ? argv[16] : NULL;
-    const int free_duel = getenv("SETO_FREE_DUEL") != NULL;
+    const int free_duel = getenv("SETO_FREE_DUEL") != NULL &&
+                          !getenv("SETO_FREE_DUEL_PLAY");
 
     if (psp_mem_init() != 0) { fprintf(stderr, "memory init failed\n"); return 1; }
+    timeBeginPeriod(1);
 
     psp_module m;
     if (psp_module_load(elf, MODULE_SPAN, &m) != 0) {
@@ -2297,10 +2289,12 @@ int main(int argc, char **argv) {
      * short grace slice so the last presses can request modules. */
     int idle = 0;
     while (!psp_exit_requested() && idle < 5000) {
-        psp_threadman_host_sleep_ms(g_input_done ? 1u : 16u);
-        idle = g_input_done ? idle + 1 : 0;
+        const uint32_t step = g_input_done ? 16u : 50u;
+        psp_threadman_host_sleep_ms(step);
+        idle = g_input_done ? idle + (int)step : 0;
     }
     seto_window_stop();
+    timeEndPeriod(1);
     report("run ended");
     return 0;
 }

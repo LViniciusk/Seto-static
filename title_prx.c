@@ -364,8 +364,8 @@ static void title_input_update(uint32_t addr) {
     }
 
     uint32_t menu = atomic_load(&g_menu_request);
-    if (menu && (state == 3 || (state == 4 && phase == 6 &&
-                               psp_title_confirm_state() == 3))) {
+    if (menu && (state == 3 || (state == 4 && (phase == 9 ||
+                               (phase == 6 && psp_title_confirm_state() == 3))))) {
         g_pad_on = 0;
         g_menu_on ^= 1;
         psp_ctrl_set(g_menu_on ? menu : 0u, 128, 128);
