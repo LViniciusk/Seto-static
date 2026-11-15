@@ -1,0 +1,113 @@
+diff --git a/src/hle/threadman.c b/src/hle/threadman.c
+index c12ee68..6987aa4 100644
+--- a/src/hle/threadman.c
++++ b/src/hle/threadman.c
+@@ -79,8 +79,13 @@
+ #define MAX_SEMAS   128
+ #define MAX_FLAGS   128
+ #define MAX_CBS     64
++#define MAX_MBX     32
++#define MAX_MBX_MSG 64
+ #define UID_BASE    0x00040000u
+ 
++#define SCE_KERNEL_ERROR_MBOX_EMPTY 0x800201B0u
++#define SCE_KERNEL_ERROR_MBOX_FULL  0x800201B1u
++
+ /* Virtual microseconds in one scheduler tick, and the most real time a park
+  * will ever spend (see the clock note above). */
+ #define TICK_US      1000ull
+@@ -219,6 +224,16 @@ static psp_thread   g_thread[MAX_THREADS];
+ static psp_sema     g_sema[MAX_SEMAS];
+ static psp_evflag   g_flag[MAX_FLAGS];
+ static psp_callback g_cb[MAX_CBS];
++
++typedef struct {
++    uint32_t uid;
++    int      used;
++    char     name[32];
++    uint32_t count;
++    uint32_t head;
++    uint32_t msg[MAX_MBX_MSG];
++} psp_mbx;
++static psp_mbx g_mbx[MAX_MBX];
+ static uint64_t     g_cb_deliveries;        /* callbacks that actually ran */
+ static uint64_t     g_cb_unresolved;        /* notifications dropped: not a recompiled function */
+ static uint64_t     g_cb_unresolved_logged;
+@@ -545,6 +560,7 @@ void psp_threadman_reset(void) {
+     memset(g_sema, 0, sizeof g_sema);
+     memset(g_flag, 0, sizeof g_flag);
+     memset(g_cb, 0, sizeof g_cb);
++    memset(g_mbx, 0, sizeof g_mbx);
+     g_cb_deliveries = 0;
+     g_cb_unresolved = 0;
+     g_cb_unresolved_logged = 0;
+@@ -1400,6 +1416,58 @@ static void hle_PollEventFlag(void) {
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ 
++/* ---- mailboxes ------------------------------------------------------------
++ *
++ * The duel loader uses a mailbox to hand completion messages from its worker
++ * back to the scene thread. The queue is only pointers; blocking receives are
++ * not used by this game, so poll/send and create/delete are the whole contract
++ * needed here. */
++static psp_mbx *find_mbx(uint32_t id) {
++    for (int i = 0; i < MAX_MBX; i++)
++        if (g_mbx[i].used && g_mbx[i].uid == id) return &g_mbx[i];
++    return NULL;
++}
++
++static void hle_CreateMbx(void) {
++    /* (name, attr, option) */
++    psp_mbx *m = NULL;
++    for (int i = 0; i < MAX_MBX; i++) if (!g_mbx[i].used) { m = &g_mbx[i]; break; }
++    if (!m) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
++    memset(m, 0, sizeof *m);
++    psp_str(psp_arg(0), m->name, sizeof m->name);
++    m->uid = g_next_uid++;
++    m->used = 1;
++    psp_ret(m->uid);
++}
++
++static void hle_DeleteMbx(void) {
++    psp_mbx *m = find_mbx(psp_arg(0));
++    if (!m) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
++    m->used = 0;
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++
++static void hle_SendMbx(void) {
++    psp_mbx *m = find_mbx(psp_arg(0));
++    if (!m) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
++    if (m->count >= MAX_MBX_MSG) { psp_ret(SCE_KERNEL_ERROR_MBOX_FULL); return; }
++    m->msg[(m->head + m->count) % MAX_MBX_MSG] = psp_arg(1);
++    m->count++;
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++
++static void hle_PollMbx(void) {
++    psp_mbx *m = find_mbx(psp_arg(0));
++    if (!m) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
++    if (!m->count) { psp_ret(SCE_KERNEL_ERROR_MBOX_EMPTY); return; }
++    uint32_t msg = m->msg[m->head];
++    m->head = (m->head + 1u) % MAX_MBX_MSG;
++    m->count--;
++    uint32_t out = psp_arg(1);
++    if (out) psp_write32(out, msg);
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++
+ /* ---- variable-size pools -------------------------------------------------
+  *
+  * A VPL is a memory pool a game allocates blocks out of. This one is backed by
+@@ -1734,6 +1802,10 @@ void psp_threadman_register(void) {
+     psp_hle_register(0x812346E4, "ThreadManForUser", "sceKernelClearEventFlag",          hle_ClearEventFlag);
+     psp_hle_register(0x402FCF22, "ThreadManForUser", "sceKernelWaitEventFlag",           hle_WaitEventFlag);
+     psp_hle_register(0x30FD48F0, "ThreadManForUser", "sceKernelPollEventFlag",           hle_PollEventFlag);
++    psp_hle_register(0x8125221D, "ThreadManForUser", "sceKernelCreateMbx",               hle_CreateMbx);
++    psp_hle_register(0x86255ADA, "ThreadManForUser", "sceKernelDeleteMbx",               hle_DeleteMbx);
++    psp_hle_register(0xE9B3061E, "ThreadManForUser", "sceKernelSendMbx",                 hle_SendMbx);
++    psp_hle_register(0x0D81716A, "ThreadManForUser", "sceKernelPollMbx",                 hle_PollMbx);
+ 
+     psp_hle_register(0x56C039B5, "ThreadManForUser", "sceKernelCreateVpl",               hle_CreateVpl);
+     psp_hle_register(0x89B3D48C, "ThreadManForUser", "sceKernelDeleteVpl",               hle_DeleteVpl);

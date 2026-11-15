@@ -1,0 +1,155 @@
+diff --git a/src/hle/iofilemgr.c b/src/hle/iofilemgr.c
+index 5228927..d0c123a 100644
+--- a/src/hle/iofilemgr.c
++++ b/src/hle/iofilemgr.c
+@@ -133,6 +133,14 @@ static void hle_Open(void) {
+         snprintf(host, sizeof host, "%s", g_umd[0] ? g_umd : "(no disc image set)");
+     } else {
+         map_path(guest, host, sizeof host);
++        /* The system font library opens its PGF files from flash0. A host
++         * directory (a PSP flash0 dump or an emulator asset tree) stands in
++         * for it when PSPRECOMP_FLASH0 names one. */
++        if (!strncmp(guest, "flash0:/", 8)) {
++            const char *root = getenv("PSPRECOMP_FLASH0");
++            if (root)
++                snprintf(host, sizeof host, "%s/%s", root, guest + 8);
++        }
+ 
+         const char *mode = "rb";
+         if (flags & PSP_O_TRUNC)                  mode = (flags & PSP_O_RDWR) == PSP_O_RDWR ? "w+b" : "wb";
+diff --git a/src/hle/misc.c b/src/hle/misc.c
+index a1d5648..c48e838 100644
+--- a/src/hle/misc.c
++++ b/src/hle/misc.c
+@@ -269,6 +269,106 @@ void psp_misc_reset(void) {
+ 
+ void psp_misc_init(void) { psp_misc_reset(); }
+ 
++/* ---- sceReg --------------------------------------------------------------
++ * The system font library resolves its fonts through the registry before it
++ * opens a PGF file. Serve the small /DATA/FONT and /SYSPROFILE/RESOLUTION
++ * subtrees the library reads; the values are the ones a PSP-3000 reports. */
++enum { REG_DIR = 1, REG_INT = 2, REG_STR = 3, REG_BIN = 4 };
++typedef struct { const char *name; uint32_t type, size; const void *data; } reg_key;
++typedef struct { const char *path; const reg_key *keys; int nkeys; } reg_cat;
++
++static const uint32_t R0 = 0, R1 = 1, R2 = 2, R288 = 0x288, R2000 = 0x2000, R2012 = 0x2012;
++static const char R_PATH[] = "flash0:/font";
++static const char R_FONT_NAME[] = "FTT-NewRodin Pro Latin";
++static const char R_FILE_NAME[] = "ltn0.pgf";
++
++static const reg_key R_FONT[] = {
++    { "path_name", REG_STR, sizeof R_PATH, R_PATH },
++    { "num_fonts", REG_INT, 4, &R1 },
++};
++static const reg_key R_INFO0[] = {
++    { "h_size", REG_INT, 4, &R288 },
++    { "v_size", REG_INT, 4, &R288 },
++    { "h_resolution", REG_INT, 4, &R2000 },
++    { "v_resolution", REG_INT, 4, &R2000 },
++    { "extra_attributes", REG_INT, 4, &R0 },
++    { "weight", REG_INT, 4, &R0 },
++    { "family_code", REG_INT, 4, &R1 },
++    { "style", REG_INT, 4, &R1 },
++    { "sub_style", REG_INT, 4, &R0 },
++    { "language_code", REG_INT, 4, &R2 },
++    { "region_code", REG_INT, 4, &R0 },
++    { "country_code", REG_INT, 4, &R1 },
++    { "font_name", REG_STR, sizeof R_FONT_NAME, R_FONT_NAME },
++    { "file_name", REG_STR, sizeof R_FILE_NAME, R_FILE_NAME },
++    { "expire_date", REG_INT, 4, &R0 },
++    { "shadow_option", REG_INT, 4, &R0 },
++};
++static const reg_key R_RES[] = {
++    { "horizontal", REG_INT, 4, &R2012 },
++    { "vertical", REG_INT, 4, &R2012 },
++};
++static const reg_cat R_CATS[] = {
++    { "/DATA/FONT", R_FONT, 2 },
++    { "/DATA/FONT/PROPERTY/INFO0", R_INFO0, (int)(sizeof R_INFO0 / sizeof R_INFO0[0]) },
++    { "/SYSPROFILE/RESOLUTION", R_RES, 2 },
++};
++
++static int reg_find_cat(uint32_t handle) {
++    int i = (int)(handle - 1);
++    return handle && i >= 0 && i < (int)(sizeof R_CATS / sizeof R_CATS[0]) ? i : -1;
++}
++static int reg_find_key(int ci, const char *name) {
++    for (int i = 0; i < R_CATS[ci].nkeys; i++)
++        if (strcmp(R_CATS[ci].keys[i].name, name) == 0) return i;
++    return -1;
++}
++static void reg_open_registry(void) {
++    uint32_t out = psp_arg(2);
++    if (out) psp_write32(out, 0);        /* the registry handle is always 0 */
++    psp_ret(0);
++}
++static void reg_open_category(void) {
++    char name[128];
++    psp_str(psp_arg(1), name, sizeof name);
++    for (int i = 0; i < (int)(sizeof R_CATS / sizeof R_CATS[0]); i++) {
++        if (strcmp(R_CATS[i].path, name) == 0) {
++            uint32_t out = psp_arg(3);
++            if (out) psp_write32(out, (uint32_t)i + 1u);
++            psp_ret(0);
++            return;
++        }
++    }
++    uint32_t out = psp_arg(3);
++    if (out) psp_write32(out, 0);
++    psp_ret(0xFFFFFFFFu);
++}
++static void reg_get_key_info(void) {
++    const int ci = reg_find_cat(psp_arg(0));
++    char name[128];
++    psp_str(psp_arg(1), name, sizeof name);
++    const int ki = ci >= 0 ? reg_find_key(ci, name) : -1;
++    if (ki < 0) { psp_ret(0xFFFFFFFFu); return; }
++    uint32_t out = psp_arg(2), type = psp_arg(3), size = psp_arg(4);
++    if (out) psp_write32(out, (uint32_t)ki);
++    if (type) psp_write32(type, R_CATS[ci].keys[ki].type);
++    if (size) psp_write32(size, R_CATS[ci].keys[ki].size);
++    psp_ret(0);
++}
++static void reg_get_key_value(void) {
++    const int ci = reg_find_cat(psp_arg(0));
++    const int ki = (int)psp_arg(1);
++    if (ci < 0 || ki < 0 || ki >= R_CATS[ci].nkeys) { psp_ret(0xFFFFFFFFu); return; }
++    const reg_key *k = &R_CATS[ci].keys[ki];
++    uint32_t buf = psp_arg(2), size = psp_arg(3);
++    if (size > k->size) size = k->size;
++    for (uint32_t i = 0; i < size; i++)
++        psp_write8(buf + i, ((const uint8_t *)k->data)[i]);
++    psp_ret(0);
++}
++static void reg_close_category(void) { psp_ret(0); }
++static void reg_close_registry(void) { psp_ret(0); }
++
+ void psp_misc_register(void) {
+     psp_hle_register(0x092968F4, "Kernel_Library", "sceKernelCpuSuspendIntr", hle_CpuSuspendIntr);
+     psp_hle_register(0x5F10D406, "Kernel_Library", "sceKernelCpuResumeIntr",  hle_CpuResumeIntr);
+@@ -319,4 +419,11 @@ void psp_misc_register(void) {
+     psp_hle_register(0xCB2E439E, "sceAudio", "sceAudioSetChannelDataLen",    hle_SetChannelDataLen);
+     psp_hle_register(0x95FD0C2D, "sceAudio", "sceAudioChangeChannelConfig",  hle_ok);
+     psp_hle_register(0xB7E1D8E7, "sceAudio", "sceAudioChangeChannelVolume",  hle_ok);
++
++    psp_hle_register(0x92E41280, "sceReg", "sceRegOpenRegistry",   reg_open_registry);
++    psp_hle_register(0x1D8A762E, "sceReg", "sceRegOpenCategory",   reg_open_category);
++    psp_hle_register(0xD4475AA8, "sceReg", "sceRegGetKeyInfo",     reg_get_key_info);
++    psp_hle_register(0x28A8E98A, "sceReg", "sceRegGetKeyValue",    reg_get_key_value);
++    psp_hle_register(0x0CAE832B, "sceReg", "sceRegCloseCategory",  reg_close_category);
++    psp_hle_register(0xFA8A5739, "sceReg", "sceRegCloseRegistry",  reg_close_registry);
+ }
+diff --git a/src/hle/sysmem.c b/src/hle/sysmem.c
+index ed73de6..a5476f4 100644
+--- a/src/hle/sysmem.c
++++ b/src/hle/sysmem.c
+@@ -42,7 +42,7 @@ static uint32_t  g_heap_lo, g_heap_hi;
+ /* Default user heap. Modules load at 0x08800000 and are a few megabytes, so
+  * starting above them keeps the allocator from handing out memory the module
+  * itself occupies. A host that knows its real layout should narrow this. */
+-#define DEFAULT_HEAP_LO 0x09600000u
++#define DEFAULT_HEAP_LO 0x09700000u
+ #define DEFAULT_HEAP_HI (PSP_RAM_BASE + PSP_RAM_SIZE)
+ 
+ void psp_sysmem_reset(void) {

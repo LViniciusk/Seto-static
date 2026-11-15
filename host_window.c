@@ -18,7 +18,7 @@
 #define WINDOW_W 960
 #define WINDOW_H 544
 #define TIMER_ID 1
-#define TIMER_MS 33                 /* ~30 FPS */
+#define TIMER_MS 16                 /* ~60 FPS */
 
 static HWND g_hwnd;
 static HANDLE g_thread;
@@ -27,6 +27,10 @@ static uint32_t *g_read;
 static uint32_t *g_dib;
 static BITMAPINFO g_bmi;
 static int g_have_frame;
+static HDC g_memdc;
+static HBITMAP g_membmp, g_memold;
+static int g_memw, g_memh;
+static char g_fps_text[64] = "FPS --.- | VPS --.-";
 
 static void update_frame(HWND hwnd) {
     if (IsIconic(hwnd)) return;
@@ -40,6 +44,29 @@ static void update_frame(HWND hwnd) {
                    ((c & 0x00FF0000u) >> 16);
     }
     g_have_frame = 1;
+    {
+        static DWORD last_ms;
+        static uint64_t last_frames, last_vblanks;
+        DWORD now = GetTickCount();
+        if (!last_ms) {
+            last_ms = now;
+            last_frames = psp_display_frames();
+            last_vblanks = psp_display_vblanks();
+        } else if (now - last_ms >= 500u) {
+            uint64_t cur_frames = psp_display_frames();
+            uint64_t cur_vblanks = psp_display_vblanks();
+            double dt = (double)(now - last_ms) / 1000.0;
+            double fps = (double)(cur_frames - last_frames) / dt;
+            double vps = (double)(cur_vblanks - last_vblanks) / dt;
+            snprintf(g_fps_text, sizeof g_fps_text, "FPS %.1f | VPS %.1f", fps, vps);
+            char title[96];
+            snprintf(title, sizeof title, "Seto-static | %s", g_fps_text);
+            SetWindowTextA(hwnd, title);
+            last_ms = now;
+            last_frames = cur_frames;
+            last_vblanks = cur_vblanks;
+        }
+    }
     InvalidateRect(hwnd, NULL, FALSE);
 }
 
@@ -47,24 +74,49 @@ static void paint(HWND hwnd, HDC hdc) {
     RECT rc;
     GetClientRect(hwnd, &rc);
     const int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
-    FillRect(hdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
-    if (!g_have_frame || cw <= 0 || ch <= 0) return;
-
-    /* 480:272 is 30:17. Fit the largest 30:17 rectangle and centre it. */
-    int dw, dh;
-    if ((int64_t)cw * 17 > (int64_t)ch * 30) {
-        dh = ch;
-        dw = MulDiv(ch, 30, 17);
-    } else {
-        dw = cw;
-        dh = MulDiv(cw, 17, 30);
+    if (cw <= 0 || ch <= 0) return;
+    /* Compose off-screen so a repaint never shows the black fill. */
+    if (cw != g_memw || ch != g_memh || !g_memdc) {
+        if (g_memdc) {
+            SelectObject(g_memdc, g_memold);
+            DeleteObject(g_membmp);
+            DeleteDC(g_memdc);
+        }
+        g_memdc = CreateCompatibleDC(hdc);
+        g_membmp = CreateCompatibleBitmap(hdc, cw, ch);
+        g_memold = SelectObject(g_memdc, g_membmp);
+        g_memw = cw; g_memh = ch;
     }
-    if (dw <= 0 || dh <= 0) return;
-
-    SetStretchBltMode(hdc, COLORONCOLOR);
-    StretchDIBits(hdc, (cw - dw) / 2, (ch - dh) / 2, dw, dh,
-                  0, 0, SCREEN_W, SCREEN_H, g_dib, &g_bmi,
-                  DIB_RGB_COLORS, SRCCOPY);
+    FillRect(g_memdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    if (g_have_frame) {
+        /* 480:272 is 30:17. Fit the largest 30:17 rectangle and centre it. */
+        int dw, dh;
+        if ((int64_t)cw * 17 > (int64_t)ch * 30) {
+            dh = ch;
+            dw = MulDiv(ch, 30, 17);
+        } else {
+            dw = cw;
+            dh = MulDiv(cw, 17, 30);
+        }
+        if (dw > 0 && dh > 0) {
+            SetStretchBltMode(g_memdc, COLORONCOLOR);
+            StretchDIBits(g_memdc, (cw - dw) / 2, (ch - dh) / 2, dw, dh,
+                          0, 0, SCREEN_W, SCREEN_H, g_dib, &g_bmi,
+                          DIB_RGB_COLORS, SRCCOPY);
+        }
+    }
+    if (g_fps_text[0]) {
+        HFONT old_font = (HFONT)SelectObject(g_memdc, GetStockObject(DEFAULT_GUI_FONT));
+        COLORREF old_fg = SetTextColor(g_memdc, RGB(80, 255, 120));
+        COLORREF old_bg = SetBkColor(g_memdc, RGB(12, 16, 20));
+        int old_mode = SetBkMode(g_memdc, OPAQUE);
+        TextOutA(g_memdc, 8, 6, g_fps_text, (int)strlen(g_fps_text));
+        SetBkMode(g_memdc, old_mode);
+        SetBkColor(g_memdc, old_bg);
+        SetTextColor(g_memdc, old_fg);
+        SelectObject(g_memdc, old_font);
+    }
+    BitBlt(hdc, 0, 0, cw, ch, g_memdc, 0, 0, SRCCOPY);
 }
 
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -91,12 +143,18 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KEYDOWN:
     case WM_KEYUP:
         if (wp == VK_RETURN) return 0;   /* input thread samples the keyboard */
-        break;
+        return DefWindowProcW(hwnd, msg, wp, lp);
     case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_ID);
+        if (g_memdc) {
+            SelectObject(g_memdc, g_memold);
+            DeleteObject(g_membmp);
+            DeleteDC(g_memdc);
+            g_memdc = NULL;
+        }
         g_hwnd = NULL;
         PostQuitMessage(0);
         return 0;
@@ -154,6 +212,7 @@ static DWORD WINAPI window_thread(LPVOID unused) {
     }
 
     ShowWindow(g_hwnd, SW_SHOW);
+    ShowWindow(g_hwnd, SW_SHOWNORMAL);
     UpdateWindow(g_hwnd);
     SetForegroundWindow(g_hwnd);
     SetEvent(g_ready);

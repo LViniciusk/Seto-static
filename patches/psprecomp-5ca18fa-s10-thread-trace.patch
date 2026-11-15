@@ -1,0 +1,37 @@
+diff --git a/src/hle/threadman.c b/src/hle/threadman.c
+--- a/src/hle/threadman.c
++++ b/src/hle/threadman.c
+@@ -1167,9 +1167,25 @@
+ 
+ static void hle_GetThreadId(void) { psp_ret(g_current ? g_current->uid : 0); }
+ 
++/* SETO_TRACE_THREAD=1 names every suspend/resume/wakeup with the thread uid;
++ * a stalled hand-over shows up as a suspend whose resume never arrives. */
++static int trace_threads(void) {
++    static int on = -1;
++    if (on < 0) on = getenv("SETO_TRACE_THREAD") != NULL;
++    return on;
++}
++
++static void trace_thread(const char *what, const psp_thread *t) {
++    if (!t || !trace_threads()) return;
++    fprintf(stderr, "thread: %s uid=%u name='%s' state=%d\n",
++            what, t->uid, t->name, (int)t->state);
++    fflush(stderr);
++}
++
+ static void hle_SuspendThread(void) {
+     psp_thread *t = find_thread(psp_arg(0));
+     if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
++    trace_thread("suspend", t);
+ #if PSPRECOMP_REAL_THREADS
+     host_mutex_lock(&g_baton_m);
+ #endif
+@@ -1184,6 +1200,7 @@
+ static void hle_ResumeThread(void) {
+     psp_thread *t = find_thread(psp_arg(0));
+     if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
++    trace_thread("resume", t);
+ #if PSPRECOMP_REAL_THREADS
+     host_mutex_lock(&g_baton_m);
+ #endif

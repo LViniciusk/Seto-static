@@ -1,0 +1,112 @@
+diff --git a/src/vfpu.c b/src/vfpu.c
+--- a/src/vfpu.c
++++ b/src/vfpu.c
+@@ -642,12 +642,8 @@ void psp_vmscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+     matrix_write(vd, size, m);
+ }
+ 
+-/* Transform a vector by a matrix: vd[r] = sum over c of M[c][r] * v[c].
+- *
+- * This is the column-major product a graphics pipeline wants -- the matrix
+- * columns are the transformed basis vectors, so transforming (1,0,0,0) yields
+- * column 0. That property is what the test pins, and it is the one that
+- * distinguishes this from its transpose. */
++/* Like vmmul's first operand, vtfm uses the encoded matrix transposed.
++ * E-form selects the ordinary column-major matrix/vector product. */
+ void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+     if (!take_prefixes(psp_cpu.pc, "vtfm")) return;
+     float m[4][4];
+@@ -660,7 +656,7 @@ void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+     for (int i = 0; i < size; i++) in[i] = psp_cpu.v[t[i]];
+     for (int r = 0; r < size; r++) {
+         float sum = 0.0f;
+-        for (int c = 0; c < size; c++) sum += m[c][r] * in[c];
++        for (int c = 0; c < size; c++) sum += m[r][c] * in[c];
+         out[r] = sum;
+     }
+     /* vd may be one of the sources, so write only after the whole result is
+diff --git a/tests/test_vfpu.c b/tests/test_vfpu.c
+--- a/tests/test_vfpu.c
++++ b/tests/test_vfpu.c
+@@ -397,13 +397,38 @@ static void test_vmmul_orientation(void) {
+     CHECK_F(out[1][1], 44.0f, "plain vmmul is A^T*B: row 1 col 1");
+ }
+ 
++/* PSP measurements: pspautotests tests/cpu/vfpu/matrix.{c,expected}.
++ * Its matrix is loaded through R700..R703, not C700..C730. */
++static void test_vtfm_hardware(void) {
++    psp_vfpu_reset();
++    for (int row = 0; row < 4; row++) {
++        int lanes[4];
++        psp_vfpu_regs(0x3C + (uint32_t)row, 4, lanes);
++        for (int col = 0; col < 4; col++)
++            psp_cpu.v[lanes[col]] = (float)(row * 4 + col + 1) * (col & 1 ? -1 : 1);
++    }
++    int src[4], dst[4];
++    psp_vfpu_regs(0x38, 4, src);  /* R600 */
++    const float in[] = { -13, -2111, 33, 40 };
++    const float expected[2][4] = {
++        { -10271, 12362, -14453, 0 }, { -9751, 11802, -13853, 15904 }
++    };
++    for (int n = 3; n <= 4; n++) {
++        for (int i = 0; i < 4; i++) psp_cpu.v[src[i]] = in[i];
++        psp_vtfm(0x24, 0x1C, 0x38, n); /* R100, M700, R600 */
++        psp_vfpu_regs(0x24, n, dst);
++        for (int i = 0; i < n; i++)
++            CHECK(psp_cpu.v[dst[i]] == expected[n - 3][i],
++                  "vtfm%d PSP lane %d: got %g, want %g", n, i,
++                  (double)psp_cpu.v[dst[i]], (double)expected[n - 3][i]);
++    }
++}
++
+ static void test_matrix_transform(void) {
+     psp_vfpu_reset();
+-    float m[4][4], v[4];
++    float m[4][4];
+ 
+-    /* Transforming a basis vector must yield the corresponding matrix column.
+-     * That is the property which distinguishes this convention from its
+-     * transpose -- an identity test would pass either way. */
++    /* Plain vtfm uses the transposed matrix; E-form uses it untransposed. */
+     for (int c = 0; c < 4; c++)
+         for (int r = 0; r < 4; r++) m[c][r] = (float)(c * 4 + r + 1);
+     set_matrix(0x08, 4, m);
+@@ -416,7 +441,10 @@ static void test_matrix_transform(void) {
+         psp_vtfm(0x44, 0x08, 0x40, 4);
+         psp_vfpu_regs(0x44, 4, d);
+         for (int r = 0; r < 4; r++)
+-            CHECK_F(psp_cpu.v[d[r]], m[basis][r], "vtfm of a basis vector is that column");
++            CHECK_F(psp_cpu.v[d[r]], m[r][basis], "plain vtfm of a basis vector is that row");
++        psp_vtfm(0x44, 0x28, 0x40, 4);
++        for (int r = 0; r < 4; r++)
++            CHECK_F(psp_cpu.v[d[r]], m[basis][r], "E-form vtfm of a basis vector is that column");
+     }
+ 
+     /* Multiplying by the identity must be a no-op, in both operand positions.
+@@ -458,15 +486,15 @@ static void test_matrix_transform(void) {
+ 
+     /* (A*B) * x */
+     psp_vmmul(0x14, 0x28, 0x10, 4);       /* matrix 5 = A*B, via E-form A */
+-    psp_vtfm(0x1C, 0x14, 0x18, 4);        /* matrix 7 */
++    psp_vtfm(0x1C, 0x34, 0x18, 4);        /* matrix 7, E-form AB */
+     float combined[4];
+     int d[4];
+     psp_vfpu_regs(0x1C, 4, d);
+     for (int i = 0; i < 4; i++) combined[i] = psp_cpu.v[d[i]];
+ 
+     /* A * (B * x) */
+-    psp_vtfm(0x00, 0x10, 0x18, 4);        /* matrix 0 */
+-    psp_vtfm(0x04, 0x08, 0x00, 4);        /* matrix 1 */
++    psp_vtfm(0x00, 0x30, 0x18, 4);        /* matrix 0, E-form B */
++    psp_vtfm(0x04, 0x28, 0x00, 4);        /* matrix 1, E-form A */
+     psp_vfpu_regs(0x04, 4, d);
+     for (int i = 0; i < 4; i++)
+         CHECK_F(psp_cpu.v[d[i]], combined[i],
+@@ -563,6 +591,7 @@ int main(void) {
+     test_compare();
+     test_matrix_ops();
+     test_matrix_transform();
++    test_vtfm_hardware();
+     test_vmmul_orientation();
+     test_conversions();
+ 

@@ -1,0 +1,355 @@
+diff --git a/include/psprecomp/mem.h b/include/psprecomp/mem.h
+--- a/include/psprecomp/mem.h
++++ b/include/psprecomp/mem.h
+@@ -66,6 +66,8 @@
+  * `size` is the access width; a read straddling the end of a region is
+  * rejected rather than silently truncated. */
+ void *psp_mem_ptr(uint32_t addr, uint32_t size);
++/* Checked span for bulk rendering; NULL keeps watched accesses on the slow path. */
++void *psp_mem_unwatched_ptr(uint32_t addr, uint32_t size);
+ 
+ /* The PSP is little-endian and so is every host we target, so these are plain
+  * loads once the address is resolved. Unmapped accesses return 0 / are dropped
+diff --git a/src/mem.c b/src/mem.c
+--- a/src/mem.c
++++ b/src/mem.c
+@@ -172,6 +172,16 @@
+     return NULL;
+ }
+ 
++void *psp_mem_unwatched_ptr(uint32_t addr, uint32_t size) {
++    if (g_wwatch || g_rwatch) return NULL;
++    const uint32_t a = addr & PSP_ADDR_MASK;
++    /* A span must not jump over a higher-priority module mapping. */
++    if (g_module_size && g_module_base > a && g_module_base - a < size) return NULL;
++    for (int i = 0; i < PSP_MAX_EXTRA; i++)
++        if (g_extra[i].size && g_extra[i].base > a && g_extra[i].base - a < size) return NULL;
++    return psp_mem_ptr(addr, size);
++}
++
+ /* Reads of unmapped memory return 0 and are counted. Silently returning 0 is
+  * what hardware roughly does, but a recompiled game should never be doing it
+  * in a steady state — the counter is how you notice. */
+diff --git a/src/hle/display.c b/src/hle/display.c
+--- a/src/hle/display.c
++++ b/src/hle/display.c
+@@ -93,6 +93,13 @@
+     if (!addr) return -1;
+     const int bpp = (fmt == PSP_DISPLAY_PIXEL_FORMAT_8888) ? 4 : 2;
+     for (int y = 0; y < PSP_SCREEN_H; y++) {
++        const uint32_t row = addr + (uint32_t)(y * (int)stride) * (uint32_t)bpp;
++        const void *pixels = fmt == PSP_DISPLAY_PIXEL_FORMAT_8888
++                           ? psp_mem_unwatched_ptr(row, PSP_SCREEN_W * 4) : NULL;
++        if (pixels) {
++            memcpy(out + y * PSP_SCREEN_W, pixels, PSP_SCREEN_W * 4);
++            continue;
++        }
+         for (int x = 0; x < PSP_SCREEN_W; x++) {
+             uint32_t at = addr + (uint32_t)(y * (int)stride + x) * (uint32_t)bpp;
+             uint32_t px = (bpp == 4) ? psp_read32(at) : psp_read16(at);
+diff --git a/src/render.c b/src/render.c
+--- a/src/render.c
++++ b/src/render.c
+@@ -24,6 +24,43 @@
+ static int      g_fb_fmt = 3;
+ static uint64_t g_pixels;
+ static uint64_t g_bad_texels;
++
++/* Resolve once per draw, never across guest writes, module reloads or watches. */
++typedef struct { uint32_t addr; uint8_t *data; } render_span;
++static render_span g_fb_span, g_z_span, g_tex_span;
++
++static void map_span(render_span *s, uint32_t addr, uint64_t size) {
++    s->addr = addr;
++    s->data = size && size <= UINT32_MAX ? psp_mem_unwatched_ptr(addr, (uint32_t)size) : NULL;
++}
++
++static uint32_t span_read32(const render_span *s, uint32_t addr) {
++    uint32_t v;
++    if (!s->data) return psp_read32(addr);
++    memcpy(&v, s->data + (uint32_t)(addr - s->addr), sizeof v);
++    return v;
++}
++
++static uint16_t span_read16(const render_span *s, uint32_t addr) {
++    uint16_t v;
++    if (!s->data) return psp_read16(addr);
++    memcpy(&v, s->data + (uint32_t)(addr - s->addr), sizeof v);
++    return v;
++}
++
++static uint8_t span_read8(const render_span *s, uint32_t addr) {
++    return s->data ? s->data[(uint32_t)(addr - s->addr)] : psp_read8(addr);
++}
++
++static void span_write32(const render_span *s, uint32_t addr, uint32_t value) {
++    if (s->data) memcpy(s->data + (uint32_t)(addr - s->addr), &value, sizeof value);
++    else psp_write32(addr, value);
++}
++
++static void span_write16(const render_span *s, uint32_t addr, uint16_t value) {
++    if (s->data) memcpy(s->data + (uint32_t)(addr - s->addr), &value, sizeof value);
++    else psp_write16(addr, value);
++}
+ 
+ uint64_t psp_render_pixels(void) { return g_pixels; }
+ void     psp_render_reset_pixels(void) { g_pixels = 0; g_bad_texels = 0; }
+@@ -124,10 +161,10 @@
+     const uint32_t blk = st->tex_addr + ((y >> 2) * ((uint32_t)st->tex_bw / 4) + (x >> 2)) * size;
+     const uint32_t i = (y & 3) * 4 + (x & 3);
+ 
+-    const uint32_t c0 = psp_read16(blk + 4), c1 = psp_read16(blk + 6);
++    const uint32_t c0 = span_read16(&g_tex_span, blk + 4), c1 = span_read16(&g_tex_span, blk + 6);
+     const uint32_t a = psp_color_expand(c0, 0), b = psp_color_expand(c1, 0);
+     uint32_t out;
+-    switch ((psp_read32(blk) >> (2 * i)) & 3) {
++    switch ((span_read32(&g_tex_span, blk) >> (2 * i)) & 3) {
+     case 0:  out = a; break;
+     case 1:  out = b; break;
+     case 2:
+@@ -142,11 +179,11 @@
+         break;
+     }
+     if (st->tex_fmt == PSP_TPSM_DXT3) {
+-        const uint32_t al = (psp_read16(blk + 8 + (y & 3) * 2) >> ((x & 3) * 4)) & 0xF;
++        const uint32_t al = (span_read16(&g_tex_span, blk + 8 + (y & 3) * 2) >> ((x & 3) * 4)) & 0xF;
+         out = (out & 0x00FFFFFFu) | ((al * 17) << 24);
+     } else if (st->tex_fmt == PSP_TPSM_DXT5) {
+-        const uint64_t bits = (uint64_t)psp_read16(blk + 12) | ((uint64_t)psp_read32(blk + 8) << 16);
+-        const int a0 = psp_read8(blk + 14), a1 = psp_read8(blk + 15);
++        const uint64_t bits = (uint64_t)span_read16(&g_tex_span, blk + 12) | ((uint64_t)span_read32(&g_tex_span, blk + 8) << 16);
++        const int a0 = span_read8(&g_tex_span, blk + 14), a1 = span_read8(&g_tex_span, blk + 15);
+         const int k = (int)(bits >> (3 * i)) & 7;
+         int al;
+         if (k == 0) al = a0;
+@@ -172,17 +209,17 @@
+     const uint32_t at = st->tex_addr + tex_offset(st, (uint32_t)x * (uint32_t)bpp / 8, (uint32_t)y);
+     switch (st->tex_fmt) {
+     case PSP_TPSM_565: case PSP_TPSM_5551: case PSP_TPSM_4444:
+-        return psp_color_expand(psp_read16(at), st->tex_fmt);
++        return psp_color_expand(span_read16(&g_tex_span, at), st->tex_fmt);
+     case PSP_TPSM_8888:
+-        return psp_read32(at);
++        return span_read32(&g_tex_span, at);
+     case PSP_TPSM_T4:
+-        return clut_entry(st, (psp_read8(at) >> ((x & 1) * 4)) & 0xF);
++        return clut_entry(st, (span_read8(&g_tex_span, at) >> ((x & 1) * 4)) & 0xF);
+     case PSP_TPSM_T8:
+-        return clut_entry(st, psp_read8(at));
++        return clut_entry(st, span_read8(&g_tex_span, at));
+     case PSP_TPSM_T16:
+-        return clut_entry(st, psp_read16(at));
++        return clut_entry(st, span_read16(&g_tex_span, at));
+     default:  /* T32 */
+-        return clut_entry(st, psp_read32(at));
++        return clut_entry(st, span_read32(&g_tex_span, at));
+     }
+ }
+ 
+@@ -259,6 +296,12 @@
+ }
+ 
+ static uint32_t blend(const psp_draw_state *st, uint32_t s, uint32_t d) {
++    if (st->blend_src == 2 && st->blend_dst == 3 && st->blend_op == 0) {
++        const int a = (int)A(s), inv = 255 - a;
++        return rgba(mul8(R(s), a) + mul8(R(d), inv),
++                    mul8(G(s), a) + mul8(G(d), inv),
++                    mul8(B(s), a) + mul8(B(d), inv), a);
++    }
+     int out[3];
+     for (int ch = 0; ch < 3; ch++) {
+         int sc = (int)((s >> (ch * 8)) & 0xFF), dc = (int)((d >> (ch * 8)) & 0xFF);
+@@ -288,15 +331,15 @@
+ }
+ 
+ static uint32_t fb_read(uint32_t at) {
+-    uint32_t c = g_fb_fmt == 3 ? psp_read32(at) : psp_color_expand(psp_read16(at), g_fb_fmt);
++    uint32_t c = g_fb_fmt == 3 ? span_read32(&g_fb_span, at) : psp_color_expand(span_read16(&g_fb_span, at), g_fb_fmt);
+     return g_fb_fmt == 0 ? c & 0x00FFFFFFu : c;
+ }
+ 
+ static void fb_write(uint32_t at, uint32_t c, uint32_t mask) {
+-    if (g_fb_fmt == 3) psp_write32(at, (c & ~mask) | (psp_read32(at) & mask));
++    if (g_fb_fmt == 3) span_write32(&g_fb_span, at, (c & ~mask) | (span_read32(&g_fb_span, at) & mask));
+     else {
+         mask = color_pack(mask, g_fb_fmt);
+-        psp_write16(at, (uint16_t)((color_pack(c, g_fb_fmt) & ~mask) | (psp_read16(at) & mask)));
++        span_write16(&g_fb_span, at, (uint16_t)((color_pack(c, g_fb_fmt) & ~mask) | (span_read16(&g_fb_span, at) & mask)));
+     }
+     g_pixels++;
+ }
+@@ -344,7 +387,7 @@
+     if (st->clear) {
+         /* Clear mode writes only the buffers its flags name. A depth-only
+          * clear leaves the colour alone. */
+-        if (st->clear_depth && have_z) psp_write16(zat, (uint16_t)z);
++        if (st->clear_depth && have_z) span_write16(&g_z_span, zat, (uint16_t)z);
+         if (!st->clear_color && !st->clear_alpha) return;
+         if (!st->clear_color || !st->clear_alpha) {
+             uint32_t d = fb_read(at);
+@@ -367,14 +410,14 @@
+             fb_write(at, (d & 0x00FFFFFFu) | ((uint32_t)stencil << 24), st->write_mask);
+             return;
+         }
+-        if (st->ztest && have_z && !depth_pass(st->zfunc, z, psp_read16(zat))) {
++        if (st->ztest && have_z && !depth_pass(st->zfunc, z, span_read16(&g_z_span, zat))) {
+             if (st->stencil) {
+                 stencil = stencil_op(st->stencil_zfail, stencil, st->stencil_ref);
+                 fb_write(at, (d & 0x00FFFFFFu) | ((uint32_t)stencil << 24), st->write_mask);
+             }
+             return;
+         }
+-        if (st->ztest && have_z && st->zwrite) psp_write16(zat, (uint16_t)z);
++        if (st->ztest && have_z && st->zwrite) span_write16(&g_z_span, zat, (uint16_t)z);
+         if (st->stencil) stencil = stencil_op(st->stencil_zpass, stencil, st->stencil_ref);
+         if (st->blend) c = blend(st, c, d);
+         /* Source alpha controls tests/blending, never the stored stencil. */
+@@ -405,6 +448,11 @@
+     if (miny < 0) miny = 0;
+     if (maxx > 479) maxx = 479;
+     if (maxy > 271) maxy = 271;
++    if (minx < st->sc_x0) minx = st->sc_x0;
++    if (miny < st->sc_y0) miny = st->sc_y0;
++    if (maxx > st->sc_x1) maxx = st->sc_x1;
++    if (maxy > st->sc_y1) maxy = st->sc_y1;
++    if (minx > maxx || miny > maxy) return;
+ 
+     const int area = edge(a, b, c->x, c->y);
+     if (area == 0) return;
+@@ -417,12 +465,13 @@
+     const float h0 = 0.5f * (float)((b->x - a->x) - (b->y - a->y));
+     const float h1 = 0.5f * (float)((c->x - b->x) - (c->y - b->y));
+     const float h2 = 0.5f * (float)((a->x - c->x) - (a->y - c->y));
++    const int dy0 = b->y - a->y, dy1 = c->y - b->y, dy2 = a->y - c->y;
+ 
+     for (int y = miny; y <= maxy; y++) {
+-        for (int x = minx; x <= maxx; x++) {
+-            int w0 = edge(a, b, x, y);   /* weight of c */
+-            int w1 = edge(b, c, x, y);   /* weight of a */
+-            int w2 = edge(c, a, x, y);   /* weight of b */
++        int w0 = edge(a, b, minx, y);   /* weight of c */
++        int w1 = edge(b, c, minx, y);   /* weight of a */
++        int w2 = edge(c, a, minx, y);   /* weight of b */
++        for (int x = minx; x <= maxx; x++, w0 -= dy0, w1 -= dy1, w2 -= dy2) {
+             if (!((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
+                 continue;
+             float la = ((float)w1 + h1) * inv, lb = ((float)w2 + h2) * inv, lc = ((float)w0 + h0) * inv;
+@@ -451,6 +500,14 @@
+     if (x0 == x1 || y0 == y1) return;
+     const float du = (b->u - a->u) / (float)(b->x - a->x);
+     const float dv = (b->v - a->v) / (float)(b->y - a->y);
++    if (x0 < 0) x0 = 0;
++    if (y0 < 0) y0 = 0;
++    if (x1 > 480) x1 = 480;
++    if (y1 > 272) y1 = 272;
++    if (x0 < st->sc_x0) x0 = st->sc_x0;
++    if (y0 < st->sc_y0) y0 = st->sc_y0;
++    if (st->sc_x1 < x1 - 1) x1 = st->sc_x1 + 1;
++    if (st->sc_y1 < y1 - 1) y1 = st->sc_y1 + 1;
+     for (int y = y0; y < y1; y++)
+         for (int x = x0; x < x1; x++)
+             fragment(st, x, y, b->rgba, a->u + ((float)(x - a->x) + 0.5f) * du,
+@@ -458,6 +515,33 @@
+ }
+ 
+ static void sw_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
++    const unsigned bytes = g_fb_fmt == 3 ? 4u : 2u;
++    map_span(&g_fb_span, g_fb_addr, ((uint64_t)g_fb_stride * 271 + 480) * bytes);
++    map_span(&g_z_span, st->zaddr, st->zbw > 0 ? ((uint64_t)st->zbw * 271 + 480) * 2 : 0);
++    g_tex_span.data = NULL;
++    if (st->tex_enable && !st->clear && st->tex_fmt >= 0 && st->tex_fmt <= PSP_TPSM_DXT5 &&
++            st->tex_w > 0 && st->tex_h > 0 && st->tex_bw > 0) {
++        uint64_t size;
++        if (st->tex_fmt >= PSP_TPSM_DXT1) {
++            size = ((uint64_t)((st->tex_h - 1) / 4) * (unsigned)(st->tex_bw / 4) +
++                    (unsigned)((st->tex_w - 1) / 4) + 1) * (st->tex_fmt == PSP_TPSM_DXT1 ? 8u : 16u);
++        } else {
++            const unsigned bpp = (unsigned)TEX_BPP[st->tex_fmt];
++            const uint64_t row = (uint64_t)(unsigned)st->tex_bw * bpp / 8;
++            const uint64_t x = (uint64_t)(unsigned)(st->tex_w - 1) * bpp / 8;
++            const unsigned y = (unsigned)(st->tex_h - 1);
++            if (st->tex_swizzle) {
++                uint64_t last = (y / 8 * (row / 16)) * 128 + (y & 7) * 16;
++                if (y >= 8) {
++                    const uint64_t prev = ((y / 8 - 1) * (row / 16)) * 128 + 112;
++                    if (prev > last) last = prev;
++                }
++                size = last + x / 16 * 128 + (x & 15);
++            } else size = y * row + x;
++            size += bpp < 8 ? 1 : bpp / 8;
++        }
++        map_span(&g_tex_span, st->tex_addr, size);
++    }
+     switch (prim) {
+     case PSP_PRIM_SPRITES:
+         for (int i = 0; i + 1 < count; i += 2) sw_sprite(&v[i], &v[i + 1], st);
+@@ -474,6 +558,7 @@
+     default:
+         break;                       /* points, lines: not yet */
+     }
++    g_fb_span.data = g_z_span.data = g_tex_span.data = NULL;
+ }
+ 
+ static void sw_noop(void) { }
+diff --git a/tests/test_raster.c b/tests/test_raster.c
+--- a/tests/test_raster.c
++++ b/tests/test_raster.c
+@@ -745,6 +745,50 @@
+     CHECK(pixel(240, 136) == 0x00000000u, "light across the face: no diffuse: 0x%08X", pixel(240, 136));
+ }
+ 
++static void test_render_spans(void) {
++    psp_ge_reset();
++    clear_fb();
++    CHECK(psp_mem_unwatched_ptr(FB, 480 * 272 * 4) != NULL, "valid VRAM span resolves");
++    CHECK(psp_mem_unwatched_ptr(PSP_VRAM_BASE + PSP_VRAM_SIZE - 2, 4) == NULL,
++          "span crossing VRAM end is rejected");
++    psp_mem_watch_write(FB);
++    CHECK(psp_mem_unwatched_ptr(FB, 4) == NULL, "watched memory uses checked accesses");
++    begin_list();
++    vertex(0, 0, 0, 0xFFFFFFFFu);
++    vertex(1, 1, 1, 0xFFFFFFFFu);
++    cmd(0x04, (6u << 16) | 2);
++    end_list();
++    CHECK(psp_mem_watch_hits() == 1, "render write still reaches memory watch");
++    psp_mem_watch_write(0);
++    psp_mem_watch_read(FB);
++    CHECK(psp_mem_unwatched_ptr(FB, 4) == NULL, "read watch disables bulk reads too");
++    psp_mem_watch_read(0);
++
++    /* A partly unmapped span must still allow individual valid accesses. */
++    const uint32_t last = PSP_VRAM_BASE + PSP_VRAM_SIZE - 4;
++    psp_draw_state st = {0};
++    st.sc_x1 = 479; st.sc_y1 = 271;
++    const psp_vertex quad[] = {
++        {0, 0, 0, 0xFFFFFFFFu, 0, 0, 0}, {1, 1, 0, 0xFFFFFFFFu, 0, 0, 0}
++    };
++    psp_write32(last, 0x12000000u);
++    psp_render_current()->set_target(last, 512, 3);
++    psp_render_current()->draw(PSP_PRIM_SPRITES, quad, 2, &st);
++    CHECK(psp_read32(last) == 0x12FFFFFFu, "valid edge pixel uses checked fallback");
++    st.tex_enable = 1; st.tex_addr = last; st.tex_fmt = 3;
++    st.tex_bw = st.tex_w = 2; st.tex_h = 1; st.tex_func = 3;
++    psp_render_current()->set_target(FB, 512, 3);
++    psp_write32(FB, 0);
++    psp_render_current()->draw(PSP_PRIM_SPRITES, quad, 2, &st);
++    CHECK(psp_read32(FB) == 0x00FFFFFFu, "valid texel uses checked fallback");
++    CHECK(psp_mem_bad_access == 0, "rejected bulk spans do not cause spurious faults");
++
++    const uint32_t region = 0x08980000u;
++    CHECK(psp_mem_map_extra(region + 128, 128) == 0, "test overlay maps");
++    CHECK(psp_mem_unwatched_ptr(region, 512) == NULL, "span cannot skip an internal overlay");
++    CHECK(psp_mem_unwatched_ptr(region + 128, 128) != NULL, "span inside overlay resolves");
++}
++
+ int main(void) {
+     if (psp_mem_init() != 0) { printf("memory init failed\n"); return 1; }
+     psp_cpu_reset();
+@@ -769,6 +813,7 @@
+     test_samples_at_pixel_centres();
+     test_vertex_flow();
+     test_lighting();
++    test_render_spans();
+     test_backend_selection();
+ 
+     psp_mem_free();

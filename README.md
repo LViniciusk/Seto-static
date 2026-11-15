@@ -41,6 +41,200 @@ controls, the original menu advances from cursor 1 to 0 and confirmation changes
 the scene state from 3 to 4, presenting the next scene, in 5/5 headless runs
 (see [S9.2 results](#s92-results--title-menu)).
 
+**S10 — field composition fixed; Classroom travel unverified: PARTIAL.** The goal is a visible,
+navigable Classroom before a duel. Free Duel is locked on a new game, and the
+first class precedes the Crowler duel, so the field has to be usable first.
+
+Three fixes were needed to see it:
+
+1. **VFPU `vtfm` orientation.** The helper multiplied with the matrix the wrong
+   way round. The fix, plus the measured `vtfm3.t`/`vtfm4.q` vectors from
+   [pspautotests](https://github.com/hrydgard/pspautotests/blob/master/tests/cpu/vfpu/matrix.expected),
+   turned seven failing lanes into exact matches.
+2. **Homogeneous transforms.** Three `vhtfm4` instructions were emitted as 3x3
+   transforms, dropping the translation. They now keep the matrix order and the
+   implicit final input of 1, with PSP-measured homogeneous vectors and synthetic
+   emitter checks.
+3. **Stencil composition.** Run s349 marks room pixels with stencil 2
+   (`STST=FF0201`, `SOP=020000`) and then draws the gradient only where stencil
+   equals 0 (`STST=FF0002`). The renderer ignored those commands, so the gradient
+   covered the room. The stencil patch decodes the test, all six operations and
+   RGB/alpha write masks, using framebuffer alpha as stencil. Source alpha still
+   controls blending, but no longer overwrites stencil. No draws are skipped or
+   reordered. Synthetic tests cover the exact room/background sequence, masked
+   writes and all three stencil outcomes; CTest 21/21.
+
+Through-mode positions remain whole pixels. The earlier `/16` experiment was
+disproved by full-screen world-map tiles and reverted; it is not part of this fix.
+
+Run s368 presents the office's 3D geometry (`build/s368-office.png`) and the
+world map with its destination panel and selection highlight (`build/s368-map.png`).
+The name confirmation visibly selects YES (`build/s368-name-yes.png`). The rebuilt
+headless executable stopped at its 200-second cap with 0 bad accesses, 0 dispatch
+misses and 0 traps. All 21 patches reapplied to a clean upstream checkout; its
+four stencil files match the runtime and its fresh build passes CTest 21/21.
+
+Earlier travel runs unloaded and reloaded the field, but selected Chancellor's
+Office rather than Classroom. Run s429-s431 (2026-11-11) reached the Classroom
+in free roam: `build/s93-room.png` shows the room and two students, and
+`build/s428-talk.png` / `build/s431-start-talk-end.png` show Crowler's dialogue
+and the "SP_GAME, the new transfer" introduction. The field state was 23 during
+the talk and returned to 1 afterwards; the Classrom loop reported `done=1` after
+the dialogue closed. The action menu does open with CROSS in free roam
+(`build/s432-duel.png`: Talk/Duel/Item/PDA); START alone does not. The first
+attempt sent DOWN before the menu existed, so CROSS selected Talk and Crowler
+answered "You have a little time 'til class starts." With the menu open, DOWN
+highlights Duel (`build/s432-duel-sel.png`) and CROSS starts the class dialogue
+"`I'll teach all you need to know about dueling.`" (`build/s432-duel2.png`,
+`build/s432-duel3.png`). After the tutorial the scene returns to free roam with
+state 1; a second Duel attempt repeats it and
+`psp_duel_manager_start_requested()` stays false. Crowler also says "You have a
+little time 'til class starts." at 7:30 AM, so the battle appears gated on the
+class-time event, not on the menu entry. D-pad input does move the player
+(`build/s439-pos-0.ppm`..`s439-pos-3.ppm`) and the nearby student follows, but
+the HUD clock stays at 7:30 AM and the Duel entry still replays the tutorial.
+A student dialogue, a class-completion event and the duel remain unverified.
+
+The character quads still arrive with an unrotated world matrix (scale and
+translation only; local plane YZ, normal on X), so camera-facing orientation is
+not proven. The screenshots show the sprites from the current fixed camera; no
+renderer or VFPU change has been made for this.
+
+A controlled `vmmul` experiment (2026-11-11) used the PSP measurement in
+pspautotests `tests/cpu/vfpu/matrix.expected`: plain `vmmul.q M200, M000, M100`
+is A*B (row 0 1585 1655 1787 1861), while the runtime returns A^T*B. Changing
+only the multiply formula to A*B makes that unit test and CTest pass 21/21, but
+the game's office geometry breaks immediately (the field appears rotated and
+torn), so the game relies on the existing E-form/operand convention. The
+mismatch is therefore in the emitter's operand/E decoding, not in the multiply
+formula; the change was reverted and no global VFPU change is part of this
+tree. The character orientation and the screen-relative movement remain open.
+
+Automation notes: with `SETO_MENU_MAP=1` the script stops after the Classroom
+dialogue and captures `build/classroom-free-roam.ppm` instead of blindly
+attempting Duel. `SETO_TRACE_FIELD=1` traces the next GE frame's
+world/view/projection matrices, viewport, model positions, screen bounds and
+pixels written per primitive, over four vblanks so an alternate-vblank render
+cannot be missed, and can dump both VRAM swapchain buffers. Name confirmation
+requires a stable, visibly highlighted YES; the selection byte alone cannot
+authorize CROSS.
+
+Name confirmation now waits for the original message window to become interactive,
+rechecks the visible YES, and retries unconsumed input edges only until the window
+acknowledges confirmation. It no longer relies on a 40/100 ms tap or repeats CROSS
+through the subsequent closing animation. `python tests/title_confirm.py` checks
+seven acknowledgement, readiness, timeout and duel-stop cases (C compiler on PATH).
+Runs s411/s412 confirmed YES and reached Story Mode through the original code.
+
+**Title animation reset remains unresolved.** The read-only s411 capture recorded
+the name pane playing frames 30–35 twice before holding frame 35; s412 played them
+once. The original controller checks for frame 34 before selecting the final
+35–36 interval. This is not proof that input duration, the animation player, or
+scheduling is the underlying cause. The background's seamless loop is also not
+fixed; no guest animation counters, loop bounds or completion states were patched.
+
+The `s10-sleep-wakeup` runtime patch fixes a proven synchronization error:
+real-thread `sceKernelSleepThread` returned success after one tick without a
+wakeup. It now remains blocked until a real `WakeupThread` request; queued wakeups
+and the inline fallback remain supported. The regression fails before the fix;
+fresh CTest runs pass 21/21 with real threads and 21/21 inline. In-game animation
+checks s417–s419 all confirmed YES and reached Story Mode with zero bad accesses,
+but s417 still played the closing interval twice. This synchronization fix is
+**not a fix for the reported animation reset**; the background loop remains
+unverified. No broader scheduler or guest-script change was applied.
+
+### S10 performance — same pixels, less address decoding
+
+The software renderer now resolves checked framebuffer, depth and texture spans
+once per draw instead of resolving every pixel/texel access. It retains the
+original checked accesses for unmapped/partial spans and active memory watches;
+spans cannot cross module overlays and never survive a draw. Textures are still
+read live, including framebuffer feedback and writes between draws. Display
+reads copy valid 8888 rows directly. Raster loops reject off-screen/scissored
+work earlier, step integer triangle edges, and specialize standard alpha blending
+without changing its rounding. No frame skipping, resolution reduction, fast
+math, effect removal, guest-state writes or new dependencies.
+
+Synthetic workload medians, three interleaved runs before/after on this machine
+(milliseconds; 40 iterations, except 800 display reads):
+
+| Workload | Before | After | Speedup |
+|---|---:|---:|---:|
+| Opaque | 1765 | 558 | 3.16x |
+| Textured triangles | 3373 | 891 | 3.79x |
+| Alpha sprites | 587 | 134 | 4.38x |
+| Stencil background | 2351 | 635 | 3.70x |
+| 4444 triangles + depth | 3155 | 1045 | 3.02x |
+| Display copy | 1664 | 14 | 118.86x |
+
+All workloads retain the pre-optimization hashes and pixel counts. An additional
+400 deterministic mixed-state draws check all framebuffer/texture formats,
+blend/stencil/depth states, masks, target changes, texture writes and VRAM
+feedback against the old renderer. `--checked` repeats the same oracles with
+bulk access disabled by a memory watch. Upstream CTest passes 21/21 after all
+22 patches are applied to a clean checkout, including watch/overlay/partial-span
+regressions. These are renderer benchmarks, **not a promise of in-game FPS**;
+existing character orientation and rendering-fidelity issues are separate.
+
+The live headless A/B test sampled front-buffer address changes every 2 ms,
+read-only, rather than counting Win32 repaints or vblank calls. In the same
+opening office dialogue (`field=23`), the old executable produced a median
+**5.22 swaps/s** (8 two-second samples), versus **9.44 swaps/s** (5 samples) after
+optimization: **1.81x**, not 30 FPS. The optimized run subsequently reached the
+Classroom at roughly 10–13 swaps/s. Both runs ended at a 180-second cap with
+zero dispatch misses/traps. Invalid accesses to `0x00000003` during title setup
+remain (6 before, 3 after); the identical signature already exists in s351/s359.
+They are not hidden or fixed by this optimization. Further whole-game profiling
+is needed before changing scheduling, timing or the recompiled CPU path.
+
+```powershell
+cmake --build build/s6-build --target bench-render -j 4
+.\build\s6-build\bench-render.exe
+.\build\s6-build\bench-render.exe --checked
+```
+
+**S9.3 — story/name menu: PARTIAL.** A minimal `sceUtilityOsk` HLE lets the
+original `ENTER NAME` flow return a configured name, and a minimal mailbox HLE
+unblocks the game's loader. The recompiled game reaches the **MAIN MENU**, loads
+the Story/Deck/Character List modules, and renders the Group List screen. A
+title-menu option for a duel has not yet been driven to a battle (see
+[S9.3 results](#s93-results--story-name-menu)).
+
+**S9.7 — office exit and moddeck_tutorial: PARTIAL.** The field Map option is
+the room exit (“Exit from this spot?” YES/NO). YES advances the story and once
+requested `libdeck_tutorial.prx` (LBN `0x5790`); the module is recompiled at
+`0x093E0000` and its image/exports load, but its start was not yet reproduced
+(see [S9.7 results](#s97-results--office-exit-and-moddeck_tutorial)).
+
+**S9.9 — duel subsystem integrated: PARTIAL.** The six PRXs behind the first
+scripted duel are discovered from the ISO (`modduel_mgr`, LBN `0x5c20`, plus
+`modduel_eng`, `modduel_draw`, `moddeck_swap`, `modtutorial`,
+`modduelrecord`), recompiled, and loaded into the low window
+(`0x02200000`–`0x03556890`) with their imports resolved. The s292 run completes
+the Classroom dialogue and reaches Duel in the original field menu, but the
+duel manager has not started (see
+[S9.10 results](#s910-results--classroom-and-duel-command)).
+
+**S9.6 — field action menu: PASS (menu), PARTIAL (duel).** START opens the
+field Talk/Duel/Item/PDA/Map menu at the idle state; DOWN selects Duel and
+CROSS starts the pre-duel conversation. Following the exit hint and loading
+`moddeck`/the duel PRXs is the next step (see
+[S9.6 results](#s96-results--field-action-menu-and-duel)).
+
+**S9.5 — readable text and moddeck: PARTIAL.** A small `sceReg` HLE plus a
+`flash0:` mapping lets the real font library open the system PGF, so menus and
+story dialogue now render and the opening conversation advances. `moddeck`
+runs and its Deck Editor renders; no duel has been started yet (see
+[S9.5 results](#s95-results--system-fonts-readable-text-and-moddeck)).
+
+**S9.4 — modstory/modfield: PARTIAL.** The real `libstory.prx` and
+`libfield.prx` images are relocated and executed. `modstory`'s `module_start`
+runs, requests `libfield.prx` through ModuleMgr, and `modfield`'s
+`module_start` runs in turn. The game renders the first story-mode scene (HUD,
+character portrait, message window) and the D-pad moves the player; no duel has
+been reached yet and the dialogue text is not drawn (see
+[S9.4 results](#s94-results--modstorymodfield)).
+
 **S7 — title screen: PASS.** The EBOOT corpus is relocated into the PSP user
 RAM window, which fixes the sound engine's pointer/handle classification and
 lets the loading stream retire. The GE now applies `ORIGIN`/`OFFSET` to relative
@@ -92,6 +286,18 @@ git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s7-ge-callback.patc
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s7-address-space.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s8-input.patch
 git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s8-wakeup-yield.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s9-mailbox.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s9-field.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s9-font.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s9-duel.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-vtfm.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-ge-trace.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-vhtfm.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-frame-dump.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-thread-trace.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-stencil.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-render-perf.patch
+git -C build/psprecomp apply ../../patches/psprecomp-5ca18fa-s10-sleep-wakeup.patch
 
 cmake -S build/psprecomp -B build/psprecomp-build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build/psprecomp-build -j 8
@@ -627,7 +833,7 @@ request, during the title load. That is the pre-existing `ehfile_queue` race,
 not caused by START and not blocking the transition. The same race appeared
 before START in earlier runs. A 6 s physical Enter test produced exactly one
 `input: START press`, one release, and scene state 3 with zero bad accesses.
-Upstream tests 21/21; LBN seek PASS; all eleven psprecomp patches apply to
+Upstream tests 21/21; LBN seek PASS; all fourteen psprecomp patches apply to
 `5ca18fa` and the clean tree passes 21/21.
 
 To reproduce: `SETO_BRINGUP_CAP=60` and `SETO_AUTO_START=1` (request at step 1,
@@ -772,30 +978,774 @@ and confirmation are processed by the original code.
 
 **Integrity.** Upstream 21/21; LBN seek PASS; `git diff --check` clean.
 
+## S9.3 results — story, name and main menu
+
+**OSK.** The title imports the system on-screen keyboard through
+`0xF6269B82`/`0xF3F76017`/`0x4B85C861`/`0x3DFAEBA9`. The host now serves that
+contract in `title_prx.c` using the standard `SceUtilityOskParams`/data layout:
+one field, the name from `SETO_PLAYER_NAME` (fallback `YUGI`), result
+`CHANGED`, and init → visible → quit → finished statuses. The title's own code
+copies the returned string and runs the original confirmation dialog. No guest
+state is written.
+
+**Mailbox.** The game's loader uses `sceKernelCreateMbx`, `DeleteMbx`,
+`SendMbx` and `PollMbx`; the runtime did not implement them. A small FIFO mailbox
+HLE (`patches/psprecomp-5ca18fa-s9-mailbox.patch`) adds the four calls. With it,
+the Group List screen progresses instead of spinning on an empty `PollMbx`.
+
+**Flow observed.** After the title menu (cursor 0) the game runs the original
+`ENTER NAME` screen. The OSK returns `YUGI`, START opens the confirmation
+dialog, and CROSS confirms it. The game then reaches the **MAIN MENU**. Menu
+options observed:
+
+| Option | Loaded/entered |
+|---:|---|
+| 1 | `libstory.prx` (`ModuleMgr` ENOENT) |
+| 2 | `libdeck.prx` (`ModuleMgr` ENOENT) |
+| 3 | `libcharalist.prx` (`ModuleMgr` ENOENT) |
+| 4 | Options screen |
+| 5 | Group List (requires the mailbox HLE) |
+| 6 | returns to the name-entry/new-game flow |
+
+The first three modules are not integrated; their `LoadModule` requests are
+recorded rather than faked. The Group List is rendered by the original code
+after the mailbox fix (`build/s92-mbx-cap.png`).
+
+**Validation.** The long synthetic path reached the name confirmation/main menu
+in 4 of 5 runs; the remaining run stopped earlier in the name animation. The
+mailbox/Group List run used the same sequence and reached scene state 4,
+phase 11. The sequence is timing-sensitive and is not yet a 5/5 battle path.
+The window is unchanged; all automated runs use `SETO_NO_WINDOW=1`.
+
+**Manual keys for this milestone.** At `ENTER NAME`, Z opens the OSK (the name
+is `SETO_PLAYER_NAME`/`YUGI`), Enter opens the confirmation dialog, and Z
+confirms it. At the main menu, Up/Down/Z navigate and select. The title menu and
+the rest of the keyboard path are unchanged.
+
+**Next target.** The title menu's second option (cursor 1) has not been driven
+to a duel. The main menu's first three modules are known but not integrated;
+the next round should identify the shortest real duel entry and integrate only
+the module(s) it requests.
+
+## S9.4 results — modstory/modfield
+
+**Images.** Two retail PRXs are now recompiled and executed:
+
+| Module | ISO LBN | Size | Relocated base | `.bss` | Imports |
+|---|---:|---:|---:|---:|---:|
+| `modstory` (`libstory.prx`) | `0x5e20` | `0x24c42` | `0x08910000` | 2.8 MB | 137 (libehsys + 3 libfield) |
+| `modfield` (`libfield.prx`) | `0x5c60` | `0x4a21a` | `0x08C00000` | 8.2 MB | 258 (libehsys) |
+
+Both are placed with `psp_mem_write_block` in the main-RAM window; the runtime
+heap base moves from `0x08C00000` to `0x09600000` so the 8.2 MB field image has
+room. `modstory`'s three `libfield` imports (`0x86220A06`, `0x79E5F8B7`,
+`0xE92DC2F2`) are resolved from `modfield`'s own export table, so the story
+module calls the real field functions instead of failing.
+
+Reproduction (the game requests both extents by LBN, so slice them from the ISO):
+
+```powershell
+# the game requests both extents by LBN, so slice them out of the ISO
+$iso = 'C:\Users\Vinicius\Documents\Github\Seto\TF1.iso'
+$fs = [IO.File]::OpenRead($iso)
+foreach ($e in @(@(0x5e20, 0x24c42, 'build\libstory.prx'),
+                 @(0x5c60, 0x4a21a, 'build\libfield.prx'))) {
+    $fs.Position = [int64]$e[0] * 2048
+    $buf = New-Object byte[] $e[1]
+    [void]$fs.Read($buf, 0, $e[1])
+    [IO.File]::WriteAllBytes($e[2], $buf)
+}
+$fs.Close()
+
+python scripts\relocate_prx.py build\libstory.prx build\s93-story-reloc.elf --base 0x08910000
+python scripts\relocate_prx.py build\libfield.prx build\s93-field-reloc.elf --base 0x08C00000
+& $tool emit build\s93-story-reloc.elf build\s93-story-reloc story
+& $tool emit build\s93-field-reloc.elf build\s93-field-reloc field
+```
+
+**Runtime gaps fixed.** The field module hits `vcmov` in an EBOOT math helper;
+`psp_vcmov` and the `A_VCMOV` emitter case now exist, and the corpus is
+regenerated (0 VFPU traps in the story run). `sceDisplayGetVcount` and
+`sceDisplayGetAccumulatedHcount` were missing; they now report the runtime's
+real vblank counter (the accumulated hcount is 0 because there is no scanout).
+Both changes are in `patches/psprecomp-5ca18fa-s9-field.patch`.
+
+**Observed flow.** Selecting Story at the main menu loads `modstory`; its
+`module_start` runs, requests `libfield.prx` through ModuleMgr, and
+`modfield`'s `module_start` runs. The game then renders the first story-mode
+scene: the HUD (`1st May`, `7:30 AM`, `0 DP`, `92 Days Until Tournament`), a
+character portrait and the message window. The D-pad moves the player (free
+roam) and START fades the scene. `build/s93-story15.ppm` / `s95-story15.png`
+are the captured frame.
+
+**Validation.** A clean headless run reaches `story: entered`, `field: entered`
+and the scene above with **0 bad accesses, 0 traps**, 2,403 vblanks and 8,605
+unimplemented calls (Atrac plus `sceReg`). The story message files
+(`ImpChrMsgIe.bin`, `script/st01_t01_*`) are opened and read from the ISO.
+
+**Gap.** The message window is drawn but its text is not: no glyph quads reach
+the GE for the dialogue, while the HUD text renders. No duel has been reached;
+the story starts in free roam and the dialogue cannot be read.
+
+## S9.5 results — system fonts, readable text and moddeck
+
+**Root cause of the missing text.** `sceFontOpen` always returned handle 0 and
+`sceFontGetCharInfo`/`GetCharGlyphImage` failed with `0x80460003`. The font
+library asks the registry for its font list (`/DATA/FONT`: `path_name`,
+`num_fonts`, `/DATA/FONT/PROPERTY/INFO0...`), then opens
+`flash0:/font/ltn0.pgf`. `sceReg` was unimplemented and the host had no flash0,
+so no font was ever loaded. The HUD draws with the game's own bitmap font,
+which is why it worked while every `sceFont` string was blank.
+
+**Fix.** `sceReg` now serves the `/DATA/FONT` and `/SYSPROFILE/RESOLUTION`
+subtrees with the PSP-3000 values (Latin regular font = `ltn0.pgf`), and the
+file HLE maps `flash0:/...` under `PSPRECOMP_FLASH0`. The font assets come from
+a local PSP flash0 dump (the PPSSPP asset tree also carries them); they are
+Sony firmware data and are **not** versioned here. With
+`PSPRECOMP_FLASH0=<flash0 root>` the real font library opens the PGF, and
+`GetCharInfo` returns real metrics.
+
+**Result.** Text now renders everywhere: the title/menu labels, the main menu
+(`Story Mode`, `Free Duel`, `Deck Menu`, ...), the story location
+(`Chancellor's Office`), speaker names and dialogue. The opening conversation
+advances with CROSS (`We aim to create the next generation of duelists.`,
+`Study hard to become the next King of Games.`, `Leave here and get to the
+Classroom at once.`). A clean run reaches the story scene with **0 bad
+accesses** (`build/s124-story20.ppm`).
+
+**moddeck.** Deck Menu requests `libdeck.prx` (LBN `0x56f0`). The 13.8 MB
+`.bss` image is relocated to `0x08910000` (this mode does not load
+story/field) and its `module_start` runs; the real Deck Editor renders
+(`build/s105-duel15.png`).
+
+**Free Duel is locked in a fresh game.** In the main menu "Free Duel" is drawn
+with grey text (RGB 128,128,128) while Story Mode and Deck Menu are white
+(255,255,255) in the same frame, and the menu cursor skips over it
+(`build/s93-free-menu.ppm`). The main-menu navigation was not "missing" the
+entry: the entry is disabled without a save/story progress, so the deck path
+was reached through the neighbouring Deck Menu. The story is therefore the only
+route to a first duel.
+
+**Gap.** No duel has been started. The story conversation is long and the
+player has not yet left the Chancellor's Office; Free Duel selection needs a
+reliable single-step menu input.
+
+## S9.6 results — field action menu and Duel
+
+**The field action menu opens with START.** At the field idle state (after the
+office conversation, no dialogue box up), pressing START (`0x00000008`) draws
+the NPC action menu:
+
+```text
+Talk
+Duel
+Item
+PDA
+Map
+```
+
+Earlier probes missed it because they pressed START during a dialogue or a
+fade (which triggers a scene wipe instead). With the menu up, one D-pad DOWN
+moves the highlight from Talk to **Duel** (`build/s181-pause2.ppm`), and CROSS
+starts the pre-duel conversation. Sheppard then gives the route hint: “The exit
+is at the bottom right hand of this room.” (`build/s181-pduel25.ppm`).
+
+**Deck request observed.** Navigating the menu also made the story request
+`libdeck.prx` (LBN `0x56f0`). In story mode the host does not load moddeck:
+story (`0x08910000`), field (`0x08C00000`) and the 13.8 MB deck `.bss` do not
+fit the current RAM windows together, so the request fails with ENOENT. This is
+the next memory-layout blocker, not a missing game call.
+
+## S9.7 results — office exit and moddeck_tutorial
+
+**The Map option is the room exit.** With the field action menu open, choosing
+**Map** opens the dialog “Exit from this spot?” with **YES/NO**. Confirming YES
+continues the story (Sheppard: “He'll take over from there.”), and in one run
+the game then requested `libdeck_tutorial.prx` repeatedly:
+
+```text
+module: load 'disc0:/sce_lbn0x5790_size0x292fa'   (moddeck_tutorial)
+```
+
+**moddeck_tutorial integrated.** The 168,698-byte PRX is relocated to
+`0x093E0000` (memsz `0x20910`, only 8,256 bytes of `.bss`), which fits the gap
+between modfield and the heap. The corpus resolves its 1,245 libehsys imports
+from the EBOOT and loads the image:
+
+```text
+decktut PRX 0x093E0000..0x09400910 (8256 bytes .bss), gp 0x094068B0, 1245 EBOOT exports
+```
+
+The `module_start` has not been observed yet: the tutorial request did not
+reproduce in the following runs (the YES dialogue timing varies), so the loader
+is verified at image/export level only.
+
+**Next target.** Reproduce the tutorial request and start, then follow the
+story into the classroom and capture the duel PRX requests.
+
+**Module lifecycle.** Tracing ModuleMgr shows the game stops and unloads
+`libtitle` (UID `0x00070002`) immediately before it loads `libstory` and
+`libfield`. The title is mapped in the low/extra window, so after the story
+starts that window is free: the 13.8 MB `moddeck` image fits at `0x01400000`
+without touching the story/field RAM windows or the heap.
+
+`moddeck` now loads lazily on the ModuleMgr request (`psp_deck_prepare` +
+`psp_mem_map_extra`). A run in which the story requested the deck produced:
+
+```text
+module: load 'disc0:/sce_lbn0x56f0_size0x2ae0a'
+deck PRX 0x01400000..0x021CEE10 (14349504 bytes .bss), gp 0x01427930, 1245 EBOOT exports
+deck: entered recompiled module_start 0x01407874
+```
+
+**Field buttons observed.** With a clean free-roam frame (no message window):
+
+| Button | Effect |
+|---|---|
+| CROSS | Talks to a nearby character; away from one shows “There's no one to talk to!” |
+| TRIANGLE | Opens the Top Menu (Deck Menu / Status / Email / Schedule / Options / End Game) |
+| SQUARE / SELECT | Opens the “Explanation” help window |
+| START / CIRCLE / R / L | No observed effect in free roam |
+
+The Talk/Duel/Item/PDA/Map command menu has not been reproduced by any single
+button press in the current free-roam state; the one capture that showed it
+(`s200-menu2`) came after the talk + walk prelude. This is the immediate blocker
+for the room exit.
+
+**Pad pipeline (static analysis).** The EBOOT updates the pad in
+`psp_func_08035AC8` (calls `sceCtrlPeekBufferPositive`, 0x3A622550) and keeps
+the processed snapshot at `0x08101534` (getter `0x08035CFC`, libehsys export
+NID `0xF5E3080C`). `modstory` imports 95 libehsys exports and none of them is
+that getter; the field pad handler `0x08C0D4E8` receives the state pointer in
+`a0` and writes only TRIANGLE -> state 23 and SQUARE -> state 5. CROSS and
+START never reach either handler, so the field command menu is owned by the
+EBOOT/story UI code that consumes the snapshot from `0x08101534`.
+
+**START in the actual free-roam state.** The host now waits for field state 1
+(free roam, after a script state 5/6/23 occurred) and presses START there.
+Result: `free-start menu=0 state=1` — START does nothing even in the real
+free-roam state with Sheppard's empty target plate up. A held CROSS in the same
+state moves the field to state 6 (dialogue) and a tap to state 23 (script), so
+CROSS is the conversation button, not the command-menu button. The Talk/Duel/
+Item/PDA/Map menu therefore does not come from a raw pad bit handled by the
+field or by the four observed EBOOT pad consumers.
+
+**The map list is field-side.** `modfield`'s constructor
+(`psp_func_08C00038`) calls the EBOOT list API — wrapper `0x74E51EA4`
+(`0x0805504C`) and callback `0xF1BC43DB` (`0x08055044`) — with the text blob at
+`0x08C35E74` (`bg_XX [ROOM]` lines for the 22 travel rooms) and stores the
+returned list handle in its globals. That list is the travel/map destination
+list behind the Map option; it is not the 5-option Talk/Duel/Item/PDA/Map menu.
+The field module imports that helper only once, at init, so the command menu
+itself is still EBOOT/story UI.
+
+**Live tracing.** `SETO_TRACE_FIELD=1` logs the field state word
+(`0x093CDAFC`) on every change and every `story -> field` command dispatch
+(export `0x86220A06`). A headless story run shows the field cycling
+`1 -> 5 -> 6 -> 23` during the opening script while the story issues commands
+13, 14, 15, 16, 17 and 19; state 1 is free roam. No command-menu state is
+produced by the field module itself, so the Talk/Duel/Item/PDA/Map UI belongs
+to `modstory`, not `modfield`.
+
+**Where the field logic lives (static analysis).** The field state machine is
+`psp_func_08C0C814`; its 24-entry jump table is at `0x08C34890` and the state
+word is `[0x093CDAFC]` (setter `0x08C0D464` writes state 21 with two words from
+its argument). The story→field command API is the export `0x86220A06`
+(`psp_func_08C0C008`): it indexes a 20-entry table at `0x08C38640`
+(12-byte entries: start, query, busy) and calls `entry.start(arg)`.
+`psp_func_08C0C088` is the matching query/“command done” entry. The pad handler
+`0x08C0D4E8` only consumes R (camera), TRIANGLE (state 23, Top Menu) and
+SQUARE (state 5); CROSS/START are handled by the field/story UI elsewhere,
+which is why no single raw pad bit opens the command menu.
+
+**Next target.** Reproduce the field command menu, choose Map → “Exit from this
+spot?” YES, and follow the story into the classroom to the first scripted duel.
+
+## S9.8 results — field command menu and world map
+
+**The command menu is now opened deterministically.** In field state 1 (free
+roam, after a script state 5/6/23), the host holds the analog stick down-right
+(`(255,255)`) for ~2.8 s, stops, and presses CROSS. The original game draws the
+Talk/Duel/Item/PDA/Map menu (`build/s93-menu-open.ppm`, reproduced in every run
+since the discovery). Four D-pad DOWNs move the highlight to **Map**
+(`build/s93-map-sel.ppm`); CROSS opens “Exit from this spot?” with YES/NO
+(`build/s93-map.ppm`); CROSS confirms YES and the game plays the story
+transition into the **Duel Academy world map**
+(`build/s93-exit-yes.ppm`).
+
+The earlier failures are explained: START does not open the menu, and the
+trigger is the analog down-right walk + CROSS in real free roam, not a raw pad
+bit handled by `modfield`/the pad consumers.
+
+**Destination list opens.** On the world map, four D-pad moves (right, up,
+left, down) followed by CROSS open the travel destination list: Main Gate
+(highlighted), Classroom, Store, Duel Field, Chancellor's Office
+(`build/s93-map-cross.ppm`). The host now sends DOWN (Classroom) and CROSS to
+travel. The emulator slowed to ~2 vblanks/s after hours of runs, so the
+confirmation itself has not yet completed inside the bring-up cap; the list
+itself is reproduced.
+
+**Next target.** Complete the Classroom travel (DOWN + CROSS) and follow the
+story to the first scripted duel, capturing the ModuleMgr requests for the duel
+PRXs. `moddeck` (LBN `0x56f0`) and `moddeck_tutorial` (LBN `0x5790`) are already
+loadable.
+
+## S9.9 results — duel subsystem integrated
+
+**The duel PRX set.** The EBOOT's module table (ISO offset `0x13100`) names the
+`lib*.prx` aliases; scanning the ISO for `SceModuleInfo` matched them to the
+real files. The first scripted duel's manager is `modduel_mgr` (LBN `0x5c20`,
+`0x1f6f2` bytes). Its import table names the dependencies and their function
+counts: libehsys 1,245; libduel_eng 143; libduel_draw 38; libdeck_swap 3;
+libtutorial 7. Matching the ELF headers gives:
+
+| module | LBN | file bytes | memsz | imports |
+| --- | --- | --- | --- | --- |
+| `modduel_mgr` | `0x5c20` | `0x1f6f2` | `0xB18610` | libehsys, libduel_eng, libduel_draw, libdeck_swap, libtutorial |
+| `modduel_eng` | `0x5940` | `0x16cc7a` | `0x116210` | libehsys |
+| `modduel_draw` | `0x5800` | `0x9d22a` | `0x457A20` | libduel_eng, libehsys |
+| `moddeck_swap` | `0x5750` | `0x1d212` | `0x17290` | libehsys, libduel_draw |
+| `modtutorial` | `0x5ef0` | `0xfdba` | `0x13B10` | libehsys, libduel_draw, libduel_eng |
+| `modduelrecord` | `0x57f0` | `0x7da2` | `0x6890` | libehsys |
+
+None of their export NIDs collide with libehsys, so the import forwarder can
+resolve by NID alone.
+
+Reproduction (slice by LBN, then relocate and emit each corpus):
+
+```powershell
+$iso = 'C:\Users\Vinicius\Documents\Github\Seto\TF1.iso'
+$fs = [IO.File]::OpenRead($iso)
+foreach ($e in @(@(0x5c20, 0x1f6f2, 'build\libduel_mgr.prx'),
+                 @(0x5940, 0x16cc7a, 'build\libduel_eng.prx'),
+                 @(0x5800, 0x9d22a, 'build\libduel_draw.prx'),
+                 @(0x5750, 0x1d212, 'build\libdeck_swap.prx'),
+                 @(0x5ef0, 0xfdba, 'build\libtutorial.prx'),
+                 @(0x57f0, 0x7da2, 'build\libduelrecord.prx'))) {
+    $fs.Position = [int64]$e[0] * 2048
+    $buf = New-Object byte[] $e[1]
+    [void]$fs.Read($buf, 0, $e[1])
+    [IO.File]::WriteAllBytes($e[2], $buf)
+}
+$fs.Close()
+python scripts\relocate_prx.py build\libduel_mgr.prx   build\s9duel-mgr-reloc.elf  --base 0x02200000
+python scripts\relocate_prx.py build\libduel_eng.prx   build\s9duel-eng-reloc.elf  --base 0x02E00000
+python scripts\relocate_prx.py build\libduel_draw.prx  build\s9duel-draw-reloc.elf --base 0x03000000
+python scripts\relocate_prx.py build\libdeck_swap.prx  build\s9duel-swap-reloc.elf --base 0x03500000
+python scripts\relocate_prx.py build\libtutorial.prx   build\s9duel-tut-reloc.elf  --base 0x03530000
+python scripts\relocate_prx.py build\libduelrecord.prx build\s9duel-rec-reloc.elf  --base 0x03550000
+& $tool emit build\s9duel-mgr-reloc.elf  build\s9duel-mgr-reloc  duelmgr
+& $tool emit build\s9duel-eng-reloc.elf  build\s9duel-eng-reloc  dueleng
+& $tool emit build\s9duel-draw-reloc.elf build\s9duel-draw-reloc dueldraw
+& $tool emit build\s9duel-swap-reloc.elf build\s9duel-swap-reloc duelswap
+& $tool emit build\s9duel-tut-reloc.elf  build\s9duel-tut-reloc  dueltut
+& $tool emit build\s9duel-rec-reloc.elf  build\s9duel-rec-reloc  duelrec
+```
+
+**Integration.** Six corpora are emitted from the relocated images and loaded
+at `0x02200000`, `0x02E00000`, `0x03000000`, `0x03500000`, `0x03530000` and
+`0x03550000` — above moddeck's window (`0x01400000`–`0x021CEE10`), so a deck
+request cannot overwrite the duel manager. `duel_prx.c` loads them, builds one
+export table per module (each entry carries that module's `$gp`), forwards
+imports at call time, and answers ModuleMgr Load/Start for the six LBN paths
+and their `lib*.prx` basenames.
+
+**Runtime mapping.** The pinned psprecomp had a single "extra" low-window
+mapping, already used by libtitle and moddeck, so a second PRX set could not be
+placed. `patches/psprecomp-5ca18fa-s9-duel.patch` turns it into a 12-slot table
+and matches each range in order. The patch applies on top of the previous
+fourteen (`git apply --check` exits 0).
+
+**Evidence (headless).** Before the guest runs, the host loads all six images:
+
+```text
+duel PRX modduel_mgr 0x02200000..0x02D18610 (11536752 bytes .bss), gp 0x0221FC80, 0 exports, entry 0x02200000
+duel PRX modduel_eng 0x02E00000..0x02F16210 (26656 bytes .bss), gp 0x02F179D0, 143 exports, entry 0x02E00000
+duel PRX modduel_draw 0x03000000..0x03457A20 (4057616 bytes .bss), gp 0x030807E0, 38 exports, entry 0x03001BF4
+duel PRX moddeck_swap 0x03500000..0x03517290 (3728 bytes .bss), gp 0x0351E3E0, 3 exports, entry 0x035117E0
+duel PRX modtutorial 0x03530000..0x03543B10 (31568 bytes .bss), gp 0x03543FA0, 7 exports, entry 0x035302CC
+duel PRX modduelrecord 0x03550000..0x03556890 (192 bytes .bss), gp 0x0355E7B0, 3 exports, entry 0x03550000
+```
+
+`modduel_mgr` reports zero function exports because it exports no callable
+functions; no other module imports it, so that is expected.
+
+**Travel and input.** The host now keeps the scheduler turning until its
+scripted input finishes (plus a 5,000-yield grace slice) instead of stopping
+5,000 yields after `module_start`; that fixed the runs that ended in the middle
+of the Classroom conversation. The exact travel nondeterminism is understood:
+the destination list opens only after the map CROSS's fade ends. When that
+takes longer than 2.5 s, the old DOWN landed on the map and the list later
+opened on Main Gate, where every following CROSS was ignored. The host now
+waits for the list and for the orange highlight to reach Classroom before it
+confirms. Title name input now waits for the visible prompt panel before
+alternating the original CROSS/START controls; the s292 log showed
+`state=4 phase=4` with the prompt visible, then `state 4->1->2->3` and
+`story=1`.
+
+The Classroom conversation itself is reproduced (`build/s282-class25.ppm` …
+`s282-class300.ppm`: Crowler “I'm by far the top teacher in the entire
+Academy.”, “Yeah! I beat you here!”, “No, not that!”). The live Win32 window run
+(`s281`) showed the command menu, Map highlight, exit dialog, world map and
+destination list frame-by-frame.
+
+## S9.10 results — Classroom and Duel command
+
+**Headless evidence (s292).** The original story reached the Classroom, rendered
+Crowler's “There's a new student coming today” dialogue, and returned to free
+roam (`classroom done=1 state=1`). The existing down-right walk + CROSS opened
+the original Talk/Duel/Item/PDA menu; DOWN highlighted Duel, and CROSS drove the
+field through states `5 -> 6 -> 23 -> 1`. Captures:
+`build/s93-travel10.ppm`, `build/s93-class-duel-menu.ppm`,
+`build/s93-class-duel-select.ppm`, `build/s93-first-duel.ppm`.
+
+**s308 update — duel modules start, battle not yet proved.** The original
+ModuleMgr path loaded and started `modduel_mgr` (entry `0x02200000`),
+`modduel_draw` (`0x03001BF4`) and `modduel_eng` (`0x02E00000`); all three
+`module_start` calls returned `0`. The final frame shows “Challenge me? Fine,
+I’ll take you on.” The run hit its 180 s cap with field state still `0`, no
+duel board, and no processed result. It also logged three bad accesses at
+`0x00000003` (first from `0x08034644`) and repeated `ehfile_queue` waits; their
+causal relation to battle progression is not established.
+
+The s308 input trace reported `auto START done=0 scene3=0`. Investigation found
+that `psp_trace_watch` holds only one active watch: adding the `0x0803D968`
+diagnostic replaced the `0x08035AC8` input-update hook. The current fix keeps
+both observations in the existing input hook. In s309 the original title input
+then reported `START done=1 scene3=1` and advanced state `3 -> 4`; the run had
+zero bad accesses and reached the visible name confirmation.
+
+In s312 the screenshot classifier identified the pink highlight on **NO**,
+sent one original D-pad DOWN press, and still identified NO; it sent no CROSS
+and paused (`build/s312-confirm-dialog.png`, `build/s312-after-down.png`). Runs
+s313–s316 did not reach phase `6`. The final s315 frame visibly showed
+`ENTER NAME`; its red prompt text was present, but the generic dialogue-box
+brightness gate rejected it during the transition. Removing that gate let
+s316 detect the returned prompt, but too early at phase `1`; START then reached
+phase `4` while the final frame still showed `ENTER NAME`. Requiring phase `4`
+before pressing START fixed the timing: s317 reached the original “Is this OK?”
+dialog at state `4`/phase `6`, with **NO** highlighted. An original analog-LEFT
+input for 600 ms left NO selected, so no CROSS was sent. The run had zero bad
+accesses. Repeated `ehfile_queue` waits remain observed, but their causal
+relation to progression is not established. No battle board or processed
+result has yet been verified.
+
+## S9.12 results — original name confirmation passed
+
+**Handler.** The name-confirmation dialog is the EBOOT message window
+`0x080476CC` (libehsys export NID `0x39ADDA9F`), entered from the title poll
+`0x0064C0D8`. It reads the **digital D-pad** from `0x08101540` (`0x80`
+left, `0x20` right, `0x10` up, `0x40` down); the one-frame confirm edge is
+`0x08101538` filtered by `0x0803D8F8` (NID `0x8171F765`, the same filter the
+title menu uses). The earlier analog-stick attempt never set those bits.
+
+**Fix.** `host.c` sends one digital LEFT when the dialog opens. The window
+moves the highlight from **NO** to **YES**; YES is drawn blue (`112,182,255`)
+and NO pink (`255,98,173`), so the classifier now accepts the blue highlight
+and sends CROSS only when YES is visibly selected. No guest memory is written;
+input still goes through `psp_ctrl_set` and the EBOOT input update.
+
+**Evidence (s332).** Window state `3 -> 4 -> 5 -> 6` with poll return `2`;
+title phase `6 -> 9`; scene `4 -> 1 -> 2 -> 3`; Story Mode then loads
+`modstory` and `modfield` and runs the opening script. The command menu opens
+(`build/s93-menu-open.ppm`: Chancellor's Office, Talk/Duel/Item/PDA/Map), the
+world map travels to the Classroom, and the classroom script runs until the
+`SETO_BRINGUP_CAP=150` cap. CTest 21/21.
+
+## S10 results — field preserved, vmmul split and the EHP store
+
+**vmmul split.** The field's 32 matrix calls use the E form
+(`vs E0, vt E1`; `SETO_TRACE_VMMUL` prints
+`08C... vs=..(E0) vt=..(E1)`). The runtime now makes the **plain** form follow
+the hardware (`A*B`, pspautotests `1585/5318/1655/5562`) while leaving the E
+form on its previous result (19). `test_vmmul_hardware`,
+`test_vmmul_orientation` and `vfpu` pass; the Classroom still renders
+(`build/s93-room.png`) and the field trace has 996 quads with 40 on screen.
+
+**Command-menu cursor.** The field command menu keeps its cursor across
+opening. The world-map travel selects **Map** (four DOWN), so the next CROSS
+opened PDA instead of Talk. The host opens the menu with a one-frame CROSS,
+resets the cursor with four held UP presses and only then selects Talk; this
+is an input-automation fix only (no guest memory write). The `s93-menu-open`
+capture shows the original Talk/Duel/Item/PDA/Map menu. The headless runs
+still report `box_up=0` after the reset, so the tutorial dialogue trigger is
+not yet proved; the manual window remains the check.
+
+**Movement probe (s490).** A pure free-roam probe (`SETO_WALK_PROBE`) reports
+field state 1 with no dialogue, `box_up=0`; LEFT is blocked by the door wall,
+while RIGHT, UP and DOWN move the player and change the GE world trace
+(`build/s490-before/left/right/up/down.png`). The field is navigable on the
+current EXE; the remaining issue is the NPC turn/talk trigger, not the D-pad.
+
+**Command-menu probe (s504).** A single 300 ms direction plus a one-frame
+CROSS leaves scene state 1 and `box_up=0` at all four directions; the nearby
+word `0x093CDB20` becomes `0x0B` (PDA) and `0x093CDB00` becomes `FFFFFFFF`,
+while `0x093CDAFC` stays 1. The full window `0x093CDAD0..0x093CDB30` is logged
+before and after each test. So the CROSS after a spawn direction opens the
+PDA, not the command menu; the red student at the door is not talkable from
+that position.
+
+**Story-block input loss (s509).** Pad readback in `field_press` proves the
+D-pad bit is set and still held (`pad: set=00000040 now=00000040`, then
+`held=00000040`). The field-state dump taken at the same moment shows exactly
+why the player stands still: `0x093CDAFC=1` but `0x093CDB20=0x0B` — the blind
+CROSS advance leaves `0x093CDB20=0x0B`. Pressing CIRCLE before the walk
+(s510/s511) did **not** move the player and the pad readback stayed exact, so
+the word is not the sole blocker. The exact s504 movement prefix inside the
+story block (s512) also did not move, while the same sequence inside the
+`SETO_WALK_PROBE` block does. The host therefore walks and tries the talk from
+inside the probe block (s513): that moved the player to Crowler's right/behind,
+but the first CROSS was still `box=0`. The LEFT face before the CROSS (s514)
+also leaves `box=0`; the player is next to the red student at the door, which
+is not a talkable target, and the walk does not reach the classroom front.
+
+**Analog walk (s530).** Driving `psp_title_walk(0, ax, ay)` through LEFT,
+RIGHT, UP and DOWN and then CROSS reaches field state **5** (a story beat) and
+the class loop later reports state **6** (the command menu); the D-pad-only
+probe stayed at state 1. The HLE ctrl read still shows `ax/ay=128`, so the
+title-hook analog is not reaching the field; the state change comes from the
+CROSS after the analog block's wait. s531's state-6 handler (four UP, then
+CROSS) logs `menu talk state=6 box=0` repeatedly, then one select reaches
+state **23** (the dialogue) with box=0. s532 adds the s435 START+CROSS handler
+for state 23, but the rerun ended at state 1 (`analog: talk state=1`,
+`classroom done=0`), so the state 5/6/23 transition is timing-dependent rather
+than a fixed input sequence.
+
+**Manual session — tutorial complete, normal duel (2026-11-12).** The live
+Win32 window (PID 27812, `SETO_HOLD_WINDOW`) was played by the user after the
+auto travel. The tutorial completed and a normal duel started: frame
+`build/session-2026-11-11/frame-00415.png` shows SP_GAME vs Gillian, LP 8000,
+Turn 1, with the duel board black. The session recorder saved 430 frames and
+`s466-final.err`. The game exited at 07:32:38 after **4,800 bad accesses**:
+the first is `modduel_draw` RNG at address 0 (`0x03028D88`, ra `0x03028CD0`),
+then `0x03028E00`, then EBOOT `vec3_set` `0x08016B1C` with `$a0=0`. The
+tutorial is no longer the blocker; the normal duel's 3D scene/RNG is.
+
+**Position instrument (s533).** Scanning the field `.bss` for the float pair
+`5.75`/`1.75` finds the player position at `0x08C40DD4` (x=5.75) and
+`0x08C40DDC` (z=1.75), with copies at `0x08C40E30`/`0x08C40E38`. Watching the
+x word through every D-pad direction produces **no write**; the field receives
+the pad (s523 `buttons=00000040`) but the movement path never updates the
+player position. The blocker is the field state/movement call, not the pad.
+
+**HLE ctrl read (s523).** With `PSPRECOMP_TRACE_CTRL`, the field's own
+`sceCtrlReadBufferPositive` (buffer `09FFFB78`) reports
+`buttons=00000040` during the D-pad press, so the pad is not lost before the
+field. `ax/ay` stay `128` (analog centered): the world-movement path uses the
+analog nub while the D-pad is the menu/facing input. The player billboard stays
+`5.75/1.75`; the talk/facing trigger remains the blocker.
+
+**s431 baseline not reproduced.** The cda9a1c and b52292b hosts, the older
+`tagforce-vhtfm-check` EBOOT corpus and `SETO_VMMUL_OLD_PLAIN=1` (s519/s521)
+still leave `talk dir=2 box=0`, as do the `auto_press`/`k>20` revert (s515)
+and the old-plain switch (s516).
+
+**Historical working point (s435/s436).** The saved logs from 14:57/15:10 show
+`talk dir=2 box=1` / `talk dir=1 box=1`, `classroom done=1` and
+`duel menu attempt=0 state=6`; the s437+ runs lose the direction lines and end
+`box=0`/`done=0`. That combination (host, EBOOT corpus and psprecomp at s436)
+is not in git; reproducing it from cda9a1c/b52292b has not restored the talk.
+The current build is restored to the latest host/corpus.
+
+**Store assets are EHP, not PRX/PHE.** The three files the Store opens are
+EHP/EhFolder archives (`0x03504845`, `NOT `, 26 entries) and GIM textures, not
+relocatable modules. `build/ehp_list.py` lists `card_frame_all.gim`,
+`card_icon*.gim`, `gx_pda_cover01.tms`, `ocg_packlist_a.bin`,
+`ocg_packname_a.bin`, `pickup_card.tms`, `sp_baloon.gim` and the other shop
+assets. There is no shop PRX to recompile; the missing scene is inside the
+store renderer. The Store destination is visible in the world-map list
+(`build/s93-map-class.png` shows its preview), but the confirm stays on the
+list before the story flag, so a new save cannot enter the shop to test it.
+
+**COP1 rounding.** The EBOOT's shop layout calls `ceil.w.s` (and `floor.w.s`);
+the emitter used to emit `psp_unimplemented` and leave the FPR stale. The
+emitter now emits `psp_fceil`/`psp_ffloor`/`psp_fround` through
+`recomp_rt.h`, and the generated EBOOT corpus was updated. The new `emit` test
+checks all three instructions; CTest is 21/21.
+
+**Duel status.** The manual tutorial duel completed: six `input: duel trace`
+samples were followed by the post-duel `modstory`/`modfield` reload, so the
+duel result was processed. The sampled frames show the duel UI; no
+`modduel_draw` 3D primitive was captured in that run, so the duel board's 3D
+path remains a visual gap, not a progression blocker.
+
+**Duel module start (s548/s550).** The game never asks ModuleMgr for the duel
+modules: with `SETO_TRACE_MODULE` the only runtime loads are the font
+(`0x52c0`), title (`0x5e70`), story (`0x5e20`) and field (`0x5c60`) LBNs; none
+of the duel LBNs (`0x5c20`, `0x5940`, `0x5800`, `0x5750`, `0x5ef0`, `0x57f0`)
+is loaded, and no `sceKernelStartModule` names their UIDs. The six duel images
+are resident from the host's boot load, so their `module_start` constructors
+never ran. Running all six entries after the EBOOT boot (s550) returns 0 and
+leaves the duel byte-identical: the board is still `x996`,
+`world 10.25 ... (7.75,-3.433,10)`, `bounds x=-533..556 y=77..862
+onscreen=40/996`. The missing constructors are therefore not the scene bug.
+
+**Where the matrices come from (s548/s550).** The GE commands are written by
+`0x080372A0(list, mode, matrix)` (mode 0 projection, 1 view, 2 world, 3
+viewport); `0x080322E8` stages the VFPU matrix at `0x08101100` and reads the
+mode from `0x08101104` before calling it -- the game's `sceGum`-style commit.
+The view is uploaded eight times with the same values (camera `(9.75, 4.0,
+5.25)`, forward `(-0.577,-0.577,-0.577)`, `0.266663/0.470581` ortho), so the
+isometric view is fixed for the whole game, as the field/story scenes confirm.
+The board's world matrix is the outlier: in that view the board centre lands at
+view-space `(-3.56,-5.24,-1.95)`, i.e. 228 px left and 335 px down of centre,
+and its 10.25 scale makes it ~2.3x the screen. The engine computes that world
+matrix; the renderer, loader, textures and projection are not implicated.
+
+**The duel never sets a camera (s552/s557).** Tracing every mode-2 commit at
+`0x08032360` shows that the world matrices are committed by the EBOOT scene
+renderer, with **no duel-module frame on the call stack** (the title's commits
+chain `0x0803239C -> 0x080331C4 -> 0x08027A24 -> 0x08027F34 -> 0x08028EF0`);
+the duel's nodes go through the same renderer. The only view uploads are the
+eight identical isometric ones (mode 1 at `0x0802E7F4`/`0x0802ED78`), so the
+duel inherits the field's fixed view while its scene nodes are authored for a
+duel camera. The missing piece is the duel scene's camera/override, not the
+node data: the board's `10.25` scale and `(7.75,-3.433,10)` translation are the
+values the renderer receives. The next step is the scene/camera setup in
+`modduel_eng` (the renderer is the EBOOT's, so the camera must come from the
+engine's scene graph).
+
+**Duel transition and settled list (s556).** The duel detector captured the
+first second of the tutorial duel (`build/duel-live-00..11.ppm`): the
+classroom and a green/purple field-texture strip render mid-screen, then the
+settled frame (`build/duel-live.ppm`) is the black field with the dialogue box.
+The GE list traced in the settled frame contains only three primitives --
+`x60`, `x32` and `x16`, all `clear 1` with texture off -- so the 2D field
+layer is drawn during the transition and **absent from the settled list**. The
+window's log then stops in the particle RNG null accesses (`0x03028E00`). The
+next fix is the draw-state condition that stops enqueuing the field layer after
+the transition, not the camera.
+
+**The 996 mesh is not the board (PPSSPP reference).** A PPSSPP frame of the
+same duel (Turn 1, SP_GAME vs Gillian) shows the duel field as a **2D layer**:
+a purple starfield background, a flat screen-aligned zone grid, the opponent's
+hand at the top, the player's hand at the bottom and the deck at the right. The
+HUD (LP bars, portraits, the big left card, the DP/SP/MP/BP/EP bar, the red
+life sliver, START Help) matches the recompiled frame exactly. The `x996`
+primitive is therefore **not** the board: the same mesh with the same
+`world 10.25 / (7.75,-3.433,10)` appears in a traced **classroom** frame
+(`SETO_CAPTURE_DUEL` at "arrived room" captured the classroom, s560), where the
+scene renders correctly, so it is a shared 3D effect drawn behind the camera.
+The missing duel content is the 2D field layer, not a 3D transform.
+
+**Clear-bit experiment (s559, reverted).** The renderer treated the GE `CLEAR`
+bit as a per-primitive colour-only mode, so textured full-screen quads with the
+bit set were painted solid. Changing it to keep the clear path only for
+untextured fills (`render.c`) left the classroom correct but the captured run
+never reached the duel, so the change was reverted untested rather than shipped
+as a fix. The field layer must be checked against that path on a duel capture.
+
+**Which module owns the camera (s552).** The libehsys matrix API exports are
+`0x5B05F797` (commit current matrix, `0x080326FC`) and `0xD697947E` (view
+builder, `0x0801850C`). `modfield` imports **both**; `modduel_eng` imports
+**neither**, and `modduel_draw` imports **only the view builder**. So the duel
+camera cannot come from the engine's matrix API: it is either computed inside
+`modduel_draw` (its `0x0305331C` path composes with `0x030680EC/0x030681EC/
+0x03068154` and sets a matrix mode) or taken by the EBOOT renderer from a scene
+node. The GE trace shows only the field's single view, so that path either is
+not reached or produces the field's pose. A PPSSPP reference of the same duel
+would settle which pose is intended before changing the guest camera code.
+
+**Duel 3D captured and located (s537/s538).** The GE trace now also prints the
+model-space extents of every mesh with 100+ vertices. In the duel the board is
+`GE prim 3 x996 vtype 00015F vaddr 09333BEC`: an untextured, alpha-blended
+translucent mesh spanning `(-0.671, 0.048, -0.573)..(0.768, 0.347, 0.335)`, so
+it exists and is sane. Its active matrices are a uniform **10.25** world scale
+with translation `(7.75, -3.433, 10)`, an isometric view rotation
+(about 45° yaw and a shallow pitch, translation
+`(-3.182, 2.858, -10.969)`), and the ortho
+projection `0.266663/0.470581` (exactly **64 px per world unit** for 480x272).
+The mesh is drawn, but `bounds x=-533..556 y=77..862 onscreen=40/996`: the
+field is ~2.3x the screen and mostly below it, and the same transform places
+the visible card at the top-left. Scaling only the world matrix by 0.5 (an
+env-gated diagnostic, reverted) moves the same prim to
+`x=-248..296 y=15..407 onscreen=392/996`; scaling the projection by 0.5 breaks
+the classroom, so the projection is right and the duel's world/view pair is
+what is inconsistent. The null accesses are the particle system (RNG globals
+read at address 0 around `0x03028C28`, `vec3_set` called with `$a0=0` from
+`0x03045FD4`), not the board. The duel's 3D is drawn with the same isometric
+ortho the working field/story scenes use, so the remaining fault is the duel
+engine's scene root/camera pose, not the GE, the textures or the loader.
+
+**Duel scene fixed (2026-11-12, s566).** Three runtime faults held the duel
+back, all in the host HLE:
+- `src/hle/ge.c` now implements **bone matrices** (`0x2A/0x2B`), **GE
+  signal/finish callbacks** and **stencil**; the characters' rotation and the
+  field composition render.
+- **16-bit GE colours are ABGR**, not RGB. `psp_color_expand` read them as RGB,
+  swapping red and blue: 16-bit CLUT card faces came out blue. The DXT1 test
+  had encoded the same swap and was corrected.
+- The **PSP has 4 MB of eDRAM**, not 2 MB (`PSP_VRAM_SIZE`). The second 2 MB
+  holds the duel's later textures (opponent hand backs, character models);
+  with the old 2 MB window those reads returned zero.
+Evidence: `build/duel-settled-136.png` (tutorial duel field: starfield, zone
+grid, both hands, deck, HUD) and the PPSSPP reference frame; CTest 21/21.
+Host additions: `SETO_MANUAL` (full manual from the title), the duel-HUD
+detector and the passive BitBlt recorder. The psprecomp change is captured as
+`patches/psprecomp-5ca18fa-s10-duel-scene-full.patch`, a **cumulative** diff
+against the pinned `5ca18fa` (apply to a clean clone instead of the older
+individual patches).
+Not yet verified after the 4 MB change: the real duel's opponent cut-in
+transition and the opponent hand showing faces instead of backs.
+
+**Store PRXs, Atrac/Savedata, virtual-time audio sync, and speed (2026-11-13, Seto-static12).**
+- **Store & Character List (`modcharalist`, `modshop`)**: integrated via
+  `store_prx.c` and `psp_store_export` forwarding in `story_prx.c` and
+  `title_prx.c`, with `build/run-manual.ps1` passing `s9charalist-reloc.elf`
+  and `s9shop-reloc.elf`. Verified live in-game (Card Shop functional; save/load
+  round-trip unlocks Free Duel).
+- **Audio & Atrac pacing (`src/hle/atrac.c`, `src/hle/misc.c`)**: real `sceAtrac`
+  decode/loop handling plus switching `sceAudioOutputPannedBlocking` (`hle_OutputBlocking`)
+  to pace against guest virtual time (`psp_threadman_vtime_us()`) instead of
+  wall-clock `host_now_us()`, keeping audio synchronized during heavy 3D
+  combat animations.
+- **Scheduler, trace scoping, and 3D raster (`CMakeLists.txt`, `threadman.c`,
+  `host.c`, `host_window.c`, `ge.c`, `render.c`)**:
+  - Restricted `PSPRECOMP_TRACE` to the 4 watchpoint translation units
+    (`tagforce_funcs_000.c`, `tagforce_funcs_040.c`, `title_funcs_000.c`,
+    `title_funcs_005.c`), removing trace instrumentation across the rest of the
+    recompiled corpus.
+  - Added `psp_threadman_host_sleep_ms()` so the idle `boot` loop in `host.c`
+    releases the CPU baton before sleeping (`boot` parks dropped from `12,826`
+    / `7,649` to `0`) and increased the `wait_loop` cap for long unbounded waits.
+  - Added nearest-neighbor / modulate-white fast paths in `sw_tri_tex` and a
+    dedicated `sw_tri_tex_ab` rasterizer for alpha-tested/blended 3D triangles,
+    skipped `0xFF` padding in `ge.c`, and raised `host_window.c` refresh to
+    ~60 FPS (`16 ms`).
+- **Verification**: `ctest` passes **21/21** (`4.82 s`), `scratch-bench-all.exe`
+  matches all 6 workload CRCs (`823B687F`, `43BAB556`, `1E6044B1`, `137307BB`,
+  `CBDFDFD2`, `6300F5C5`, `bad=0`) and the 400-draw mixed-state oracle (`0813E1B7`,
+  `480089` px) bit-exactly against fallback. Headless runs on `Seto-static12.exe`:
+  90s `SETO_TRAVEL_STORE=1` (`5,254` vblanks, `0` boot parks, `0` dispatch misses,
+  `0` bad accesses) and 45s `SETO_AUTO_STORY=1` (`2,506` vblanks, `1,254` frames,
+  `0` boot parks, `0` dispatch misses, `0` bad accesses). Updated cumulative patch:
+  `patches/psprecomp-5ca18fa-s10-duel-scene-full.patch`.
+
 ## Limitations
 
-- `sceReg` is not implemented: the font library's registry reads return 0 and
-  it uses defaults. `GetCharInfo`/`GetCharGlyphImage` and text rendering are not
-  reached yet.
-- Only `libtitle.prx` is integrated; the other game PRXs are not recompiled.
-  S8 reaches the title menu; the `modduel_mgr` load is reached only by the idle
-  path. That module needs `libduel_eng`, `libduel_draw`, `libdeck_swap` and
-  `libtutorial`, which are not integrated.
+- `sceReg` serves only the `/DATA/FONT` and `/SYSPROFILE/RESOLUTION` subtrees
+  the font library reads; other categories return not-found and the library
+  uses defaults. Fonts need a flash0 tree via `PSPRECOMP_FLASH0`; without it the
+  game runs but `sceFont` strings are blank.
+- `libtitle.prx`, `libstory.prx`, `libfield.prx`, `libdeck.prx`,
+  `libdeck_tutorial.prx`, `libcharalist`, `libshop`, and the six duel PRXs are
+  integrated (`modcharalist` and `modshop` via `store_prx.c`).
 - The rebased corpus relocates the EBOOT into the PSP user RAM window. The host
   refuses the unrelocated image instead of guessing its base.
-- Audio is paced by the runtime but not played. Only START is mapped; D-Pad,
-  CROSS and CIRCLE are not.
-- 270 VFPU + 16 `vcmov` instructions remain traps in the rebased EBOOT corpus;
-  none were reached by this run. The title corpus has 22 VFPU traps, also
-  unreached.
+- Audio is paced by the runtime in virtual time (with Atrac/SasCore HLE) rather
+  than played out to host speakers. START, the D-pad, CROSS, CIRCLE, TRIANGLE,
+  and analog stick are mapped.
+- `vcmov` is implemented; 270 other VFPU instructions remain traps in the
+  rebased EBOOT corpus (0.25%), unreached by the story run. The title corpus has
+  22 VFPU traps, also unreached.
 - 2,889 functions without `jr $ra` and 176 `scattered` functions remain discovery
   caveats; they did not affect the EBOOT run.
-- No window; the goal is the real code path, not play.
 
 ## Repo contents
 
-Tracked: this README, `.gitignore`, `host.c`, `umd.c`, `fpl.c`, `font_prx.c`,
-`title_prx.c`, `scripts/relocate_prx.py`, `CMakeLists.txt`, `tests/lbn_seek.c`,
-and eleven small patches against the pinned psprecomp. `build/` (tool clone, generated C,
-relocated ELF, objects, executable) and `private/` (decrypted EBOOT, ISO) are
-ignored.
+Tracked: this README, `.gitignore`, `host.c`, `host_window.c`, `umd.c`, `fpl.c`,
+`font_prx.c`, `title_prx.c`, `story_prx.c`, `field_prx.c`, `deck_prx.c`,
+`decktut_prx.c`, `store_prx.c`, `duel_prx.c`, `scripts/relocate_prx.py`,
+`CMakeLists.txt`, `tests/lbn_seek.c`, and cumulative/step patches against the
+pinned psprecomp in `patches/`. `build/` (tool clone, generated C, relocated ELF,
+objects, executable) and `private/` (decrypted EBOOT, ISO) are ignored.

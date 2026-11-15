@@ -1,0 +1,63 @@
+diff --git a/src/mem.c b/src/mem.c
+index 20a9a1d..83dd8f9 100644
+--- a/src/mem.c
++++ b/src/mem.c
+@@ -108,18 +108,31 @@ int psp_mem_map_module(uint32_t base, uint32_t size) {
+     return 0;
+ }
+ 
+-/* A second module image: the EBOOT occupies the low mapping and a large PRX
+- * (modtitle reserves 12.7 MB) cannot fit in the RAM window or share it. */
+-static uint8_t *g_extra;
+-static uint32_t g_extra_base, g_extra_size;
++/* Extra module images: the EBOOT occupies the low mapping, and large PRXs
++ * (modtitle, moddeck, the duel subsystem) each reserve their own low window. */
++#define PSP_MAX_EXTRA 12
++static struct { uint8_t *data; uint32_t base, size; } g_extra[PSP_MAX_EXTRA];
+ 
+ int psp_mem_map_extra(uint32_t base, uint32_t size) {
+-    free(g_extra);
+-    g_extra = (uint8_t *)calloc(1, size ? size : 1);
+-    if (!g_extra) { g_extra_size = 0; return -1; }
+-    g_extra_base = base;
+-    g_extra_size = size;
+-    return 0;
++    for (int i = 0; i < PSP_MAX_EXTRA; i++) {
++        if (g_extra[i].size && g_extra[i].base == base) {
++            /* Reloading the same window replaces it. */
++            free(g_extra[i].data);
++            g_extra[i].data = (uint8_t *)calloc(1, size ? size : 1);
++            if (!g_extra[i].data) { g_extra[i].size = 0; return -1; }
++            g_extra[i].size = size;
++            return 0;
++        }
++    }
++    for (int i = 0; i < PSP_MAX_EXTRA; i++) {
++        if (g_extra[i].size) continue;
++        g_extra[i].data = (uint8_t *)calloc(1, size ? size : 1);
++        if (!g_extra[i].data) return -1;
++        g_extra[i].base = base;
++        g_extra[i].size = size;
++        return 0;
++    }
++    return -1;
+ }
+ 
+ void *psp_mem_ptr(uint32_t addr, uint32_t size) {
+@@ -133,10 +146,12 @@ void *psp_mem_ptr(uint32_t addr, uint32_t size) {
+         if (off + size > g_module_size) return NULL;
+         return g_module + off;
+     }
+-    if (g_extra_size && a >= g_extra_base && a < g_extra_base + g_extra_size) {
+-        uint32_t off = a - g_extra_base;
+-        if (off + size > g_extra_size) return NULL;
+-        return g_extra + off;
++    for (int i = 0; i < PSP_MAX_EXTRA; i++) {
++        if (!g_extra[i].size || a < g_extra[i].base ||
++            a >= g_extra[i].base + g_extra[i].size) continue;
++        uint32_t off = a - g_extra[i].base;
++        if (off + size > g_extra[i].size) return NULL;
++        return g_extra[i].data + off;
+     }
+ 
+     if (a >= PSP_RAM_BASE && a < PSP_RAM_BASE + PSP_RAM_SIZE) {

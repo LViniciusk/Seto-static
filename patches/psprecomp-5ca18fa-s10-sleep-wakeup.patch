@@ -1,0 +1,158 @@
+--- a/src/hle/threadman.c
++++ b/src/hle/threadman.c
+@@ -28,8 +28,8 @@
+  *     it gets the CPU back. A per-thread `HOST_TLS psp_cpu` would be the
+  *     other way to do it, and would put a TLS lookup on every register access
+  *     in millions of lines of generated code.
+- *   - **Waits hand off the CPU.** `SleepThread` parks for one tick (or a
+- *     wakeup), `WaitSema`/`WaitEventFlag` retry until signalled or timed out,
++ *   - **Waits hand off the CPU.** `SleepThread` parks until a wakeup,
++ *     `WaitSema`/`WaitEventFlag` retry until signalled or timed out,
+  *     `WaitThreadEnd` parks until the target exits, `DelayThread` parks for its
+  *     duration (in virtual time -- see the clock below).
+  *   - **A wait is also where time passes**, so it is where an interrupt is
+@@ -1081,19 +1081,13 @@
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ 
+-/* sceKernelSleepThread[CB]: park until sceKernelWakeupThread.
+- *
+- * Capped at a tick, and that cap is the difference between a game that
+- * advances and one that stops: a sleep that nothing ever wakes, inside a
+- * `while (!flag) sleep();` poll, is indistinguishable from a hang -- and a
+- * hang produces no evidence at all. One tick per iteration means the other
+- * threads get the CPU and any interrupt handler gets to run, so what the poll
+- * is waiting for can still be produced. */
++/* A scheduler tick is not a wakeup. Only the inline fallback cannot block. */
+ static void hle_SleepThread(void) {
+     psp_thread *t = g_tls_me;
+-    int already_woken = t && t->wakeups > 0;
+-
+-    if (!already_woken) park_for(W_SLEEP, TICK_US);
++    while (!t || !t->wakeups) {
++        park_for(W_SLEEP, TICK_US);
++        if (!PSPRECOMP_REAL_THREADS || !t) break;
++    }
+     if (t && t->wakeups) t->wakeups--;      /* consume it, pending or fresh */
+     deliver_tick();
+     psp_ret(SCE_KERNEL_ERROR_OK);
+--- a/tests/test_hle.c
++++ b/tests/test_hle.c
+@@ -302,8 +302,7 @@
+     CHECK(call(DELETE, thid, 0, 0, 0) == 0, "delete succeeds");
+     CHECK(psp_sysmem_free() > before_delete, "deleting a thread frees its stack");
+ 
+-    /* Sleep yields for a tick in opt-in mode and returns immediately in inline
+-     * mode. It is deliberately not faithful indefinite sleep. */
++    /* Real threads sleep until a wakeup; inline mode cannot block a worker. */
+     const uint32_t SLEEPER = 0x08801080u;
+     psp_register(SLEEPER, fake_sleeper_entry);
+     uint32_t sid = call5(CREATE, 0, SLEEPER, 32, 0x4000, 0);
+@@ -329,15 +328,7 @@
+ #endif
+     CHECK(psp_threadman_handover_expired() == 0,
+           "and the handover did not fall back to its cap");
+-    /* The numbers are in the message on purpose: if this ever fails again, the
+-     * failing run says what it saw instead of needing a second one.
+-     *
+-     * And it is `>= 1`, not `== 1`: after the handover both threads are runnable,
+-     * which is what hardware does too, so the sleeper may legitimately have got
+-     * all the way through its sleep before the starter gets the CPU back. What
+-     * the delay has to guarantee is that the thread *ran* -- asserting where it
+-     * stopped would assert a race between two equal peers, and it was flaking on
+-     * exactly that (stage=2, one run in ten) after the handover was in place. */
++    /* Keep the handover counters in a failure report; the wakeup is below. */
+     CHECK(g_sleeper_stage >= 1,
+           "the sleeper ran and then blocked on SleepThread (stage=%d, started %llu->%llu,"
+           " handovers %llu->%llu, expired=%llu)",
+@@ -347,12 +338,13 @@
+           (unsigned long long)psp_threadman_handovers(),
+           (unsigned long long)psp_threadman_handover_expired());
+ 
+-    /* A sleep with nothing to wake it still ends, one tick later. That is the
+-     * approximation that keeps a `while (!flag) sleep();` poll alive: the
+-     * faithful alternative is a thread that never returns, and a run that
+-     * stops with no evidence in it. */
+-    call(DELAY, 1000, 0, 0, 0);
+-    CHECK(g_sleeper_stage == 2, "a sleep nothing wakes returns after its tick");
++    for (int i = 0; i < 8; i++) call(DELAY, 1000, 0, 0, 0);
++#if PSPRECOMP_REAL_THREADS
++    CHECK(g_sleeper_stage == 1, "SleepThread must not return without a wakeup");
++    CHECK(call(WAKEUP, sid, 0, 0, 0) == 0, "wake the blocked sleeper");
++    CHECK(call(WAITEND, sid, 0, 0, 0) == 0, "the woken sleeper exits");
++#endif
++    CHECK(g_sleeper_stage == 2, "the sleeper reaches its end");
+ 
+     /* A wakeup is not lost when it arrives before the sleep: a producer that
+      * wakes a worker it has not started waiting yet must not have to guess. */
+@@ -768,6 +760,14 @@
+     psp_intr_tick();   /* a handler that waits must not recurse */
+ }
+ 
++static void sleep_with_pending_wakeup(void) {
++#if PSPRECOMP_REAL_THREADS
++    uint32_t self = call(psp_nid("sceKernelGetThreadId"), 0, 0, 0, 0);
++    call(psp_nid("sceKernelWakeupThread"), self, 0, 0, 0);
++#endif
++    call(psp_nid("sceKernelSleepThread"), 0, 0, 0, 0);
++}
++
+ static void test_sub_interrupts(void) {
+     psp_intrman_reset();
+     g_handler_calls = 0;
+@@ -783,7 +783,7 @@
+     CHECK(psp_intr_enabled() == 0, "and starts disabled, as it does on hardware");
+ 
+     /* Registered but not enabled: a wait must not deliver. */
+-    call(psp_nid("sceKernelSleepThread"), 0, 0, 0, 0);
++    sleep_with_pending_wakeup();
+     CHECK(g_handler_calls == 0 && psp_intr_deliveries() == 0,
+           "a disabled handler is not called");
+ 
+@@ -791,7 +791,7 @@
+           "enable returns the previous state (0 = was disabled)");
+     CHECK(psp_intr_enabled() == 1, "handler enabled");
+ 
+-    call(psp_nid("sceKernelSleepThread"), 0, 0, 0, 0);
++    sleep_with_pending_wakeup();
+     CHECK(g_handler_calls == 1 && psp_intr_deliveries() == 1,
+           "the wait delivers one interrupt");
+     CHECK(g_handler_sub == 2 && g_handler_arg == 0x1234,
+@@ -810,7 +810,7 @@
+     psp_register(FN, fake_subintr_handler_that_waits);
+     call(psp_nid("sceKernelRegisterSubIntrHandler"), 1, 2, FN, 0);
+     call(psp_nid("sceKernelEnableSubIntr"), 1, 2, 0, 0);
+-    call(psp_nid("sceKernelSleepThread"), 0, 0, 0, 0);
++    sleep_with_pending_wakeup();
+     CHECK(g_handler_calls == 1, "a handler that waits does not re-enter delivery");
+ 
+     /* A handler address that discovery never found is counted and named, not
+@@ -818,7 +818,7 @@
+     psp_intrman_reset();
+     call(psp_nid("sceKernelRegisterSubIntrHandler"), 1, 2, 0x0000BEEFu, 0);
+     call(psp_nid("sceKernelEnableSubIntr"), 1, 2, 0, 0);
+-    call(psp_nid("sceKernelSleepThread"), 0, 0, 0, 0);
++    sleep_with_pending_wakeup();
+     CHECK(psp_intr_unresolved() == 1 && psp_intr_deliveries() == 0,
+           "an unrecompiled handler address is counted as unresolved");
+ 
+@@ -830,7 +830,7 @@
+     call(psp_nid("sceKernelEnableSubIntr"), 1, 2, 0, 0);
+     CHECK(call(psp_nid("sceKernelReleaseSubIntrHandler"), 1, 2, 0, 0) == 0,
+           "release");
+-    call(psp_nid("sceKernelSleepThread"), 0, 0, 0, 0);
++    sleep_with_pending_wakeup();
+     CHECK(g_handler_calls == 0 && psp_intr_handlers() == 0,
+           "a released handler is not called");
+ }
+--- a/tests/test_thread_lifecycle.c
++++ b/tests/test_thread_lifecycle.c
+@@ -140,6 +140,8 @@
+     call("sceKernelDelayThread", 1, 0, 0, 0);
+     REQUIRE(deliveries == 0);
+     psp_threadman_intr_resume((uint32_t)inner);
++    uint32_t self = call("sceKernelGetThreadId", 0, 0, 0, 0);
++    call("sceKernelWakeupThread", self, 0, 0, 0);
+     call("sceKernelSleepThread", 0, 0, 0, 0);
+     REQUIRE(deliveries == 0);
+     psp_threadman_intr_resume((uint32_t)outer);

@@ -1,0 +1,119 @@
+diff --git a/include/psprecomp/vfpu.h b/include/psprecomp/vfpu.h
+--- a/include/psprecomp/vfpu.h
++++ b/include/psprecomp/vfpu.h
+@@ -129,6 +129,7 @@
+  * orientation of vmmul is not independently verified. */
+ void psp_vmscl(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+ void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size);
++void psp_vhtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+ void psp_vmmul(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+ 
+ /* Prefix state. Set by vpfxs/vpfxt/vpfxd; applied and cleared by the next
+diff --git a/src/vfpu.c b/src/vfpu.c
+--- a/src/vfpu.c
++++ b/src/vfpu.c
+@@ -644,7 +644,7 @@
+ 
+ /* Like vmmul's first operand, vtfm uses the encoded matrix transposed.
+  * E-form selects the ordinary column-major matrix/vector product. */
+-void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
++static void matrix_transform(uint32_t vd, uint32_t vs, uint32_t vt, int size, int homogeneous) {
+     if (!take_prefixes(psp_cpu.pc, "vtfm")) return;
+     float m[4][4];
+     int d[4], t[4];
+@@ -654,6 +654,7 @@
+ 
+     float in[4], out[4];
+     for (int i = 0; i < size; i++) in[i] = psp_cpu.v[t[i]];
++    if (homogeneous) in[size - 1] = 1.0f;
+     for (int r = 0; r < size; r++) {
+         float sum = 0.0f;
+         for (int c = 0; c < size; c++) sum += m[r][c] * in[c];
+@@ -664,6 +665,14 @@
+     for (int r = 0; r < size; r++) psp_cpu.v[d[r]] = out[r];
+ }
+ 
++void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
++    matrix_transform(vd, vs, vt, size, 0);
++}
++
++void psp_vhtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
++    matrix_transform(vd, vs, vt, size, 1);
++}
++
+ /* Matrix product: Md = Ms^T * Mt. The first operand is used transposed, which
+  * is why code writes `vmmul.q M000, E100, M200` (E = the transposed view) to
+  * get M100 * M200.
+diff --git a/tools/allegrexrecomp/emit.c b/tools/allegrexrecomp/emit.c
+--- a/tools/allegrexrecomp/emit.c
++++ b/tools/allegrexrecomp/emit.c
+@@ -548,8 +548,12 @@
+     /* Matrix ops that need no multiply. `vsize` is the matrix order here. */
+     case A_VMMUL:
+         fprintf(f, "%spsp_vmmul(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
+-    case A_VTFM2: case A_VTFM3: case A_VTFM4:
+-        fprintf(f, "%spsp_vtfm(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
++    case A_VTFM2: case A_VTFM3: case A_VTFM4: {
++        const unsigned dim = in->op == A_VTFM2 ? 2 : in->op == A_VTFM3 ? 3 : 4;
++        fprintf(f, "%spsp_%s(%u, %u, %u, %u);\n", ind,
++                in->vsize == dim - 1 ? "vhtfm" : "vtfm", in->vd, in->vs, in->vt, dim);
++        return;
++    }
+     case A_VMSCL:
+         fprintf(f, "%spsp_vmscl(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
+     case A_VMIDT:
+diff --git a/tests/test_vfpu.c b/tests/test_vfpu.c
+--- a/tests/test_vfpu.c
++++ b/tests/test_vfpu.c
+@@ -412,6 +412,9 @@ static void test_vtfm_hardware(void) {
+     const float expected[2][4] = {
+         { -10271, 12362, -14453, 0 }, { -9751, 11802, -13853, 15904 }
+     };
++    const float homogeneous[2][4] = {
++        { -10559, 12682, -14805, 0 }, { -10258, 12348, -14438, 16528 }
++    };
+     for (int n = 3; n <= 4; n++) {
+         for (int i = 0; i < 4; i++) psp_cpu.v[src[i]] = in[i];
+         psp_vtfm(0x24, 0x1C, 0x38, n); /* R100, M700, R600 */
+@@ -421,6 +424,11 @@ static void test_vtfm_hardware(void) {
+             CHECK(psp_cpu.v[dst[i]] == expected[n - 3][i],
+                   "vtfm%d PSP lane %d: got %g, want %g", n, i,
+                   (double)psp_cpu.v[dst[i]], (double)expected[n - 3][i]);
++        psp_vhtfm(0x24, 0x1C, 0x38, n);
++        for (int i = 0; i < n; i++)
++            CHECK(psp_cpu.v[dst[i]] == homogeneous[n - 3][i],
++                  "vhtfm%d PSP lane %d: got %g, want %g", n, i,
++                  (double)psp_cpu.v[dst[i]], (double)homogeneous[n - 3][i]);
+     }
+ }
+ 
+diff --git a/tests/test_emit.c b/tests/test_emit.c
+--- a/tests/test_emit.c
++++ b/tests/test_emit.c
+@@ -1111,6 +1111,26 @@ int main(void) {
++    /* vhtfm has one fewer input lane than the matrix order, not a smaller matrix. */
++    {
++        static const uint32_t CODE_TFM[] = {
++            0xF1808408u, /* vhtfm4.q C200, M100, C000 */
++            0xF1808488u, /* vtfm4.q  C200, M100, C000 */
++            0xF1000488u, /* vhtfm3.t C200, M100, C000 */
++            0xF1008408u, /* vtfm3.t  C200, M100, C000 */
++            0x03E00008u, 0x00000000u,
++        };
++        uint32_t seed = BASE;
++        char *tsrc = emit_synthetic("t_tfm", CODE_TFM, 6, &seed, 1, NULL);
++        if (tsrc) {
++            expect_contains(tsrc, "psp_vhtfm(8, 4, 0, 4);", "vhtfm4 keeps the fourth matrix column");
++            expect_contains(tsrc, "psp_vtfm(8, 4, 0, 4);", "vtfm4 keeps four input lanes");
++            expect_contains(tsrc, "psp_vhtfm(8, 4, 0, 3);", "vhtfm3 keeps the third matrix column");
++            expect_contains(tsrc, "psp_vtfm(8, 4, 0, 3);", "vtfm3 keeps three input lanes");
++            free(tsrc);
++        }
++    }
++
+     /* vi2f / vf2iz carry a 5-bit scale in bits 20..16, which the emitter used
+      * to drop: vi2f.q C200, C100, 16 converted 16.16 fixed point as if it
+      * were a whole number, 65536 times too large. */
+     {
+         static const uint32_t CODE_CVT[] = {
+             0xD2908488u,   /* vi2f.q  C200, C100, 16 */
