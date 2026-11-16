@@ -29,7 +29,7 @@ index 331a13f..ee29f49 100644
   * calls are C calls, so it is one of three things:
   *  - a return, when `ra` is the current call's return site (or the call was
 diff --git a/include/psprecomp/hle.h b/include/psprecomp/hle.h
-index 59cb28d..23a5a5f 100644
+index 59cb28d..995b619 100644
 --- a/include/psprecomp/hle.h
 +++ b/include/psprecomp/hle.h
 @@ -76,6 +76,12 @@ void psp_hle_dump_recent(FILE *out);
@@ -45,21 +45,24 @@ index 59cb28d..23a5a5f 100644
  /* ---- o32 argument access ------------------------------------------------- */
  
  /* Arguments 0-3 arrive in $a0-$a3; 4 and beyond are on the stack, at $sp+16
-@@ -139,10 +145,13 @@ void psp_display_init(void);
+@@ -139,10 +145,15 @@ void psp_display_init(void);
  void psp_display_register(void);
  void psp_display_reset(void);
  int      psp_display_capture(const char *path);
 +/* Debug: dump one VRAM framebuffer with the current display stride/format. */
 +int      psp_display_dump_at(const char *path, uint32_t addr);
  /* The front buffer as 480x272 pixels of 0xAABBGGRR; -1 before the game has
-  * set a framebuffer. */
+- * set a framebuffer. */
++ * set a framebuffer. `psp_display_read_present` returns the most recent
++ * completed buffer snapshot from `sceDisplaySetFrameBuf` to prevent tearing. */
  int      psp_display_read(uint32_t *out);
++int      psp_display_read_present(uint32_t *out);
  uint64_t psp_display_vblanks(void);
 +uint64_t psp_display_frames(void);
  uint32_t psp_display_framebuffer(void);
  
  void psp_ge_init(void);
-@@ -159,17 +168,30 @@ void psp_sas_reset(void);
+@@ -159,17 +170,30 @@ void psp_sas_reset(void);
  uint64_t psp_sas_frames(void);
  uint64_t psp_sas_nonzero(void);
  
@@ -90,7 +93,7 @@ index 59cb28d..23a5a5f 100644
  uint64_t psp_audio_blocks(void);
  
  void psp_threadman_init(void);
-@@ -193,7 +215,7 @@ void psp_threadman_yield(void);
+@@ -193,7 +217,7 @@ void psp_threadman_yield(void);
  /* Park for `us` of virtual time, as sceKernelDelayThread does. For HLE calls
   * that block on hardware for a known time, such as blocking audio output. */
  void psp_threadman_delay(uint64_t us);
@@ -99,7 +102,7 @@ index 59cb28d..23a5a5f 100644
  
  /* Interrupt masking is per thread, and the cookie is the previous state --
   * which is why resuming a nested suspend does not enable interrupts. */
-@@ -224,6 +246,7 @@ void     psp_threadman_dump(FILE *out);
+@@ -224,6 +248,7 @@ void     psp_threadman_dump(FILE *out);
  /* Whether an id names a callback the guest has actually created. A subsystem
   * that records a callback id (scePower's slots) has to ask first. */
  int psp_callback_valid(uint32_t uid);
@@ -272,38 +275,55 @@ index f419054..27be919 100644
   * vector instruction. Matrix ops do not apply them, and trap instead. */
  void psp_vfpu_set_prefix(int which, uint32_t value);
 diff --git a/src/dispatch.c b/src/dispatch.c
-index a2510f5..0655a94 100644
+index a2510f5..0427399 100644
 --- a/src/dispatch.c
 +++ b/src/dispatch.c
-@@ -198,7 +198,15 @@ int psp_ra_is_jump(uint32_t ra) {
+@@ -198,7 +198,26 @@ int psp_ra_is_jump(uint32_t ra) {
      return 1;
  }
  
 -void psp_dispatch(uint32_t addr) {
-+static uint32_t g_mod_lo, g_mod_hi, g_mod_gp;
++#define PSP_MAX_MOD_GP 32
++static struct { uint32_t lo, hi, gp; } g_mods[PSP_MAX_MOD_GP];
++static int g_nmods;
 +
 +void psp_dispatch_module_gp(uint32_t lo, uint32_t hi, uint32_t gp) {
-+    g_mod_lo = lo;
-+    g_mod_hi = hi;
-+    g_mod_gp = gp;
++    for (int i = 0; i < g_nmods; i++) {
++        if (g_mods[i].lo == lo && g_mods[i].hi == hi) {
++            g_mods[i].gp = gp;
++            return;
++        }
++    }
++    if (g_nmods < PSP_MAX_MOD_GP) {
++        g_mods[g_nmods].lo = lo;
++        g_mods[g_nmods].hi = hi;
++        g_mods[g_nmods].gp = gp;
++        g_nmods++;
++    }
 +}
 +
 +static void psp_dispatch_body(uint32_t addr) {
      if (g_budget && ++g_calls >= g_budget) {
          g_budget = 0;                 /* fire once */
          if (g_over) g_over();
-@@ -227,6 +235,19 @@ void psp_dispatch(uint32_t addr) {
+@@ -227,6 +246,25 @@ void psp_dispatch(uint32_t addr) {
      (g_miss ? g_miss : default_miss)(addr);
  }
  
 +void psp_dispatch(uint32_t addr) {
 +    uint32_t saved_gp = 0;
 +    int switched = 0;
-+    if (g_mod_hi && addr >= g_mod_lo && addr < g_mod_hi &&
-+        psp_cpu.r[PSP_REG_GP] != g_mod_gp) {
-+        saved_gp = psp_cpu.r[PSP_REG_GP];
-+        psp_cpu.r[PSP_REG_GP] = g_mod_gp;
-+        switched = 1;
++    if (g_nmods && !(addr >= 0x08000000u && addr < 0x08900000u)) {
++        for (int i = 0; i < g_nmods; i++) {
++            if (addr >= g_mods[i].lo && addr < g_mods[i].hi) {
++                if (psp_cpu.r[PSP_REG_GP] != g_mods[i].gp) {
++                    saved_gp = psp_cpu.r[PSP_REG_GP];
++                    psp_cpu.r[PSP_REG_GP] = g_mods[i].gp;
++                    switched = 1;
++                }
++                break;
++            }
++        }
 +    }
 +    psp_dispatch_body(addr);
 +    if (switched) psp_cpu.r[PSP_REG_GP] = saved_gp;
@@ -312,6 +332,14 @@ index a2510f5..0655a94 100644
  uint32_t psp_dispatch_count(void)  { return g_count; }
  uint64_t psp_dispatch_misses(void) { return g_misses; }
  
+@@ -234,6 +272,7 @@ void psp_dispatch_reset(void) {
+     free(g_table);
+     g_table = NULL;
+     g_cap = g_count = 0;
++    g_nmods = 0;
+     g_misses = 0;
+     g_miss = NULL;
+ }
 diff --git a/src/hle/atrac.c b/src/hle/atrac.c
 new file mode 100644
 index 0000000..2d76123
@@ -622,22 +650,57 @@ index 0000000..2d76123
 +    psp_hle_register(0x6A8C3CD5, "sceAtrac3plus", "sceAtracDecodeData",         hle_AtracDecodeData);
 +}
 diff --git a/src/hle/display.c b/src/hle/display.c
-index 73f6653..0374c61 100644
+index 73f6653..137cd49 100644
 --- a/src/hle/display.c
 +++ b/src/hle/display.c
-@@ -30,6 +30,7 @@ static uint32_t g_fb_width;      /* in pixels, the stride -- usually 512 */
+@@ -12,6 +12,7 @@
+ 
+ #include "psprecomp/hle.h"
+ #include "psprecomp/render.h"
++#include "host_thread.h"
+ 
+ #include <stdio.h>
+ #include <string.h>
+@@ -30,8 +31,29 @@ static uint32_t g_fb_width;      /* in pixels, the stride -- usually 512 */
  static uint32_t g_fb_format;
  static uint32_t g_mode, g_mode_w, g_mode_h;
  static uint64_t g_vblank_count;
 +static uint64_t g_frame_count;
++#if PSPRECOMP_REAL_THREADS
++static uint32_t g_present_px[PSP_SCREEN_W * PSP_SCREEN_H];
++static int      g_present_valid;
++static uint64_t g_present_last_us;
++static host_mutex g_present_lock;
++static int        g_present_lock_init;
++#endif
++
++static void present_lock_ensure(void) {
++#if PSPRECOMP_REAL_THREADS
++    if (!g_present_lock_init) {
++        host_mutex_init(&g_present_lock);
++        g_present_lock_init = 1;
++    }
++#endif
++}
  
  void psp_display_reset(void) {
++    present_lock_ensure();
++#if PSPRECOMP_REAL_THREADS
++    host_mutex_lock(&g_present_lock);
++#endif
      g_fb_addr = 0;
-@@ -39,11 +40,13 @@ void psp_display_reset(void) {
+     g_fb_width = 512;
+     g_fb_format = PSP_DISPLAY_PIXEL_FORMAT_8888;
+@@ -39,11 +61,18 @@ void psp_display_reset(void) {
      g_mode_w = PSP_SCREEN_W;
      g_mode_h = PSP_SCREEN_H;
      g_vblank_count = 0;
 +    g_frame_count = 0;
++#if PSPRECOMP_REAL_THREADS
++    g_present_valid = 0;
++    g_present_last_us = 0;
++    host_mutex_unlock(&g_present_lock);
++#endif
  }
  
  void psp_display_init(void) { psp_display_reset(); }
@@ -647,7 +710,7 @@ index 73f6653..0374c61 100644
  uint32_t psp_display_framebuffer(void) { return g_fb_addr; }
  
  /* Write the current framebuffer as a binary PPM. Returns 0 on success, -1 if
-@@ -65,6 +68,26 @@ int psp_display_capture(const char *path) {
+@@ -65,6 +94,26 @@ int psp_display_capture(const char *path) {
      return 0;
  }
  
@@ -674,7 +737,7 @@ index 73f6653..0374c61 100644
  /* The front buffer, converted, for a window or a capture. Read while the game
   * runs: a frame being drawn into the *back* buffer is never seen, which is the
   * point of the game double-buffering. */
-@@ -73,6 +96,13 @@ int psp_display_read(uint32_t *out) {
+@@ -73,6 +122,13 @@ int psp_display_read(uint32_t *out) {
      if (!addr) return -1;
      const int bpp = (fmt == PSP_DISPLAY_PIXEL_FORMAT_8888) ? 4 : 2;
      for (int y = 0; y < PSP_SCREEN_H; y++) {
@@ -688,15 +751,45 @@ index 73f6653..0374c61 100644
          for (int x = 0; x < PSP_SCREEN_W; x++) {
              uint32_t at = addr + (uint32_t)(y * (int)stride + x) * (uint32_t)bpp;
              uint32_t px = (bpp == 4) ? psp_read32(at) : psp_read16(at);
-@@ -97,6 +127,7 @@ static void hle_SetFrameBuf(void) {
+@@ -82,6 +138,18 @@ int psp_display_read(uint32_t *out) {
+     return 0;
+ }
+ 
++int psp_display_read_present(uint32_t *out) {
++#if PSPRECOMP_REAL_THREADS
++    present_lock_ensure();
++    host_mutex_lock(&g_present_lock);
++    int use_snap = g_present_valid && (host_deadline_us() - g_present_last_us) < 200000ull;
++    if (use_snap) memcpy(out, g_present_px, sizeof g_present_px);
++    host_mutex_unlock(&g_present_lock);
++    if (use_snap) return 0;
++#endif
++    return psp_display_read(out);
++}
++
+ /* ---- the calls ----------------------------------------------------------- */
+ 
+ static void hle_SetMode(void) {
+@@ -97,6 +165,18 @@ static void hle_SetFrameBuf(void) {
      g_fb_width  = psp_arg(1);
      g_fb_format = psp_arg(2);
      if (!g_fb_width) g_fb_width = 512;
 +    g_frame_count++;
++#if PSPRECOMP_REAL_THREADS
++    if (g_fb_addr) {
++        present_lock_ensure();
++        host_mutex_lock(&g_present_lock);
++        if (psp_display_read(g_present_px) == 0) {
++            g_present_valid = 1;
++            g_present_last_us = host_deadline_us();
++        }
++        host_mutex_unlock(&g_present_lock);
++    }
++#endif
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -115,9 +146,21 @@ static void hle_WaitVblank(void) {
+@@ -115,9 +195,21 @@ static void hle_WaitVblank(void) {
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
@@ -1621,10 +1714,19 @@ index 9cff0ef..144082b 100644
      psp_power_register();
  }
 diff --git a/src/hle/host_thread.h b/src/hle/host_thread.h
-index 419b8d2..83cfb74 100644
+index 419b8d2..68bc148 100644
 --- a/src/hle/host_thread.h
 +++ b/src/hle/host_thread.h
-@@ -20,7 +20,12 @@ static void host_thread_error(void) {
+@@ -7,7 +7,7 @@
+ #include <stdlib.h>
+ #include <stdio.h>
+ 
+-static void host_thread_error(void) {
++static inline void host_thread_error(void) {
+     fputs("psprecomp: host synchronization failed\n", stderr);
+     abort();
+ }
+@@ -20,21 +20,26 @@ static void host_thread_error(void) {
  #include <process.h>
  #include <mmsystem.h>
  
@@ -1638,25 +1740,225 @@ index 419b8d2..83cfb74 100644
  typedef HANDLE host_thread;
  typedef SRWLOCK host_mutex;
  typedef CONDITION_VARIABLE host_cond;
-@@ -46,6 +51,7 @@ static void host_cond_wait(host_cond *c, host_mutex *m) {
+ #define HOST_MUTEX_INIT SRWLOCK_INIT
+ #define HOST_COND_INIT CONDITION_VARIABLE_INIT
+-static void host_mutex_init(host_mutex *m) { InitializeSRWLock(m); }
+-static void host_mutex_destroy(host_mutex *m) { (void)m; }
+-static void host_cond_init(host_cond *c) { InitializeConditionVariable(c); }
+-static void host_cond_destroy(host_cond *c) { (void)c; }
+-static void host_mutex_lock(host_mutex *m) { AcquireSRWLockExclusive(m); }
+-static void host_mutex_unlock(host_mutex *m) { ReleaseSRWLockExclusive(m); }
+-static void host_cond_signal(host_cond *c) { WakeConditionVariable(c); }
+-static void host_cond_broadcast(host_cond *c) { WakeAllConditionVariable(c); }
+-static void host_cond_wait(host_cond *c, host_mutex *m) {
++static inline void host_mutex_init(host_mutex *m) { InitializeSRWLock(m); }
++static inline void host_mutex_destroy(host_mutex *m) { (void)m; }
++static inline void host_cond_init(host_cond *c) { InitializeConditionVariable(c); }
++static inline void host_cond_destroy(host_cond *c) { (void)c; }
++static inline void host_mutex_lock(host_mutex *m) { AcquireSRWLockExclusive(m); }
++static inline void host_mutex_unlock(host_mutex *m) { ReleaseSRWLockExclusive(m); }
++static inline void host_cond_signal(host_cond *c) { WakeConditionVariable(c); }
++static inline void host_cond_broadcast(host_cond *c) { WakeAllConditionVariable(c); }
++static inline void host_cond_wait(host_cond *c, host_mutex *m) {
+     if (!SleepConditionVariableSRW(c, m, INFINITE, 0)) host_thread_error();
+ }
+ /* Windows condition waits have millisecond granularity. Round UP so a short
+@@ -45,8 +50,9 @@ static void host_cond_wait(host_cond *c, host_mutex *m) {
+  * audio thread, which parks once per 5.8 ms buffer, ran 17 times slower than
   * real time. host_timer_init() asks for 1 ms resolution, and deadlines use the
   * performance counter rather than GetTickCount64. */
- static void host_timer_init(void) { timeBeginPeriod(1); }
-+static void host_sleep_ms(uint32_t ms) { Sleep(ms); }
- static uint64_t host_deadline_us(void) {
+-static void host_timer_init(void) { timeBeginPeriod(1); }
+-static uint64_t host_deadline_us(void) {
++static inline void host_timer_init(void) { timeBeginPeriod(1); }
++static inline void host_sleep_ms(uint32_t ms) { Sleep(ms); }
++static inline uint64_t host_deadline_us(void) {
      static LARGE_INTEGER freq;
      LARGE_INTEGER now;
-@@ -116,6 +122,10 @@ static void host_cond_signal(host_cond *c) { if (pthread_cond_signal(c)) host_th
- static void host_cond_broadcast(host_cond *c) { if (pthread_cond_broadcast(c)) host_thread_error(); }
- static void host_cond_wait(host_cond *c, host_mutex *m) { if (pthread_cond_wait(c, m)) host_thread_error(); }
- static void host_timer_init(void) { }   /* POSIX sleeps are already fine-grained */
-+static void host_sleep_ms(uint32_t ms) {
+     if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+@@ -54,7 +60,7 @@ static uint64_t host_deadline_us(void) {
+     return (uint64_t)(now.QuadPart / freq.QuadPart) * 1000000ull +
+            (uint64_t)(now.QuadPart % freq.QuadPart) * 1000000ull / (uint64_t)freq.QuadPart;
+ }
+-static int host_cond_until(host_cond *c, host_mutex *m, uint64_t deadline) {
++static inline int host_cond_until(host_cond *c, host_mutex *m, uint64_t deadline) {
+     uint64_t now = host_deadline_us();
+     if (now >= deadline) return 1;
+     uint64_t ms = (deadline - now + 999ull) / 1000ull;
+@@ -64,7 +70,7 @@ static int host_cond_until(host_cond *c, host_mutex *m, uint64_t deadline) {
+     host_thread_error();
+     return 1;
+ }
+-static uint64_t host_epoch_us(void) {
++static inline uint64_t host_epoch_us(void) {
+     FILETIME ft;
+     ULARGE_INTEGER value;
+     GetSystemTimeAsFileTime(&ft);
+@@ -74,13 +80,13 @@ static uint64_t host_epoch_us(void) {
+     return value.QuadPart / 10ull - 11644473600000000ull;
+ }
+ typedef struct { void *(*entry)(void *); void *arg; } host_start;
+-static unsigned __stdcall host_thread_entry(void *arg) {
++static inline unsigned __stdcall host_thread_entry(void *arg) {
+     host_start start = *(host_start *)arg;
+     free(arg);
+     start.entry(start.arg);
+     return 0;
+ }
+-static int host_thread_create(host_thread *thread, size_t stack,
++static inline int host_thread_create(host_thread *thread, size_t stack,
+                               void *(*entry)(void *), void *arg) {
+     host_start *start = (host_start *)malloc(sizeof *start);
+     if (!start) return -1;
+@@ -92,7 +98,7 @@ static int host_thread_create(host_thread *thread, size_t stack,
+     *thread = (HANDLE)handle;
+     return 0;
+ }
+-static void host_thread_join(host_thread thread) {
++static inline void host_thread_join(host_thread thread) {
+     if (WaitForSingleObject(thread, INFINITE) != WAIT_OBJECT_0) host_thread_error();
+     if (!CloseHandle(thread)) host_thread_error();
+ }
+@@ -106,23 +112,27 @@ typedef pthread_mutex_t host_mutex;
+ typedef pthread_cond_t host_cond;
+ #define HOST_MUTEX_INIT PTHREAD_MUTEX_INITIALIZER
+ #define HOST_COND_INIT PTHREAD_COND_INITIALIZER
+-static void host_mutex_init(host_mutex *m) { if (pthread_mutex_init(m, NULL)) host_thread_error(); }
+-static void host_mutex_destroy(host_mutex *m) { if (pthread_mutex_destroy(m)) host_thread_error(); }
+-static void host_cond_init(host_cond *c) { if (pthread_cond_init(c, NULL)) host_thread_error(); }
+-static void host_cond_destroy(host_cond *c) { if (pthread_cond_destroy(c)) host_thread_error(); }
+-static void host_mutex_lock(host_mutex *m) { if (pthread_mutex_lock(m)) host_thread_error(); }
+-static void host_mutex_unlock(host_mutex *m) { if (pthread_mutex_unlock(m)) host_thread_error(); }
+-static void host_cond_signal(host_cond *c) { if (pthread_cond_signal(c)) host_thread_error(); }
+-static void host_cond_broadcast(host_cond *c) { if (pthread_cond_broadcast(c)) host_thread_error(); }
+-static void host_cond_wait(host_cond *c, host_mutex *m) { if (pthread_cond_wait(c, m)) host_thread_error(); }
+-static void host_timer_init(void) { }   /* POSIX sleeps are already fine-grained */
+-static uint64_t host_deadline_us(void) {
++static inline void host_mutex_init(host_mutex *m) { if (pthread_mutex_init(m, NULL)) host_thread_error(); }
++static inline void host_mutex_destroy(host_mutex *m) { if (pthread_mutex_destroy(m)) host_thread_error(); }
++static inline void host_cond_init(host_cond *c) { if (pthread_cond_init(c, NULL)) host_thread_error(); }
++static inline void host_cond_destroy(host_cond *c) { if (pthread_cond_destroy(c)) host_thread_error(); }
++static inline void host_mutex_lock(host_mutex *m) { if (pthread_mutex_lock(m)) host_thread_error(); }
++static inline void host_mutex_unlock(host_mutex *m) { if (pthread_mutex_unlock(m)) host_thread_error(); }
++static inline void host_cond_signal(host_cond *c) { if (pthread_cond_signal(c)) host_thread_error(); }
++static inline void host_cond_broadcast(host_cond *c) { if (pthread_cond_broadcast(c)) host_thread_error(); }
++static inline void host_cond_wait(host_cond *c, host_mutex *m) { if (pthread_cond_wait(c, m)) host_thread_error(); }
++static inline void host_timer_init(void) { }   /* POSIX sleeps are already fine-grained */
++static inline void host_sleep_ms(uint32_t ms) {
 +    struct timespec ts = { (time_t)(ms / 1000u), (long)((ms % 1000u) * 1000000ul) };
 +    nanosleep(&ts, NULL);
 +}
- static uint64_t host_deadline_us(void) {
++static inline uint64_t host_deadline_us(void) {
      struct timespec ts;
      if (clock_gettime(CLOCK_REALTIME, &ts)) host_thread_error();
+     return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+ }
+-static uint64_t host_epoch_us(void) { return host_deadline_us(); }
+-static int host_cond_until(host_cond *c, host_mutex *m, uint64_t deadline) {
++static inline uint64_t host_epoch_us(void) { return host_deadline_us(); }
++static inline int host_cond_until(host_cond *c, host_mutex *m, uint64_t deadline) {
+     struct timespec ts;
+     ts.tv_sec = (time_t)(deadline / 1000000ull);
+     ts.tv_nsec = (long)((deadline % 1000000ull) * 1000ull);
+@@ -130,7 +140,7 @@ static int host_cond_until(host_cond *c, host_mutex *m, uint64_t deadline) {
+     if (rc && rc != ETIMEDOUT) host_thread_error();
+     return rc == ETIMEDOUT;
+ }
+-static int host_thread_create(host_thread *thread, size_t stack,
++static inline int host_thread_create(host_thread *thread, size_t stack,
+                               void *(*entry)(void *), void *arg) {
+     pthread_attr_t attr;
+     int rc = pthread_attr_init(&attr);
+@@ -140,6 +150,6 @@ static int host_thread_create(host_thread *thread, size_t stack,
+     if (pthread_attr_destroy(&attr)) host_thread_error();
+     return rc;
+ }
+-static void host_thread_join(host_thread thread) { if (pthread_join(thread, NULL)) host_thread_error(); }
++static inline void host_thread_join(host_thread thread) { if (pthread_join(thread, NULL)) host_thread_error(); }
+ #endif
+ #endif
+diff --git a/src/hle/intrman.c b/src/hle/intrman.c
+index dca3249..5904099 100644
+--- a/src/hle/intrman.c
++++ b/src/hle/intrman.c
+@@ -33,12 +33,16 @@
+  */
+ #include "psprecomp/hle.h"
+ #include "psprecomp/dispatch.h"
++#include "host_thread.h"
+ 
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ 
+-#define MAX_SUBINTR 64
+-#define INTR_LOG    8   /* how many problems to name before counting silently */
++#define MAX_SUBINTR      64
++#define INTR_LOG         8   /* how many problems to name before counting silently */
++#define VBLANK_INTR      30  /* PSP_VBLANK_INT: fires once per 59.94 Hz frame */
++#define VBLANK_PERIOD_US 16667ull
+ 
+ typedef struct {
+     int      intr;
+@@ -54,6 +58,7 @@ static uint64_t   g_deliveries;
+ static uint64_t   g_unresolved;
+ static int        g_unresolved_logged;
+ static int        g_delivering;   /* reentrancy guard: see psp_intr_tick */
++static uint64_t   g_vblank_next_us;
+ 
+ void psp_intrman_init(void) { psp_intrman_reset(); }
+ 
+@@ -63,6 +68,7 @@ void psp_intrman_reset(void) {
+     g_unresolved = 0;
+     g_unresolved_logged = 0;
+     g_delivering = 0;
++    g_vblank_next_us = 0;
+ }
+ 
+ static psp_subintr *find_subintr(int intr, int subintr) {
+@@ -126,6 +132,17 @@ static void hle_ReleaseSubIntrHandler(void) {
+  * correct for a call: a MIPS callee allocates *below* the caller's frame, so its
+  * prologue cannot overwrite the frame it interrupted.
+  */
++#if PSPRECOMP_REAL_THREADS
++static int intr_no_vsync(void) {
++    static int v = -1;
++    if (v < 0) {
++        const char *e = getenv("PSPRECOMP_NO_VSYNC");
++        v = (e && e[0] == '1') ? 1 : 0;
++    }
++    return v;
++}
++#endif
++
+ void psp_intr_tick(void) {
+     /* A handler is free to wait -- and handlers routinely do. The wait calls
+      * back into here, so without this guard a single delivery would recurse
+@@ -136,9 +153,25 @@ void psp_intr_tick(void) {
+     if (psp_threadman_intr_disabled()) return;
+     g_delivering = 1;
+ 
++    /* Pace PSP_VBLANK_INT (30) at 59.94 Hz in real time (or virtual time under
++     * PSPRECOMP_NO_VSYNC=1 / inline mode) so vblank-driven loops neither spin
++     * at 0 us nor crawl under Windows 1 ms timer rounding across 17 ticks. */
++#if PSPRECOMP_REAL_THREADS
++    uint64_t now = !intr_no_vsync() ? host_deadline_us() : psp_threadman_vtime_us();
++#else
++    uint64_t now = psp_threadman_vtime_us();
++#endif
++    int vblank_due = (now >= g_vblank_next_us);
++    if (vblank_due) {
++        if (!g_vblank_next_us || g_vblank_next_us + 4ull * VBLANK_PERIOD_US < now)
++            g_vblank_next_us = now;
++        g_vblank_next_us += VBLANK_PERIOD_US;
++    }
++
+     for (int i = 0; i < MAX_SUBINTR; i++) {
+         psp_subintr *s = &g_sub[i];
+         if (!s->used || !s->enabled) continue;
++        if (s->intr == VBLANK_INTR && !vblank_due) continue;
+ 
+         if (!psp_lookup(s->handler)) {
+             /* Worth naming loudly: the guest registered a handler we cannot
 diff --git a/src/hle/iofilemgr.c b/src/hle/iofilemgr.c
 index 6d0afc6..9f5f4cf 100644
 --- a/src/hle/iofilemgr.c
@@ -3420,7 +3722,7 @@ index b084e6e..a5476f4 100644
  
  void psp_sysmem_reset(void) {
 diff --git a/src/hle/threadman.c b/src/hle/threadman.c
-index ba2ae51..61ea920 100644
+index ba2ae51..3f9298a 100644
 --- a/src/hle/threadman.c
 +++ b/src/hle/threadman.c
 @@ -28,8 +28,8 @@
@@ -3744,7 +4046,18 @@ index ba2ae51..61ea920 100644
  
      if (t->stack_size < 0x1000) t->stack_size = 0x1000;
      /* Stacks grow down, so allocate from the top of the heap: a stack that
-@@ -1048,19 +1178,13 @@ static void hle_DelayThread(void) {
+@@ -1031,7 +1161,9 @@ static void hle_DeleteThread(void) {
+ static void park_ticks(uint64_t us, int kind) {
+     uint64_t left = us ? us : TICK_US;
+     while (left) {
+-        uint64_t step = left < TICK_US ? left : TICK_US;
++        /* Batch large delays up to one frame (16.67 ms) per park so Windows 1 ms
++         * timer rounding does not stretch a 46 ms audio delay to ~70 ms. */
++        uint64_t step = left < FRAME_US ? left : FRAME_US;
+         park_for(kind, step);
+         left -= step;
+     }
+@@ -1048,19 +1180,13 @@ static void hle_DelayThread(void) {
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
@@ -3769,7 +4082,7 @@ index ba2ae51..61ea920 100644
      if (t && t->wakeups) t->wakeups--;      /* consume it, pending or fresh */
      deliver_tick();
      psp_ret(SCE_KERNEL_ERROR_OK);
-@@ -1070,7 +1194,26 @@ static void hle_WakeupThread(void) {
+@@ -1070,7 +1196,26 @@ static void hle_WakeupThread(void) {
      psp_thread *t = find_thread(psp_arg(0));
      if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
      t->wakeups++;
@@ -3796,7 +4109,18 @@ index ba2ae51..61ea920 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1115,17 +1258,48 @@ static void hle_GetThreadExitStatus(void) {
+@@ -1090,7 +1235,9 @@ static int end_reached(void *p) {
+ static void wait_thread_end(void) {
+     psp_thread *t = find_thread(psp_arg(0));
+     if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
+-    uint32_t out = psp_arg(1), timeout = psp_arg(2);
++    uint32_t out = psp_arg(1);
++    /* Real PSP callers pass (thid, NULL) in $a0/$a1 with garbage in $a2. */
++    uint32_t timeout = out ? psp_arg(2) : 0u;
+     struct end_ctx c = { t, g_tls_me ? g_tls_me->end_waits : NULL };
+ 
+     t->end_waiters++;
+@@ -1115,17 +1262,48 @@ static void hle_GetThreadExitStatus(void) {
  
  static void hle_GetThreadId(void) { psp_ret(g_current ? g_current->uid : 0); }
  
@@ -3846,7 +4170,7 @@ index ba2ae51..61ea920 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1234,6 +1408,7 @@ static uint32_t take_sema(uint32_t timeout) {
+@@ -1234,6 +1412,7 @@ static uint32_t take_sema(uint32_t timeout) {
  }
  
  static void hle_WaitSema(void)   { psp_ret(take_sema(psp_arg(2))); }
@@ -3854,7 +4178,7 @@ index ba2ae51..61ea920 100644
  
  /* The poll variant never blocks: it is the whole difference, and a game that
   * switches to it must not be parked. */
-@@ -1262,9 +1437,10 @@ static void hle_CancelSema(void) {
+@@ -1262,9 +1441,10 @@ static void hle_CancelSema(void) {
  
  /* ---- event flags --------------------------------------------------------- */
  
@@ -3868,7 +4192,7 @@ index ba2ae51..61ea920 100644
  
  static psp_evflag *find_flag(uint32_t id) {
      for (int i = 0; i < MAX_FLAGS; i++)
-@@ -1280,6 +1456,8 @@ static void hle_CreateEventFlag(void) {
+@@ -1280,6 +1460,8 @@ static void hle_CreateEventFlag(void) {
  
      memset(f, 0, sizeof *f);
      psp_str(psp_arg(0), f->name, sizeof f->name);
@@ -3877,7 +4201,7 @@ index ba2ae51..61ea920 100644
      f->pattern = psp_arg(2);
      f->uid = g_next_uid++;
      f->used = 1;
-@@ -1328,8 +1506,10 @@ static uint32_t wait_flag(uint32_t timeout) {
+@@ -1328,8 +1510,10 @@ static uint32_t wait_flag(uint32_t timeout) {
      uint32_t rc = wait_loop(flag_ready, &c, timeout, W_FLAG,
                              "sceKernelWaitEventFlag", f->name);
      if (out) psp_write32(out, f->pattern);
@@ -3890,7 +4214,7 @@ index ba2ae51..61ea920 100644
      return rc;
  }
  
-@@ -1343,6 +1523,59 @@ static void hle_PollEventFlag(void) {
+@@ -1343,6 +1527,59 @@ static void hle_PollEventFlag(void) {
      if (out) psp_write32(out, f->pattern);
      if (!flag_ready(&c)) { psp_ret(SCE_KERNEL_ERROR_EVF_COND); return; }
      if (c.mode & PSP_EVENT_WAITCLEAR) f->pattern &= ~c.bits;
@@ -3950,7 +4274,7 @@ index ba2ae51..61ea920 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1625,6 +1858,134 @@ static void hle_NotifyCallback(void) {
+@@ -1625,6 +1862,134 @@ static void hle_NotifyCallback(void) {
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
@@ -4085,7 +4409,7 @@ index ba2ae51..61ea920 100644
  static void hle_CheckCallback(void) {
      /* The explicit check point, and the one a game uses to decide whether to
       * keep polling: 1 if a callback ran, 0 if none was pending. */
-@@ -1671,6 +2032,15 @@ void psp_threadman_register(void) {
+@@ -1671,6 +2036,15 @@ void psp_threadman_register(void) {
      psp_hle_register(0x28B6489C, "ThreadManForUser", "sceKernelDeleteSema",              hle_DeleteSema);
      psp_hle_register(0x3F53E640, "ThreadManForUser", "sceKernelSignalSema",              hle_SignalSema);
      psp_hle_register(0x4E3A1105, "ThreadManForUser", "sceKernelWaitSema",                hle_WaitSema);
@@ -4101,7 +4425,7 @@ index ba2ae51..61ea920 100644
      psp_hle_register(0x58B1F937, "ThreadManForUser", "sceKernelPollSema",                hle_PollSema);
      psp_hle_register(0x8FFDF9A2, "ThreadManForUser", "sceKernelCancelSema",              hle_CancelSema);
  
-@@ -1680,6 +2050,10 @@ void psp_threadman_register(void) {
+@@ -1680,6 +2054,10 @@ void psp_threadman_register(void) {
      psp_hle_register(0x812346E4, "ThreadManForUser", "sceKernelClearEventFlag",          hle_ClearEventFlag);
      psp_hle_register(0x402FCF22, "ThreadManForUser", "sceKernelWaitEventFlag",           hle_WaitEventFlag);
      psp_hle_register(0x30FD48F0, "ThreadManForUser", "sceKernelPollEventFlag",           hle_PollEventFlag);
@@ -4113,7 +4437,7 @@ index ba2ae51..61ea920 100644
      psp_hle_register(0x56C039B5, "ThreadManForUser", "sceKernelCreateVpl",               hle_CreateVpl);
      psp_hle_register(0x89B3D48C, "ThreadManForUser", "sceKernelDeleteVpl",               hle_DeleteVpl);
 diff --git a/src/mem.c b/src/mem.c
-index 99da3ec..b9356f6 100644
+index 99da3ec..bb8478c 100644
 --- a/src/mem.c
 +++ b/src/mem.c
 @@ -108,6 +108,33 @@ int psp_mem_map_module(uint32_t base, uint32_t size) {
@@ -4122,7 +4446,7 @@ index 99da3ec..b9356f6 100644
  
 +/* Extra module images: the EBOOT occupies the low mapping, and large PRXs
 + * (modtitle, moddeck, the duel subsystem) each reserve their own low window. */
-+#define PSP_MAX_EXTRA 12
++#define PSP_MAX_EXTRA 16
 +static struct { uint8_t *data; uint32_t base, size; } g_extra[PSP_MAX_EXTRA];
 +
 +int psp_mem_map_extra(uint32_t base, uint32_t size) {

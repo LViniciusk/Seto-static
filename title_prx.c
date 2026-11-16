@@ -133,62 +133,6 @@ static uint32_t title_export(uint32_t nid) {
     return 0;
 }
 
-/* The title uses the system OSK for the player name. The runtime does not
- * implement sceUtilityOsk, so serve its small, synchronous contract here: one
- * field, a configured/default name, and the normal init -> visible -> quit ->
- * finished status sequence. The title's own code still reads and stores the
- * returned string. */
-static int g_osk_status;
-static uint32_t g_osk_params;
-
-
-static void osk_fill(void) {
-    const uint32_t params = g_osk_params;
-    const int count = (int)psp_read32(params + 0x30);
-    const uint32_t data = psp_read32(params + 0x34);
-    const char *name = getenv("SETO_PLAYER_NAME");
-    if (!name || !*name) name = "YUGI";
-    for (int i = 0; i < count && i < 4; i++) {
-        const uint32_t d = data + (uint32_t)i * 0x34u;
-        const uint32_t out = psp_read32(d + 0x28);
-        const int len = (int)psp_read32(d + 0x24);
-        int limit = (int)psp_read32(d + 0x30);
-        if (limit <= 0 || limit > len - 1) limit = len > 0 ? len - 1 : 15;
-        if (limit > 31) limit = 31;
-        if (!out || limit <= 0) continue;
-        int n = (int)strlen(name);
-        if (n > limit) n = limit;
-        for (int j = 0; j < n; j++)
-            psp_write16(out + (uint32_t)j * 2u, (uint16_t)(unsigned char)name[j]);
-        psp_write16(out + (uint32_t)n * 2u, 0);
-        psp_write32(d + 0x2C, 2);          /* PSP_UTILITY_OSK_RESULT_CHANGED */
-    }
-    psp_write32(params + 0x1C, 0);         /* base.result */
-}
-
-static void title_osk(uint32_t nid) {
-    switch (nid) {
-    case 0xF6269B82u:                       /* sceUtilityOskInitStart */
-        g_osk_params = psp_arg(0);
-        osk_fill();
-        g_osk_status = 1;
-        psp_ret(0);
-        return;
-    case 0xF3F76017u:                       /* sceUtilityOskGetStatus */
-        if (g_osk_status == 1) g_osk_status = 2;
-        psp_ret((uint32_t)g_osk_status);
-        return;
-    case 0x4B85C861u:                       /* sceUtilityOskUpdate */
-        if (g_osk_status == 2) g_osk_status = 3;
-        psp_ret(0);
-        return;
-    case 0x3DFAEBA9u:                       /* sceUtilityOskShutdownStart */
-        g_osk_status = 4;
-        psp_ret(0);
-        return;
-    }
-}
-
 /* Called by every libtitle import stub (the corpus is compiled with
  * -Dpsp_hle_call=title_import_forward). The call reaches the real EBOOT
  * function through psp_call_from_host(), so the guest register file, stack
@@ -198,6 +142,15 @@ static _Atomic int g_scene_phase;
 
 #if defined(HAVE_CHARALIST_CORPUS) || defined(HAVE_SHOP_CORPUS)
 uint32_t psp_store_export(uint32_t nid, uint32_t *gp_out);
+#endif
+#ifdef HAVE_DECKTUT_CORPUS
+uint32_t psp_decktut_export(uint32_t nid, uint32_t *gp_out);
+#endif
+#ifdef HAVE_DUEL_CORPUS
+uint32_t psp_duel_export(uint32_t nid, uint32_t *gp_out);
+#endif
+#ifdef HAVE_EXTRA_CORPUS
+uint32_t psp_extra_export(uint32_t nid, uint32_t *gp_out);
 #endif
 void title_import_forward(uint32_t nid) {
     if (getenv("SETO_TRACE_CONFIRM") && atomic_load(&g_scene_state) == 4 &&
@@ -214,13 +167,22 @@ void title_import_forward(uint32_t nid) {
     }
     if (nid == 0xF6269B82u || nid == 0xF3F76017u ||
         nid == 0x4B85C861u || nid == 0x3DFAEBA9u) {
-        title_osk(nid);
+        psp_hle_call(nid);
         return;
     }
     uint32_t addr = title_export(nid);
     uint32_t gp = g_eboot_gp;
 #if defined(HAVE_CHARALIST_CORPUS) || defined(HAVE_SHOP_CORPUS)
     if (!addr) addr = psp_store_export(nid, &gp);
+#endif
+#ifdef HAVE_EXTRA_CORPUS
+    if (!addr) addr = psp_extra_export(nid, &gp);
+#endif
+#ifdef HAVE_DECKTUT_CORPUS
+    if (!addr) addr = psp_decktut_export(nid, &gp);
+#endif
+#ifdef HAVE_DUEL_CORPUS
+    if (!addr) addr = psp_duel_export(nid, &gp);
 #endif
     if (!addr) {
         static unsigned logged;

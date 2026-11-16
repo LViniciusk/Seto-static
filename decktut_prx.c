@@ -29,6 +29,8 @@
 typedef struct { uint32_t nid, addr; } decktut_export_t;
 static decktut_export_t g_exports[MAX_EXPORTS];
 static int g_nexports;
+static decktut_export_t g_mod_exports[32];
+static int g_mod_nexports;
 static uint32_t g_eboot_gp, g_decktut_gp;
 static int g_decktut_loaded;
 
@@ -199,12 +201,47 @@ int psp_decktut_image_load(const char *path, uint32_t eboot_info) {
     if (build_exports(eboot_info ? eboot_info : EBOOT_INFO) != 0) {
         free(d); return -1;
     }
+    g_mod_nexports = 0;
+    uint32_t ent = psp_read32(info + 0x24);
+    uint32_t ent_end = psp_read32(info + 0x28);
+    for (uint32_t e = ent; e + 0x10 <= ent_end; ) {
+        uint32_t namep = psp_read32(e);
+        uint8_t ent_len = psp_read8(e + 8);
+        uint8_t nvar = psp_read8(e + 9);
+        uint16_t nfunc = psp_read16(e + 10);
+        uint32_t table = psp_read32(e + 12);
+        uint32_t stride = ent_len ? (uint32_t)ent_len * 4u : 0x10u;
+        if (stride < 0x10) break;
+        if (namep) {
+            uint32_t total = (uint32_t)nfunc + nvar;
+            for (uint16_t i = 0; i < nfunc && g_mod_nexports < 32; i++) {
+                uint32_t nid = psp_read32(table + (uint32_t)i * 4u);
+                uint32_t addr = psp_read32(table + (total + i) * 4u);
+                if (addr < DECKTUT_BASE || addr >= DECKTUT_BASE + memsz || !psp_lookup(addr)) continue;
+                g_mod_exports[g_mod_nexports].nid = nid;
+                g_mod_exports[g_mod_nexports].addr = addr;
+                g_mod_nexports++;
+            }
+        }
+        e += stride;
+    }
     psp_dispatch_module_gp(DECKTUT_BASE, DECKTUT_BASE + memsz, g_decktut_gp);
     g_decktut_loaded = 1;
     free(d);
     fprintf(stderr, "decktut PRX 0x%08X..0x%08X (%u bytes .bss), gp 0x%08X, "
             "%d EBOOT exports\n", vaddr, vaddr + memsz, memsz - filesz,
             g_decktut_gp, g_nexports);
+    return 0;
+}
+
+uint32_t psp_decktut_export(uint32_t nid, uint32_t *gp_out) {
+    if (!g_decktut_loaded) return 0;
+    for (int i = 0; i < g_mod_nexports; i++) {
+        if (g_mod_exports[i].nid == nid) {
+            if (gp_out) *gp_out = g_decktut_gp;
+            return g_mod_exports[i].addr;
+        }
+    }
     return 0;
 }
 

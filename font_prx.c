@@ -40,6 +40,10 @@ int psp_duel_start(uint32_t uid, uint32_t status_ptr);
 int psp_store_load_uid(const char *path, uint32_t *uid);
 int psp_store_start(uint32_t uid, uint32_t status_ptr);
 #endif
+#ifdef HAVE_EXTRA_CORPUS
+int psp_extra_load_uid(const char *path, uint32_t *uid);
+int psp_extra_start(uint32_t uid, uint32_t status_ptr);
+#endif
 
 static uint16_t rd16(const uint8_t *p) {
     return (uint16_t)(p[0] | (p[1] << 8));
@@ -303,6 +307,13 @@ static void hle_LoadModule(void) {
         return;
     }
 #endif
+#ifdef HAVE_EXTRA_CORPUS
+    uint32_t extrauid;
+    if (psp_extra_load_uid(path, &extrauid)) {
+        psp_ret(extrauid);
+        return;
+    }
+#endif
     if (!g_font_loaded || strcmp(path, FONT_LBN_PATH) != 0) {
         /* A module the game loads at run time and this host does not carry.
          * Naming it is the difference between "the scene is stuck" and why.
@@ -345,6 +356,9 @@ static void hle_StartModule(void) {
 #endif
 #if defined(HAVE_CHARALIST_CORPUS) || defined(HAVE_SHOP_CORPUS)
     if (psp_store_start(psp_arg(0), psp_arg(3))) return;
+#endif
+#ifdef HAVE_EXTRA_CORPUS
+    if (psp_extra_start(psp_arg(0), psp_arg(3))) return;
 #endif
     if (psp_arg(0) != g_font_uid) {
         psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID);
