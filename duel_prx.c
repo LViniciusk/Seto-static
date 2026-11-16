@@ -307,22 +307,26 @@ int psp_duel_start(uint32_t uid, uint32_t status_ptr) {
     return 0;
 }
 
-void duel_import_forward(uint32_t nid) {
-    uint32_t addr = 0, gp = 0;
-    for (int i = 0; i < NDUEL && !addr; i++) {
+uint32_t psp_duel_export(uint32_t nid, uint32_t *gp_out) {
+    for (int i = 0; i < NDUEL; i++) {
         duel_mod_t *m = &g_duel[i];
         if (!m->loaded) continue;
         int lo = 0, hi = m->nexports - 1;
         while (lo <= hi) {
             int mid = (lo + hi) / 2;
             if (m->ex[mid].nid == nid) {
-                addr = m->ex[mid].addr;
-                gp = m->ex[mid].gp;
-                break;
+                if (gp_out) *gp_out = m->ex[mid].gp;
+                return m->ex[mid].addr;
             }
             if (m->ex[mid].nid < nid) lo = mid + 1; else hi = mid - 1;
         }
     }
+    return 0;
+}
+
+void duel_import_forward(uint32_t nid) {
+    uint32_t gp = 0;
+    uint32_t addr = psp_duel_export(nid, &gp);
     if (!addr) {
         addr = eboot_export(nid);
         gp = g_eboot_gp;

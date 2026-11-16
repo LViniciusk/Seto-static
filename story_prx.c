@@ -128,6 +128,15 @@ uint32_t psp_field_gp(void);
 #if defined(HAVE_CHARALIST_CORPUS) || defined(HAVE_SHOP_CORPUS)
 uint32_t psp_store_export(uint32_t nid, uint32_t *gp_out);
 #endif
+#ifdef HAVE_DECKTUT_CORPUS
+uint32_t psp_decktut_export(uint32_t nid, uint32_t *gp_out);
+#endif
+#ifdef HAVE_DUEL_CORPUS
+uint32_t psp_duel_export(uint32_t nid, uint32_t *gp_out);
+#endif
+#ifdef HAVE_EXTRA_CORPUS
+uint32_t psp_extra_export(uint32_t nid, uint32_t *gp_out);
+#endif
 void story_import_forward(uint32_t nid) {
     uint32_t addr = story_export(nid);
     uint32_t gp = g_eboot_gp;
@@ -139,6 +148,15 @@ void story_import_forward(uint32_t nid) {
 #endif
 #if defined(HAVE_CHARALIST_CORPUS) || defined(HAVE_SHOP_CORPUS)
     if (!addr) addr = psp_store_export(nid, &gp);
+#endif
+#ifdef HAVE_EXTRA_CORPUS
+    if (!addr) addr = psp_extra_export(nid, &gp);
+#endif
+#ifdef HAVE_DECKTUT_CORPUS
+    if (!addr) addr = psp_decktut_export(nid, &gp);
+#endif
+#ifdef HAVE_DUEL_CORPUS
+    if (!addr) addr = psp_duel_export(nid, &gp);
 #endif
     if (!addr) {
         static unsigned logged;

@@ -23,6 +23,7 @@ RAM_LO, RAM_HI = 0x08000000, 0x0A000000
 HEAP_LO = 0x09700000
 EBOOT_END = 0x00640000
 VRAM_LO = 0x04000000
+VRAM_HI = 0x04400000
 SHT_PSPREL = 0x700000A0
 
 
@@ -98,7 +99,9 @@ def main(argv):
     # for RAM. Neither may touch VRAM (0x04000000) or the runtime heap.
     if RAM_LO <= base and end <= HEAP_LO:
         pass
-    elif end <= VRAM_LO:
+    elif base >= EBOOT_END and end <= VRAM_LO:
+        pass
+    elif base >= VRAM_HI and end <= RAM_LO:
         pass
     else:
         fail("relocated image [0x%08X,0x%08X) leaves the free windows"

@@ -121,15 +121,29 @@ static int build_exports(uint32_t info) {
     return 0;
 }
 
+#ifdef HAVE_DECKTUT_CORPUS
+uint32_t psp_decktut_export(uint32_t nid, uint32_t *gp_out);
+#endif
+#ifdef HAVE_EXTRA_CORPUS
+uint32_t psp_extra_export(uint32_t nid, uint32_t *gp_out);
+#endif
+
 void deck_import_forward(uint32_t nid) {
+    uint32_t gp = g_eboot_gp;
     uint32_t addr = deck_export(nid);
+#ifdef HAVE_EXTRA_CORPUS
+    if (!addr) addr = psp_extra_export(nid, &gp);
+#endif
+#ifdef HAVE_DECKTUT_CORPUS
+    if (!addr) addr = psp_decktut_export(nid, &gp);
+#endif
     if (!addr) {
-        /* libdeck_tutorial/librecipe_viewer/sceRtc: let the runtime answer. */
+        /* Fallback (e.g. sceRtc) lets the runtime answer. */
         psp_hle_call(nid);
         return;
     }
     uint32_t caller_gp = psp_cpu.r[PSP_REG_GP];
-    psp_cpu.r[PSP_REG_GP] = g_eboot_gp;
+    psp_cpu.r[PSP_REG_GP] = gp;
     psp_call_from_host(addr);
     psp_cpu.r[PSP_REG_GP] = caller_gp;
 }

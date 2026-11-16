@@ -20,9 +20,13 @@
 void psp_recomp_register(void);   /* generated tagforce_register.c */
 int  seto_window_start(void);
 void seto_window_stop(void);
+void seto_osk_register(void);
+int  seto_window_osk_active(void);
 void psp_umd_register(void);
 void psp_umd_set_iso(const char *path);
 void psp_fpl_register(void);
+void seto_multimedia_register(void);
+void seto_multimedia_shutdown(void);
 int  psp_font_image_load(const char *path);
 int  psp_font_bind(void);
 #ifdef HAVE_FONT_CORPUS
@@ -44,6 +48,10 @@ int  psp_decktut_image_load(const char *path, uint32_t eboot_info);
 #endif
 #if defined(HAVE_CHARALIST_CORPUS) || defined(HAVE_SHOP_CORPUS)
 int  psp_store_images_load(const char *charalist_path, const char *shop_path, uint32_t eboot_info);
+#endif
+#ifdef HAVE_EXTRA_CORPUS
+int  psp_extra_images_load(const char *const *paths, const char *dir_hint, uint32_t eboot_info);
+void psp_extra_bind_hle(void);
 #endif
 #ifdef HAVE_DUEL_CORPUS
 int  psp_duel_images_load(const char *const *paths, uint32_t eboot_info);
@@ -396,7 +404,7 @@ static void hold_field_input(void) {
     fprintf(stderr, "window: holding; arrows/Z/X/C/Enter control the field\n");
     int t_down = 0;
     for (;;) {
-        psp_ctrl_set(poll_host_pad(), 128, 128);
+        psp_ctrl_set(seto_window_osk_active() ? 0u : poll_host_pad(), 128, 128);
         /* T: log every GE primitive of the next frame to stderr. */
         const int t = (host_key_state('T') & 0x8000) != 0;
         if (t && !t_down) {
@@ -1060,6 +1068,17 @@ static DWORD WINAPI input_thread(LPVOID unused) {
 #ifdef HAVE_TITLE_CORPUS
         if (auto_start) {
             if (!sent) {
+                if (getenv("SETO_SKIP_MOVIE") && !psp_title_menu_ready()) {
+                    static DWORD last_skip = 0;
+                    DWORD now = GetTickCount();
+                    if (last_skip == 0) last_skip = now;
+                    else if (now - last_skip > 6000) {
+                        last_skip = now;
+                        psp_ctrl_set(0x0008u /* START */, 128, 128);
+                        Sleep(80);
+                        psp_ctrl_set(0, 128, 128);
+                    }
+                }
                 if (psp_title_menu_ready()) {
                     sent = 1;
                     psp_title_start_request(1);
@@ -2077,7 +2096,7 @@ map_list_open:
         {
             /* Manual play: always forward focused host pad state directly across
              * all screens (title, menus, field, duel) without scene-state locks. */
-            psp_ctrl_set(poll_host_pad(), 128, 128);
+            psp_ctrl_set(seto_window_osk_active() ? 0u : poll_host_pad(), 128, 128);
         }
         Sleep(10);
     }
@@ -2115,6 +2134,8 @@ int main(int argc, char **argv) {
     const char *duel_rec = argc > 14 ? argv[14] : NULL;
     const char *charalist = argc > 15 ? argv[15] : NULL;
     const char *shop = argc > 16 ? argv[16] : NULL;
+    const char *extra_paths[9];
+    for (int i = 0; i < 9; i++) extra_paths[i] = argc > 17 + i ? argv[17 + i] : NULL;
     const int free_duel = getenv("SETO_FREE_DUEL") != NULL &&
                           !getenv("SETO_FREE_DUEL_PLAY");
 
@@ -2134,7 +2155,9 @@ int main(int argc, char **argv) {
     psp_umd_set_iso(iso);
     psp_umd_register();
     psp_fpl_register();
+    seto_osk_register();
     psp_recomp_register();
+    seto_multimedia_register();
 
     /* S5: the pre-relocated PRX image plus its namespaced corpus. The image is
      * placed, its exports are bound to the seven NIDs and called from the
@@ -2150,6 +2173,9 @@ int main(int argc, char **argv) {
         if (psp_font_bind() != 0) return 1;
         g_font_entry = 0x08900000u;   /* sceFontNewLib, the first expected call */
     }
+#ifdef HAVE_EXTRA_CORPUS
+    psp_extra_bind_hle();
+#endif
 #else
     if (font) {
         fprintf(stderr, "font PRX: this build has no font corpus (build/s5-font-reloc)\n");
@@ -2226,6 +2252,19 @@ int main(int argc, char **argv) {
         return 1;
     }
 #endif
+#ifdef HAVE_EXTRA_CORPUS
+    if (psp_extra_images_load(extra_paths,
+                              shop ? shop : (charalist ? charalist : elf),
+                              m.info) != 0)
+        return 1;
+#else
+    for (int i = 0; i < 9; i++) {
+        if (extra_paths[i]) {
+            fprintf(stderr, "extra PRX: this build has no extra corpora (build/s13-*-reloc)\n");
+            return 1;
+        }
+    }
+#endif
 
     /* This EBOOT has no .ctors section. The upstream heuristic scans the last
      * 64 KB of the image for a run of pointers into that same window and here
@@ -2294,6 +2333,7 @@ int main(int argc, char **argv) {
         idle = g_input_done ? idle + (int)step : 0;
     }
     seto_window_stop();
+    seto_multimedia_shutdown();
     timeEndPeriod(1);
     report("run ended");
     return 0;
