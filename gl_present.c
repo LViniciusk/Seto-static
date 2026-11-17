@@ -6,6 +6,7 @@
  * for a future GE backend; the software renderer remains the default. */
 
 #include "gl_present.h"
+#include "ge_queue.h"
 
 #include <windows.h>
 #include <GL/gl.h>
@@ -58,6 +59,30 @@ static PFNGLBUFFERDATAPROC p_glBufferData;
 static PFNGLDELETEBUFFERSPROC p_glDeleteBuffers;
 static PFNGLVERTEXATTRIBPOINTERPROC p_glVertexAttribPointer;
 static PFNGLENABLEVERTEXATTRIBARRAYPROC p_glEnableVertexAttribArray;
+static PFNGLGENFRAMEBUFFERSPROC p_glGenFramebuffers;
+static PFNGLBINDFRAMEBUFFERPROC p_glBindFramebuffer;
+static PFNGLFRAMEBUFFERTEXTURE2DPROC p_glFramebufferTexture2D;
+static PFNGLCHECKFRAMEBUFFERSTATUSPROC p_glCheckFramebufferStatus;
+static PFNGLDELETEFRAMEBUFFERSPROC p_glDeleteFramebuffers;
+static PFNGLUNIFORM4FPROC p_glUniform4f;
+
+/* M1.0: GPU thread + SPSC queue + shared FBO. The software renderer is still
+ * the display source unless SETO_GE_GPU is set; the test command only changes
+ * the triangle colour. */
+static HGLRC g_ge_ctx;
+static HANDLE g_ge_thread;
+static HANDLE g_ge_ready;
+static volatile LONG g_ge_quit;
+static CRITICAL_SECTION g_ge_lock;
+static int g_ge_lock_ready;
+static int g_ge_active;
+static int g_ge_ok;
+static GLuint g_ge_prog, g_ge_vao, g_ge_vbo, g_ge_tex, g_ge_fbo;
+static GLint g_ge_color_loc;
+static int g_ge_w, g_ge_h;
+static ge_queue g_ge_q;
+static int g_ge_queue_ready;
+static uint32_t g_ge_rgb = 0xFFFFFFFFu;
 
 static const char *vs_src =
     "#version 330 core\n"
@@ -138,6 +163,12 @@ static int load_gl(void) {
     SETO_GL_LOAD(PFNGLDELETEBUFFERSPROC, glDeleteBuffers);
     SETO_GL_LOAD(PFNGLVERTEXATTRIBPOINTERPROC, glVertexAttribPointer);
     SETO_GL_LOAD(PFNGLENABLEVERTEXATTRIBARRAYPROC, glEnableVertexAttribArray);
+    SETO_GL_LOAD(PFNGLGENFRAMEBUFFERSPROC, glGenFramebuffers);
+    SETO_GL_LOAD(PFNGLBINDFRAMEBUFFERPROC, glBindFramebuffer);
+    SETO_GL_LOAD(PFNGLFRAMEBUFFERTEXTURE2DPROC, glFramebufferTexture2D);
+    SETO_GL_LOAD(PFNGLCHECKFRAMEBUFFERSTATUSPROC, glCheckFramebufferStatus);
+    SETO_GL_LOAD(PFNGLDELETEFRAMEBUFFERSPROC, glDeleteFramebuffers);
+    SETO_GL_LOAD(PFNGLUNIFORM4FPROC, glUniform4f);
     return 1;
 }
 
@@ -192,7 +223,245 @@ static int make_program(void) {
     return 1;
 }
 
+static const char *ge_vs =
+    "#version 330 core\n"
+    "layout(location=0) in vec2 a_pos;\n"
+    "void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }\n";
+
+static const char *ge_fs =
+    "#version 330 core\n"
+    "uniform vec4 u_color;\n"
+    "out vec4 o_color;\n"
+    "void main() { o_color = u_color; }\n";
+
+static const float ge_verts[] = {
+    -0.6f, -0.5f,
+     0.6f, -0.5f,
+     0.0f,  0.6f
+};
+
+static int ge_make_program(void) {
+    GLuint vs = compile_shader(GL_VERTEX_SHADER, ge_vs);
+    GLuint fs = compile_shader(GL_FRAGMENT_SHADER, ge_fs);
+    GLint ok = 0;
+    if (!vs || !fs) {
+        if (vs) p_glDeleteShader(vs);
+        if (fs) p_glDeleteShader(fs);
+        return 0;
+    }
+    g_ge_prog = p_glCreateProgram();
+    p_glAttachShader(g_ge_prog, vs);
+    p_glAttachShader(g_ge_prog, fs);
+    p_glLinkProgram(g_ge_prog);
+    p_glGetProgramiv(g_ge_prog, GL_LINK_STATUS, &ok);
+    p_glDeleteShader(vs);
+    p_glDeleteShader(fs);
+    if (!ok) {
+        GLchar log[2048];
+        GLsizei len = 0;
+        p_glGetProgramInfoLog(g_ge_prog, sizeof log, &len, log);
+        fprintf(stderr, "gl: GE program link failed: %.*s\n", (int)len, log);
+        p_glDeleteProgram(g_ge_prog);
+        g_ge_prog = 0;
+        return 0;
+    }
+    g_ge_color_loc = p_glGetUniformLocation(g_ge_prog, "u_color");
+    return 1;
+}
+
+static int ge_make_vao(void) {
+    p_glGenVertexArrays(1, &g_ge_vao);
+    p_glBindVertexArray(g_ge_vao);
+    p_glGenBuffers(1, &g_ge_vbo);
+    p_glBindBuffer(GL_ARRAY_BUFFER, g_ge_vbo);
+    p_glBufferData(GL_ARRAY_BUFFER, sizeof ge_verts, ge_verts, GL_STATIC_DRAW);
+    p_glEnableVertexAttribArray(0);
+    p_glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (const void *)0);
+    return 1;
+}
+
+static int ge_make_target(int w, int h) {
+    if (g_ge_fbo) {
+        p_glDeleteFramebuffers(1, &g_ge_fbo);
+        g_ge_fbo = 0;
+    }
+    if (g_ge_tex) {
+        glDeleteTextures(1, &g_ge_tex);
+        g_ge_tex = 0;
+    }
+    glGenTextures(1, &g_ge_tex);
+    glBindTexture(GL_TEXTURE_2D, g_ge_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+
+    p_glGenFramebuffers(1, &g_ge_fbo);
+    p_glBindFramebuffer(GL_FRAMEBUFFER, g_ge_fbo);
+    p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                             GL_TEXTURE_2D, g_ge_tex, 0);
+    if (p_glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        fprintf(stderr, "gl: GE FBO incomplete (%dx%d)\n", w, h);
+        p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        p_glDeleteFramebuffers(1, &g_ge_fbo);
+        g_ge_fbo = 0;
+        glDeleteTextures(1, &g_ge_tex);
+        g_ge_tex = 0;
+        return 0;
+    }
+    p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    g_ge_w = w;
+    g_ge_h = h;
+    return 1;
+}
+
+static void ge_free_gl(void) {
+    if (g_ge_fbo && p_glDeleteFramebuffers) p_glDeleteFramebuffers(1, &g_ge_fbo);
+    if (g_ge_tex) glDeleteTextures(1, &g_ge_tex);
+    if (g_ge_prog && p_glDeleteProgram) p_glDeleteProgram(g_ge_prog);
+    if (g_ge_vao && p_glDeleteVertexArrays) p_glDeleteVertexArrays(1, &g_ge_vao);
+    if (g_ge_vbo && p_glDeleteBuffers) p_glDeleteBuffers(1, &g_ge_vbo);
+    g_ge_fbo = g_ge_tex = g_ge_prog = g_ge_vao = g_ge_vbo = 0;
+    g_ge_w = g_ge_h = 0;
+}
+
+static DWORD WINAPI ge_thread(LPVOID unused) {
+    RECT rc;
+    int w, h;
+    (void)unused;
+
+    if (!wglMakeCurrent(g_dc, g_ge_ctx)) {
+        fprintf(stderr, "gl: GE render context make-current failed\n");
+        SetEvent(g_ge_ready);
+        return 1;
+    }
+    GetClientRect(g_hwnd, &rc);
+    w = rc.right - rc.left;
+    h = rc.bottom - rc.top;
+    if (w <= 0 || h <= 0) { w = 960; h = 544; }
+    if (!ge_make_program() || !ge_make_vao() || !ge_make_target(w, h)) {
+        ge_free_gl();
+        wglMakeCurrent(NULL, NULL);
+        SetEvent(g_ge_ready);
+        return 1;
+    }
+    g_ge_ok = 1;
+    SetEvent(g_ge_ready);
+
+    while (!g_ge_quit) {
+        ge_cmd cmd;
+        while (ge_queue_pop(&g_ge_q, &cmd)) {
+            if (cmd.type == GE_CMD_TEST_COLOR) g_ge_rgb = cmd.color;
+        }
+        GetClientRect(g_hwnd, &rc);
+        w = rc.right - rc.left;
+        h = rc.bottom - rc.top;
+        if (w > 0 && h > 0) {
+            EnterCriticalSection(&g_ge_lock);
+            if (w != g_ge_w || h != g_ge_h) ge_make_target(w, h);
+            if (g_ge_fbo && g_ge_tex) {
+                p_glBindFramebuffer(GL_FRAMEBUFFER, g_ge_fbo);
+                glViewport(0, 0, w, h);
+                glClearColor(0.08f, 0.08f, 0.12f, 1.0f);
+                glClear(GL_COLOR_BUFFER_BIT);
+                p_glUseProgram(g_ge_prog);
+                p_glUniform4f(g_ge_color_loc,
+                              (GLfloat)((g_ge_rgb >> 16) & 0xFF) / 255.0f,
+                              (GLfloat)((g_ge_rgb >> 8) & 0xFF) / 255.0f,
+                              (GLfloat)(g_ge_rgb & 0xFF) / 255.0f, 1.0f);
+                p_glBindVertexArray(g_ge_vao);
+                glDrawArrays(GL_TRIANGLES, 0, 3);
+                p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                glFinish();
+            }
+            LeaveCriticalSection(&g_ge_lock);
+        }
+        Sleep(16);
+    }
+
+    ge_free_gl();
+    wglMakeCurrent(NULL, NULL);
+    return 0;
+}
+
+static void ge_stop(void) {
+    if (g_ge_thread) {
+        InterlockedExchange(&g_ge_quit, 1);
+        WaitForSingleObject(g_ge_thread, 2000);
+        CloseHandle(g_ge_thread);
+        g_ge_thread = NULL;
+    }
+    if (g_ge_ready) {
+        CloseHandle(g_ge_ready);
+        g_ge_ready = NULL;
+    }
+    if (g_ge_lock_ready) {
+        DeleteCriticalSection(&g_ge_lock);
+        g_ge_lock_ready = 0;
+    }
+    if (g_ge_queue_ready) {
+        ge_queue_destroy(&g_ge_q);
+        g_ge_queue_ready = 0;
+    }
+    if (g_ge_ctx) {
+        wglDeleteContext(g_ge_ctx);
+        g_ge_ctx = NULL;
+    }
+    g_ge_active = 0;
+    g_ge_ok = 0;
+}
+
+static int ge_start(PFNWGLCREATECONTEXTATTRIBSARBPROC create_ctx) {
+    const int attribs[] = {
+        WGL_CONTEXT_MAJOR_VERSION_ARB, 3,
+        WGL_CONTEXT_MINOR_VERSION_ARB, 3,
+        WGL_CONTEXT_PROFILE_MASK_ARB, WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
+        0
+    };
+
+    g_ge_ctx = create_ctx(g_dc, g_ctx, attribs);
+    if (!g_ge_ctx) {
+        fprintf(stderr, "gl: GE render context unavailable\n");
+        return 0;
+    }
+    InitializeCriticalSection(&g_ge_lock);
+    g_ge_lock_ready = 1;
+    if (ge_queue_init(&g_ge_q, 64) != 0) {
+        fprintf(stderr, "gl: GE queue init failed\n");
+        ge_stop();
+        return 0;
+    }
+    g_ge_queue_ready = 1;
+    g_ge_ready = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!g_ge_ready) {
+        fprintf(stderr, "gl: GE ready event failed\n");
+        ge_stop();
+        return 0;
+    }
+    g_ge_quit = 0;
+    g_ge_thread = CreateThread(NULL, 0, ge_thread, NULL, 0, NULL);
+    if (!g_ge_thread) {
+        fprintf(stderr, "gl: GE thread failed\n");
+        ge_stop();
+        return 0;
+    }
+    WaitForSingleObject(g_ge_ready, 3000);
+    CloseHandle(g_ge_ready);
+    g_ge_ready = NULL;
+    if (!g_ge_ok) {
+        fprintf(stderr, "gl: GE thread init failed\n");
+        ge_stop();
+        return 0;
+    }
+    g_ge_active = 1;
+    fprintf(stderr, "gl: GE GPU test backend active (%dx%d)\n", g_ge_w, g_ge_h);
+    return 1;
+}
+
 static void gl_cleanup(void) {
+    ge_stop();
     if (g_ctx) {
         if (g_prog && p_glDeleteProgram) p_glDeleteProgram(g_prog);
         if (g_vao && p_glDeleteVertexArrays) p_glDeleteVertexArrays(1, &g_vao);
@@ -310,6 +579,12 @@ int seto_gl_present_init(HWND hwnd) {
     g_active = 1;
     fprintf(stderr, "gl: OpenGL %s presenter active\n",
             (const char *)glGetString(GL_VERSION));
+
+    {
+        const char *ge = getenv("SETO_GE_GPU");
+        if (ge && ge[0] && !ge_start(create_ctx))
+            fprintf(stderr, "gl: GE test backend disabled; software frame stays\n");
+    }
     return 1;
 }
 
@@ -320,6 +595,41 @@ void seto_gl_present_frame(HWND hwnd, const uint32_t *rgba) {
 
     if (!g_active) return;
     (void)hwnd;
+
+    if (g_ge_active) {
+        ge_cmd c;
+        c.type = GE_CMD_TEST_COLOR;
+        c.color = (uint32_t)GetTickCount();
+        ge_queue_push(&g_ge_q, c);
+
+        GetClientRect(g_hwnd, &rc);
+        cw = rc.right - rc.left;
+        ch = rc.bottom - rc.top;
+        if (cw <= 0 || ch <= 0) return;
+        if ((int64_t)cw * 17 > (int64_t)ch * 30) {
+            dh = ch;
+            dw = (int)((int64_t)ch * 30 / 17);
+        } else {
+            dw = cw;
+            dh = (int)((int64_t)cw * 17 / 30);
+        }
+        EnterCriticalSection(&g_ge_lock);
+        if (g_ge_tex) {
+            glBindTexture(GL_TEXTURE_2D, g_ge_tex);
+            glViewport((cw - dw) / 2, (ch - dh) / 2, dw, dh);
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            p_glUseProgram(g_prog);
+            p_glUniform2f(g_u_texel, 1.0f / g_ge_w, 1.0f / g_ge_h);
+            p_glUniform1i(g_u_mode, 1);
+            p_glBindVertexArray(g_vao);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            glFinish();
+        }
+        LeaveCriticalSection(&g_ge_lock);
+        SwapBuffers(g_dc);
+        return;
+    }
 
     glBindTexture(GL_TEXTURE_2D, g_tex);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, GL_SCREEN_W, GL_SCREEN_H,
