@@ -7,6 +7,8 @@
 
 #include <psprecomp/hle.h>
 
+#include "gl_present.h"
+
 #include <windows.h>
 #include <gdiplus.h>
 #include <stdint.h>
@@ -47,15 +49,19 @@ static int gdiplus_start_once(void) {
 static void update_frame(HWND hwnd) {
     if (IsIconic(hwnd)) return;
     if (psp_display_read_present(g_read) != 0) return;
-    /* 0xAABBGGRR from psp_display_read; a 32-bit BI_RGB DIB wants B,G,R,X
-     * in memory, i.e. 0x00RRGGBB in the word. */
-    for (int i = 0; i < SCREEN_W * SCREEN_H; i++) {
-        const uint32_t c = g_read[i];
-        g_dib[i] = ((c & 0x000000FFu) << 16) |
-                   (c & 0x0000FF00u) |
-                   ((c & 0x00FF0000u) >> 16);
+    if (seto_gl_present_active()) {
+        seto_gl_present_frame(hwnd, g_read);
+    } else {
+        /* 0xAABBGGRR from psp_display_read; a 32-bit BI_RGB DIB wants B,G,R,X
+         * in memory, i.e. 0x00RRGGBB in the word. */
+        for (int i = 0; i < SCREEN_W * SCREEN_H; i++) {
+            const uint32_t c = g_read[i];
+            g_dib[i] = ((c & 0x000000FFu) << 16) |
+                       (c & 0x0000FF00u) |
+                       ((c & 0x00FF0000u) >> 16);
+        }
+        g_have_frame = 1;
     }
-    g_have_frame = 1;
     {
         static DWORD last_ms;
         static uint64_t last_frames, last_vblanks;
@@ -79,9 +85,8 @@ static void update_frame(HWND hwnd) {
             last_vblanks = cur_vblanks;
         }
     }
-    InvalidateRect(hwnd, NULL, FALSE);
+    if (!seto_gl_present_active()) InvalidateRect(hwnd, NULL, FALSE);
 }
-
 #include <psprecomp/cpu.h>
 #include <psprecomp/hle.h>
 #include <psprecomp/mem.h>
@@ -390,6 +395,7 @@ int seto_window_osk_active(void) {
 }
 
 static void paint(HWND hwnd, HDC hdc) {
+    if (seto_gl_present_active()) return;
     RECT rc;
     GetClientRect(hwnd, &rc);
     const int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
@@ -555,6 +561,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_ID);
+        seto_gl_present_shutdown(hwnd);
         if (g_memdc) {
             SelectObject(g_memdc, g_memold);
             DeleteObject(g_membmp);
@@ -592,7 +599,7 @@ static DWORD WINAPI window_thread(LPVOID unused) {
     WNDCLASSEXW wc;
     memset(&wc, 0, sizeof wc);
     wc.cbSize = sizeof wc;
-    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.style = CS_HREDRAW | CS_VREDRAW | CS_OWNDC;
     wc.lpfnWndProc = wnd_proc;
     wc.hInstance = GetModuleHandleW(NULL);
     wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
@@ -622,6 +629,8 @@ static DWORD WINAPI window_thread(LPVOID unused) {
         SetEvent(g_ready);
         return 1;
     }
+
+    seto_gl_present_init(g_hwnd);
 
     ShowWindow(g_hwnd, SW_SHOW);
     ShowWindow(g_hwnd, SW_SHOWNORMAL);
