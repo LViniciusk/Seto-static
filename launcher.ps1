@@ -80,8 +80,14 @@ function Start-Game($cfg, [switch]$DryRun) {
     $env:SETO_HOLD_WINDOW = '1'
     $env:SETO_SCALE = [string]$cfg.scale
     $env:SETO_FILTER = [string]$cfg.filter
-    if ($cfg.present -eq 'gl' -or $cfg.present -eq 'ge') { $env:SETO_PRESENT = 'gl' }
+    if ($cfg.present -eq 'gl' -or $cfg.present -eq 'ge' -or $cfg.present -eq 'ged') {
+        $env:SETO_PRESENT = 'gl'
+    }
     if ($cfg.present -eq 'ge') { $env:SETO_GE_GPU = 'test' }
+    if ($cfg.present -eq 'ged') {
+        $env:SETO_GE_GPU = 'draw'
+        $env:SETO_RENDERER = 'gl'
+    }
 
     if ($DryRun) {
         Write-Output "exe: $exe"
@@ -117,6 +123,7 @@ $presentLabels = [ordered]@{
     'GDI (default)'         = '0'
     'OpenGL 3.3 (M0)'       = 'gl'
     'OpenGL GE test (M1.0)' = 'ge'
+    'OpenGL GE draw (M1.1)' = 'ged'
 }
 
 $form = New-Object System.Windows.Forms.Form

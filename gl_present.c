@@ -14,6 +14,7 @@
 #include <GL/wglext.h>
 
 #include <stdint.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,6 +51,7 @@ static PFNGLDELETEPROGRAMPROC p_glDeleteProgram;
 static PFNGLGETUNIFORMLOCATIONPROC p_glGetUniformLocation;
 static PFNGLUNIFORM1IPROC p_glUniform1i;
 static PFNGLUNIFORM2FPROC p_glUniform2f;
+static PFNGLUNIFORM1FPROC p_glUniform1f;
 static PFNGLGENVERTEXARRAYSPROC p_glGenVertexArrays;
 static PFNGLBINDVERTEXARRAYPROC p_glBindVertexArray;
 static PFNGLDELETEVERTEXARRAYSPROC p_glDeleteVertexArrays;
@@ -65,6 +67,11 @@ static PFNGLFRAMEBUFFERTEXTURE2DPROC p_glFramebufferTexture2D;
 static PFNGLCHECKFRAMEBUFFERSTATUSPROC p_glCheckFramebufferStatus;
 static PFNGLDELETEFRAMEBUFFERSPROC p_glDeleteFramebuffers;
 static PFNGLUNIFORM4FPROC p_glUniform4f;
+static PFNGLGENRENDERBUFFERSPROC p_glGenRenderbuffers;
+static PFNGLBINDRENDERBUFFERPROC p_glBindRenderbuffer;
+static PFNGLRENDERBUFFERSTORAGEPROC p_glRenderbufferStorage;
+static PFNGLFRAMEBUFFERRENDERBUFFERPROC p_glFramebufferRenderbuffer;
+static PFNGLDELETERENDERBUFFERSPROC p_glDeleteRenderbuffers;
 
 /* M1.0: GPU thread + SPSC queue + shared FBO. The software renderer is still
  * the display source unless SETO_GE_GPU is set; the test command only changes
@@ -77,12 +84,16 @@ static CRITICAL_SECTION g_ge_lock;
 static int g_ge_lock_ready;
 static int g_ge_active;
 static int g_ge_ok;
-static GLuint g_ge_prog, g_ge_vao, g_ge_vbo, g_ge_tex, g_ge_fbo;
+static int g_ge_draw_mode;
+static GLuint g_ge_prog, g_ge_vao, g_ge_vbo, g_ge_tex, g_ge_fbo, g_ge_depth;
 static GLint g_ge_color_loc;
 static int g_ge_w, g_ge_h;
 static ge_queue g_ge_q;
 static int g_ge_queue_ready;
 static uint32_t g_ge_rgb = 0xFFFFFFFFu;
+
+static GLuint g_ge_geo_prog, g_ge_geo_vao, g_ge_geo_vbo;
+static GLint g_ge_geo_size, g_ge_geo_atest, g_ge_geo_afunc, g_ge_geo_aref;
 
 static const char *vs_src =
     "#version 330 core\n"
@@ -154,6 +165,7 @@ static int load_gl(void) {
     SETO_GL_LOAD(PFNGLGETUNIFORMLOCATIONPROC, glGetUniformLocation);
     SETO_GL_LOAD(PFNGLUNIFORM1IPROC, glUniform1i);
     SETO_GL_LOAD(PFNGLUNIFORM2FPROC, glUniform2f);
+    SETO_GL_LOAD(PFNGLUNIFORM1FPROC, glUniform1f);
     SETO_GL_LOAD(PFNGLGENVERTEXARRAYSPROC, glGenVertexArrays);
     SETO_GL_LOAD(PFNGLBINDVERTEXARRAYPROC, glBindVertexArray);
     SETO_GL_LOAD(PFNGLDELETEVERTEXARRAYSPROC, glDeleteVertexArrays);
@@ -169,6 +181,11 @@ static int load_gl(void) {
     SETO_GL_LOAD(PFNGLCHECKFRAMEBUFFERSTATUSPROC, glCheckFramebufferStatus);
     SETO_GL_LOAD(PFNGLDELETEFRAMEBUFFERSPROC, glDeleteFramebuffers);
     SETO_GL_LOAD(PFNGLUNIFORM4FPROC, glUniform4f);
+    SETO_GL_LOAD(PFNGLGENRENDERBUFFERSPROC, glGenRenderbuffers);
+    SETO_GL_LOAD(PFNGLBINDRENDERBUFFERPROC, glBindRenderbuffer);
+    SETO_GL_LOAD(PFNGLRENDERBUFFERSTORAGEPROC, glRenderbufferStorage);
+    SETO_GL_LOAD(PFNGLFRAMEBUFFERRENDERBUFFERPROC, glFramebufferRenderbuffer);
+    SETO_GL_LOAD(PFNGLDELETERENDERBUFFERSPROC, glDeleteRenderbuffers);
     return 1;
 }
 
@@ -234,6 +251,43 @@ static const char *ge_fs =
     "out vec4 o_color;\n"
     "void main() { o_color = u_color; }\n";
 
+static const char *ge_geo_vs =
+    "#version 330 core\n"
+    "layout(location=0) in ivec2 a_pos;\n"
+    "layout(location=1) in float a_z;\n"
+    "layout(location=2) in vec4 a_color;\n"
+    "uniform vec2 u_size;\n"
+    "out vec4 v_color;\n"
+    "void main() {\n"
+    "  vec2 p = vec2(a_pos) / u_size;\n"
+    "  gl_Position = vec4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0,\n"
+    "                     a_z / 65535.0 * 2.0 - 1.0, 1.0);\n"
+    "  v_color = a_color;\n"
+    "}\n";
+
+static const char *ge_geo_fs =
+    "#version 330 core\n"
+    "in vec4 v_color;\n"
+    "out vec4 o_color;\n"
+    "uniform int u_atest;\n"
+    "uniform int u_afunc;\n"
+    "uniform float u_aref;\n"
+    "void main() {\n"
+    "  if (u_atest != 0) {\n"
+    "    bool pass;\n"
+    "    if (u_afunc == 0) pass = false;\n"
+    "    else if (u_afunc == 1) pass = true;\n"
+    "    else if (u_afunc == 2) pass = abs(v_color.a - u_aref) < (1.0 / 255.0);\n"
+    "    else if (u_afunc == 3) pass = abs(v_color.a - u_aref) >= (1.0 / 255.0);\n"
+    "    else if (u_afunc == 4) pass = v_color.a < u_aref;\n"
+    "    else if (u_afunc == 5) pass = v_color.a <= u_aref;\n"
+    "    else if (u_afunc == 6) pass = v_color.a > u_aref;\n"
+    "    else pass = v_color.a >= u_aref;\n"
+    "    if (!pass) discard;\n"
+    "  }\n"
+    "  o_color = v_color;\n"
+    "}\n";
+
 static const float ge_verts[] = {
     -0.6f, -0.5f,
      0.6f, -0.5f,
@@ -280,6 +334,164 @@ static int ge_make_vao(void) {
     return 1;
 }
 
+static int ge_make_geo_program(void) {
+    GLuint vs = compile_shader(GL_VERTEX_SHADER, ge_geo_vs);
+    GLuint fs = compile_shader(GL_FRAGMENT_SHADER, ge_geo_fs);
+    GLint ok = 0;
+    if (!vs || !fs) {
+        if (vs) p_glDeleteShader(vs);
+        if (fs) p_glDeleteShader(fs);
+        return 0;
+    }
+    g_ge_geo_prog = p_glCreateProgram();
+    p_glAttachShader(g_ge_geo_prog, vs);
+    p_glAttachShader(g_ge_geo_prog, fs);
+    p_glLinkProgram(g_ge_geo_prog);
+    p_glGetProgramiv(g_ge_geo_prog, GL_LINK_STATUS, &ok);
+    p_glDeleteShader(vs);
+    p_glDeleteShader(fs);
+    if (!ok) {
+        GLchar log[2048];
+        GLsizei len = 0;
+        p_glGetProgramInfoLog(g_ge_geo_prog, sizeof log, &len, log);
+        fprintf(stderr, "gl: GE geo program link failed: %.*s\n", (int)len, log);
+        p_glDeleteProgram(g_ge_geo_prog);
+        g_ge_geo_prog = 0;
+        return 0;
+    }
+    g_ge_geo_size = p_glGetUniformLocation(g_ge_geo_prog, "u_size");
+    g_ge_geo_atest = p_glGetUniformLocation(g_ge_geo_prog, "u_atest");
+    g_ge_geo_afunc = p_glGetUniformLocation(g_ge_geo_prog, "u_afunc");
+    g_ge_geo_aref = p_glGetUniformLocation(g_ge_geo_prog, "u_aref");
+    return 1;
+}
+
+static int ge_make_geo_vao(void) {
+    p_glGenVertexArrays(1, &g_ge_geo_vao);
+    p_glBindVertexArray(g_ge_geo_vao);
+    p_glGenBuffers(1, &g_ge_geo_vbo);
+    p_glBindBuffer(GL_ARRAY_BUFFER, g_ge_geo_vbo);
+    p_glEnableVertexAttribArray(0);
+    p_glVertexAttribPointer(0, 2, GL_INT, GL_FALSE, sizeof(psp_vertex),
+                            (const void *)(uintptr_t)offsetof(psp_vertex, x));
+    p_glEnableVertexAttribArray(1);
+    p_glVertexAttribPointer(1, 1, GL_FLOAT, GL_FALSE, sizeof(psp_vertex),
+                            (const void *)(uintptr_t)offsetof(psp_vertex, z));
+    p_glEnableVertexAttribArray(2);
+    p_glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(psp_vertex),
+                            (const void *)(uintptr_t)offsetof(psp_vertex, rgba));
+    return 1;
+}
+
+static GLenum ge_blend_factor(int f) {
+    switch (f) {
+    case 0: return GL_ZERO;
+    case 1: return GL_ONE;
+    case 2: return GL_SRC_COLOR;
+    case 3: return GL_ONE_MINUS_SRC_COLOR;
+    case 4: return GL_DST_COLOR;
+    case 5: return GL_ONE_MINUS_DST_COLOR;
+    case 6: return GL_SRC_ALPHA;
+    case 7: return GL_ONE_MINUS_SRC_ALPHA;
+    case 8: return GL_DST_ALPHA;
+    case 9: return GL_ONE_MINUS_DST_ALPHA;
+    default: return GL_ONE;
+    }
+}
+
+static GLenum ge_depth_func(int f) {
+    switch (f) {
+    case 0: return GL_NEVER;
+    case 1: return GL_ALWAYS;
+    case 2: return GL_EQUAL;
+    case 3: return GL_NOTEQUAL;
+    case 4: return GL_LESS;
+    case 5: return GL_LEQUAL;
+    case 6: return GL_GREATER;
+    default: return GL_GEQUAL;
+    }
+}
+
+static void ge_apply_state(const psp_draw_state *st) {
+    int x0 = st->sc_x0, y0 = st->sc_y0, x1 = st->sc_x1, y1 = st->sc_y1;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 >= 480) x1 = 479;
+    if (y1 >= 272) y1 = 271;
+    if (x1 < x0 || y1 < y0) {
+        glDisable(GL_SCISSOR_TEST);
+    } else {
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(x0, 272 - (y1 + 1), x1 - x0 + 1, y1 - y0 + 1);
+    }
+
+    if (st->blend) {
+        glEnable(GL_BLEND);
+        glBlendFunc(ge_blend_factor(st->blend_src), ge_blend_factor(st->blend_dst));
+    } else {
+        glDisable(GL_BLEND);
+    }
+
+    if (st->cull_enable) {
+        glEnable(GL_CULL_FACE);
+        glCullFace(GL_BACK);
+        glFrontFace(st->cull_face ? GL_CW : GL_CCW);
+    } else {
+        glDisable(GL_CULL_FACE);
+    }
+
+    if (st->ztest) {
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(ge_depth_func(st->zfunc));
+    } else {
+        glDisable(GL_DEPTH_TEST);
+    }
+    glDepthMask(st->zwrite ? GL_TRUE : GL_FALSE);
+    glDisable(GL_STENCIL_TEST);
+}
+
+static void ge_process_draw(const ge_cmd *c) {
+    GLenum mode;
+    if (!c || c->count <= 0) return;
+
+    if (c->state.clear) {
+        const uint32_t col = c->verts[0].rgba;
+        const GLfloat r = (GLfloat)(col & 0xFF) / 255.0f;
+        const GLfloat g = (GLfloat)((col >> 8) & 0xFF) / 255.0f;
+        const GLfloat b = (GLfloat)((col >> 16) & 0xFF) / 255.0f;
+        const GLfloat a = (GLfloat)((col >> 24) & 0xFF) / 255.0f;
+        GLbitfield bits = GL_COLOR_BUFFER_BIT;
+        ge_apply_state(&c->state);
+        glClearColor(r, g, b, a);
+        if (c->state.clear_depth) {
+            glDepthMask(GL_TRUE);
+            glClearDepth(0.0);
+            bits |= GL_DEPTH_BUFFER_BIT;
+        }
+        glClear(bits);
+        return;
+    }
+
+    switch (c->prim) {
+    case PSP_PRIM_TRIANGLES:      mode = GL_TRIANGLES; break;
+    case PSP_PRIM_TRIANGLE_STRIP: mode = GL_TRIANGLE_STRIP; break;
+    case PSP_PRIM_TRIANGLE_FAN:   mode = GL_TRIANGLE_FAN; break;
+    default: return;
+    }
+
+    ge_apply_state(&c->state);
+    p_glUseProgram(g_ge_geo_prog);
+    p_glUniform2f(g_ge_geo_size, 480.0f, 272.0f);
+    p_glUniform1i(g_ge_geo_atest, c->state.atest ? 1 : 0);
+    p_glUniform1i(g_ge_geo_afunc, c->state.atest_func);
+    p_glUniform1f(g_ge_geo_aref, (GLfloat)c->state.atest_ref / 255.0f);
+    p_glBindBuffer(GL_ARRAY_BUFFER, g_ge_geo_vbo);
+    p_glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(c->count * sizeof(psp_vertex)),
+                   c->verts, GL_STREAM_DRAW);
+    p_glBindVertexArray(g_ge_geo_vao);
+    glDrawArrays(mode, 0, c->count);
+}
+
 static int ge_make_target(int w, int h) {
     if (g_ge_fbo) {
         p_glDeleteFramebuffers(1, &g_ge_fbo);
@@ -302,6 +514,15 @@ static int ge_make_target(int w, int h) {
     p_glBindFramebuffer(GL_FRAMEBUFFER, g_ge_fbo);
     p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                              GL_TEXTURE_2D, g_ge_tex, 0);
+    if (g_ge_depth) {
+        p_glDeleteRenderbuffers(1, &g_ge_depth);
+        g_ge_depth = 0;
+    }
+    p_glGenRenderbuffers(1, &g_ge_depth);
+    p_glBindRenderbuffer(GL_RENDERBUFFER, g_ge_depth);
+    p_glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, w, h);
+    p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                GL_RENDERBUFFER, g_ge_depth);
     if (p_glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
         fprintf(stderr, "gl: GE FBO incomplete (%dx%d)\n", w, h);
         p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -309,6 +530,8 @@ static int ge_make_target(int w, int h) {
         g_ge_fbo = 0;
         glDeleteTextures(1, &g_ge_tex);
         g_ge_tex = 0;
+        p_glDeleteRenderbuffers(1, &g_ge_depth);
+        g_ge_depth = 0;
         return 0;
     }
     p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -319,11 +542,16 @@ static int ge_make_target(int w, int h) {
 
 static void ge_free_gl(void) {
     if (g_ge_fbo && p_glDeleteFramebuffers) p_glDeleteFramebuffers(1, &g_ge_fbo);
+    if (g_ge_depth && p_glDeleteRenderbuffers) p_glDeleteRenderbuffers(1, &g_ge_depth);
     if (g_ge_tex) glDeleteTextures(1, &g_ge_tex);
     if (g_ge_prog && p_glDeleteProgram) p_glDeleteProgram(g_ge_prog);
+    if (g_ge_geo_prog && p_glDeleteProgram) p_glDeleteProgram(g_ge_geo_prog);
     if (g_ge_vao && p_glDeleteVertexArrays) p_glDeleteVertexArrays(1, &g_ge_vao);
+    if (g_ge_geo_vao && p_glDeleteVertexArrays) p_glDeleteVertexArrays(1, &g_ge_geo_vao);
     if (g_ge_vbo && p_glDeleteBuffers) p_glDeleteBuffers(1, &g_ge_vbo);
-    g_ge_fbo = g_ge_tex = g_ge_prog = g_ge_vao = g_ge_vbo = 0;
+    if (g_ge_geo_vbo && p_glDeleteBuffers) p_glDeleteBuffers(1, &g_ge_geo_vbo);
+    g_ge_fbo = g_ge_depth = g_ge_tex = g_ge_prog = g_ge_vao = g_ge_vbo = 0;
+    g_ge_geo_prog = g_ge_geo_vao = g_ge_geo_vbo = 0;
     g_ge_w = g_ge_h = 0;
 }
 
@@ -337,21 +565,45 @@ static DWORD WINAPI ge_thread(LPVOID unused) {
         SetEvent(g_ge_ready);
         return 1;
     }
-    GetClientRect(g_hwnd, &rc);
-    w = rc.right - rc.left;
-    h = rc.bottom - rc.top;
-    if (w <= 0 || h <= 0) { w = 960; h = 544; }
-    if (!ge_make_program() || !ge_make_vao() || !ge_make_target(w, h)) {
-        ge_free_gl();
-        wglMakeCurrent(NULL, NULL);
-        SetEvent(g_ge_ready);
-        return 1;
+
+    if (g_ge_draw_mode) {
+        if (!ge_make_geo_program() || !ge_make_geo_vao() || !ge_make_target(480, 272)) {
+            ge_free_gl();
+            wglMakeCurrent(NULL, NULL);
+            SetEvent(g_ge_ready);
+            return 1;
+        }
+    } else {
+        GetClientRect(g_hwnd, &rc);
+        w = rc.right - rc.left;
+        h = rc.bottom - rc.top;
+        if (w <= 0 || h <= 0) { w = 960; h = 544; }
+        if (!ge_make_program() || !ge_make_vao() || !ge_make_target(w, h)) {
+            ge_free_gl();
+            wglMakeCurrent(NULL, NULL);
+            SetEvent(g_ge_ready);
+            return 1;
+        }
     }
     g_ge_ok = 1;
     SetEvent(g_ge_ready);
 
     while (!g_ge_quit) {
         ge_cmd cmd;
+        if (g_ge_draw_mode) {
+            EnterCriticalSection(&g_ge_lock);
+            while (ge_queue_pop(&g_ge_q, &cmd)) {
+                if (cmd.type == GE_CMD_DRAW) ge_process_draw(&cmd);
+                else if (cmd.type == GE_CMD_TEST_COLOR) g_ge_rgb = cmd.color;
+                /* GE_CMD_TARGET: the M1.1 display target is the fixed 480x272
+                 * FBO. GE_CMD_PRESENT: the window timer presents the FBO. */
+            }
+            glFinish();
+            LeaveCriticalSection(&g_ge_lock);
+            Sleep(16);
+            continue;
+        }
+
         while (ge_queue_pop(&g_ge_q, &cmd)) {
             if (cmd.type == GE_CMD_TEST_COLOR) g_ge_rgb = cmd.color;
         }
@@ -456,7 +708,8 @@ static int ge_start(PFNWGLCREATECONTEXTATTRIBSARBPROC create_ctx) {
         return 0;
     }
     g_ge_active = 1;
-    fprintf(stderr, "gl: GE GPU test backend active (%dx%d)\n", g_ge_w, g_ge_h);
+    fprintf(stderr, "gl: GE GPU %s backend active (%dx%d)\n",
+            g_ge_draw_mode ? "draw" : "test", g_ge_w, g_ge_h);
     return 1;
 }
 
@@ -582,8 +835,11 @@ int seto_gl_present_init(HWND hwnd) {
 
     {
         const char *ge = getenv("SETO_GE_GPU");
-        if (ge && ge[0] && !ge_start(create_ctx))
-            fprintf(stderr, "gl: GE test backend disabled; software frame stays\n");
+        if (ge && ge[0]) {
+            g_ge_draw_mode = strcmp(ge, "draw") == 0;
+            if (!ge_start(create_ctx))
+                fprintf(stderr, "gl: GE backend disabled; software frame stays\n");
+        }
     }
     return 1;
 }
@@ -597,6 +853,36 @@ void seto_gl_present_frame(HWND hwnd, const uint32_t *rgba) {
     (void)hwnd;
 
     if (g_ge_active) {
+        if (g_ge_draw_mode) {
+            GetClientRect(g_hwnd, &rc);
+            cw = rc.right - rc.left;
+            ch = rc.bottom - rc.top;
+            if (cw <= 0 || ch <= 0) return;
+            if ((int64_t)cw * 17 > (int64_t)ch * 30) {
+                dh = ch;
+                dw = (int)((int64_t)ch * 30 / 17);
+            } else {
+                dw = cw;
+                dh = (int)((int64_t)cw * 17 / 30);
+            }
+            EnterCriticalSection(&g_ge_lock);
+            if (g_ge_tex) {
+                glBindTexture(GL_TEXTURE_2D, g_ge_tex);
+                glViewport((cw - dw) / 2, (ch - dh) / 2, dw, dh);
+                glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+                glClear(GL_COLOR_BUFFER_BIT);
+                p_glUseProgram(g_prog);
+                p_glUniform2f(g_u_texel, 1.0f / 480.0f, 1.0f / 272.0f);
+                p_glUniform1i(g_u_mode, g_filter);
+                p_glBindVertexArray(g_vao);
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+                glFinish();
+            }
+            LeaveCriticalSection(&g_ge_lock);
+            SwapBuffers(g_dc);
+            return;
+        }
+
         ge_cmd c;
         c.type = GE_CMD_TEST_COLOR;
         c.color = (uint32_t)GetTickCount();
@@ -660,6 +946,41 @@ void seto_gl_present_frame(HWND hwnd, const uint32_t *rgba) {
     p_glBindVertexArray(g_vao);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     SwapBuffers(g_dc);
+}
+
+int seto_ge_gpu_draw_mode(void) { return g_ge_draw_mode; }
+
+int seto_ge_gpu_enqueue_target(uint32_t addr, uint32_t stride, int fmt) {
+    ge_cmd c;
+    if (!g_ge_active || !g_ge_draw_mode || !g_ge_queue_ready) return 0;
+    memset(&c, 0, sizeof c);
+    c.type = GE_CMD_TARGET;
+    c.addr = addr;
+    c.stride = stride;
+    c.fmt = (uint32_t)fmt;
+    return ge_queue_push(&g_ge_q, c);
+}
+
+int seto_ge_gpu_enqueue_draw(int prim, const psp_vertex *v, int count,
+                             const psp_draw_state *st) {
+    ge_cmd c;
+    if (!g_ge_active || !g_ge_draw_mode || !g_ge_queue_ready) return 0;
+    if (!v || !st || count <= 0 || count > GE_MAX_VERTS) return 0;
+    memset(&c, 0, sizeof c);
+    c.type = GE_CMD_DRAW;
+    c.prim = (uint32_t)prim;
+    c.count = (uint32_t)count;
+    c.state = *st;
+    memcpy(c.verts, v, (size_t)count * sizeof *v);
+    return ge_queue_push(&g_ge_q, c);
+}
+
+void seto_ge_gpu_present(void) {
+    ge_cmd c;
+    if (!g_ge_active || !g_ge_draw_mode || !g_ge_queue_ready) return;
+    memset(&c, 0, sizeof c);
+    c.type = GE_CMD_PRESENT;
+    ge_queue_push(&g_ge_q, c);
 }
 
 void seto_gl_present_shutdown(HWND hwnd) {

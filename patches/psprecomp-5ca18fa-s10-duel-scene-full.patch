@@ -181,7 +181,7 @@ index 132306f..e5ab735 100644
   * hot path in any recompiled game; correctness first. */
  static inline float psp_fsqrt(float v) {
 diff --git a/include/psprecomp/render.h b/include/psprecomp/render.h
-index 81ee925..ad1893b 100644
+index 81ee925..207e6cc 100644
 --- a/include/psprecomp/render.h
 +++ b/include/psprecomp/render.h
 @@ -24,6 +24,8 @@ typedef struct {
@@ -233,6 +233,17 @@ index 81ee925..ad1893b 100644
  } psp_draw_state;
  
  typedef struct {
+@@ -116,6 +144,10 @@ int psp_render_select(const char *name);
+ /* The active backend. Never NULL -- defaults to software. */
+ const psp_render_backend *psp_render_current(void);
+ 
++/* Install a host-provided backend (the GL frontend). Passing NULL restores
++ * the current selection. */
++void psp_render_set_backend(const psp_render_backend *backend);
++
+ /* Backends provided by the runtime. */
+ extern const psp_render_backend psp_render_software;
+ extern const psp_render_backend psp_render_null;
 diff --git a/include/psprecomp/vfpu.h b/include/psprecomp/vfpu.h
 index f419054..27be919 100644
 --- a/include/psprecomp/vfpu.h
@@ -4518,7 +4529,7 @@ index 7e4aff8..5092b53 100644
      free(b);
  
 diff --git a/src/render.c b/src/render.c
-index 6a20fb4..8c16be7 100644
+index 6a20fb4..ca6042f 100644
 --- a/src/render.c
 +++ b/src/render.c
 @@ -9,14 +9,18 @@
@@ -5636,7 +5647,7 @@ index 6a20fb4..8c16be7 100644
      const uint32_t bytes = g_fb_fmt == 3 ? 4u : 2u;
      const uint32_t at = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * bytes;
      /* Rounded: coplanar layers (WTF draws LED text on its panel at the same
-@@ -324,123 +1137,3019 @@ static void fragment(const psp_draw_state *st, int x, int y, uint32_t c, float u
+@@ -324,136 +1137,3032 @@ static void fragment(const psp_draw_state *st, int x, int y, uint32_t c, float u
      if (st->clear) {
          /* Clear mode writes only the buffers its flags name. A depth-only
           * clear leaves the colour alone. */
@@ -5757,6 +5768,12 @@ index 6a20fb4..8c16be7 100644
 -    int maxx = a->x > b->x ? (a->x > c->x ? a->x : c->x) : (b->x > c->x ? b->x : c->x);
 -    int miny = a->y < b->y ? (a->y < c->y ? a->y : c->y) : (b->y < c->y ? b->y : c->y);
 -    int maxy = a->y > b->y ? (a->y > c->y ? a->y : c->y) : (b->y > c->y ? b->y : c->y);
+-
+-    if (a->behind || b->behind || c->behind) return;   /* ponytail: no near-plane clipping */
+-    if (minx < 0) minx = 0;
+-    if (miny < 0) miny = 0;
+-    if (maxx > 479) maxx = 479;
+-    if (maxy > 271) maxy = 271;
 +static inline uint32_t fb_read_fast(const uint8_t *fb_base, uint32_t off_px) {
 +    if (g_fb_fmt == 3) {
 +        uint32_t c;
@@ -5769,11 +5786,17 @@ index 6a20fb4..8c16be7 100644
 +    return g_fb_fmt == 0 ? c & 0x00FFFFFFu : c;
 +}
  
--    if (a->behind || b->behind || c->behind) return;   /* ponytail: no near-plane clipping */
--    if (minx < 0) minx = 0;
--    if (miny < 0) miny = 0;
--    if (maxx > 479) maxx = 479;
--    if (maxy > 271) maxy = 271;
+-    const int area = edge(a, b, c->x, c->y);
+-    if (area == 0) return;
+-    const float inv = 1.0f / (float)area;
+-    /* Coverage is decided on the integer grid; attributes are sampled at the
+-     * pixel centre, half a pixel on, as the GE does. Sampled at the corner, a
+-     * row lands exactly on a texel edge, float error floors it to the texel
+-     * before, and WTF's LED panels -- dots on every other texel row -- lost
+-     * whole rows of dots. */
+-    const float h0 = 0.5f * (float)((b->x - a->x) - (b->y - a->y));
+-    const float h1 = 0.5f * (float)((c->x - b->x) - (c->y - b->y));
+-    const float h2 = 0.5f * (float)((a->x - c->x) - (a->y - c->y));
 +static inline void fb_write_fast_keep_alpha(uint8_t *fb_base, uint32_t off_px, uint32_t c) {
 +    if (g_fb_fmt == 3) {
 +        uint32_t dst;
@@ -5792,17 +5815,20 @@ index 6a20fb4..8c16be7 100644
 +    }
 +}
  
--    const int area = edge(a, b, c->x, c->y);
--    if (area == 0) return;
--    const float inv = 1.0f / (float)area;
--    /* Coverage is decided on the integer grid; attributes are sampled at the
--     * pixel centre, half a pixel on, as the GE does. Sampled at the corner, a
--     * row lands exactly on a texel edge, float error floors it to the texel
--     * before, and WTF's LED panels -- dots on every other texel row -- lost
--     * whole rows of dots. */
--    const float h0 = 0.5f * (float)((b->x - a->x) - (b->y - a->y));
--    const float h1 = 0.5f * (float)((c->x - b->x) - (c->y - b->y));
--    const float h2 = 0.5f * (float)((a->x - c->x) - (a->y - c->y));
+-    for (int y = miny; y <= maxy; y++) {
+-        for (int x = minx; x <= maxx; x++) {
+-            int w0 = edge(a, b, x, y);   /* weight of c */
+-            int w1 = edge(b, c, x, y);   /* weight of a */
+-            int w2 = edge(c, a, x, y);   /* weight of b */
+-            if (!((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
+-                continue;
+-            float la = ((float)w1 + h1) * inv, lb = ((float)w2 + h2) * inv, lc = ((float)w0 + h0) * inv;
+-            uint32_t col = c->rgba;
+-            if (st->gouraud) {
+-                col = rgba((int)(R(a->rgba) * la + R(b->rgba) * lb + R(c->rgba) * lc + 0.5f),
+-                           (int)(G(a->rgba) * la + G(b->rgba) * lb + G(c->rgba) * lc + 0.5f),
+-                           (int)(B(a->rgba) * la + B(b->rgba) * lb + B(c->rgba) * lc + 0.5f),
+-                           (int)(A(a->rgba) * la + A(b->rgba) * lb + A(c->rgba) * lc + 0.5f));
 +static inline int tri_row_span(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c,
 +                               int area, int minx, int maxx, int y,
 +                               int *xs_out, int *xe_out, int *w0_out, int *w1_out, int *w2_out) {
@@ -5827,9 +5853,13 @@ index 6a20fb4..8c16be7 100644
 +            if (w < 0) {
 +                const int lim = (-w + nd - 1) / nd;
 +                if (lim > kmin) kmin = lim;
-+            }
-+        }
-+    }
+             }
+-            fragment(st, x, y, col,
+-                     a->u * la + b->u * lb + c->u * lc,
+-                     a->v * la + b->v * lb + c->v * lc,
+-                     a->z * la + b->z * lb + c->z * lc);
+         }
+     }
 +    if (kmin > kmax) return 0;
 +    *xs_out = minx + kmin;
 +    *xe_out = minx + kmax;
@@ -5837,30 +5867,66 @@ index 6a20fb4..8c16be7 100644
 +    *w1_out = w1_0 - kmin * dy1;
 +    *w2_out = w2_0 - kmin * dy2;
 +    return 1;
-+}
-+
+ }
+ 
+-/* A sprite is the PSP's 2D primitive: two vertices giving opposite corners of
+- * an axis-aligned rectangle, coloured by the second. The far edge is exclusive
+- * so adjacent sprites tile without overlapping. Texture coordinates run
+- * linearly from one corner to the other, so swapped corners mirror the image. */
+-static void sw_sprite(const psp_vertex *a, const psp_vertex *b, const psp_draw_state *st) {
+-    int x0 = a->x < b->x ? a->x : b->x, x1 = a->x > b->x ? a->x : b->x;
+-    int y0 = a->y < b->y ? a->y : b->y, y1 = a->y > b->y ? a->y : b->y;
+-    if (x0 == x1 || y0 == y1) return;
+-    const float du = (b->u - a->u) / (float)(b->x - a->x);
+-    const float dv = (b->v - a->v) / (float)(b->y - a->y);
+-    for (int y = y0; y < y1; y++)
+-        for (int x = x0; x < x1; x++)
+-            fragment(st, x, y, b->rgba, a->u + ((float)(x - a->x) + 0.5f) * du,
+-                     a->v + ((float)(y - a->y) + 0.5f) * dv, b->z);
 +static inline int zrange_needed(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c,
 +                                const psp_draw_state *st) {
 +    if (!st->zrange_enable || st->through) return 0;
 +    const float z0 = a->z < b->z ? (a->z < c->z ? a->z : c->z) : (b->z < c->z ? b->z : c->z);
 +    const float z1 = a->z > b->z ? (a->z > c->z ? a->z : c->z) : (b->z > c->z ? b->z : c->z);
 +    return !(z0 >= (float)st->zmin && z1 <= (float)st->zmax);
-+}
-+
+ }
+ 
+-static void sw_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
+-    switch (prim) {
+-    case PSP_PRIM_SPRITES:
+-        for (int i = 0; i + 1 < count; i += 2) sw_sprite(&v[i], &v[i + 1], st);
+-        break;
+-    case PSP_PRIM_TRIANGLES:
+-        for (int i = 0; i + 2 < count; i += 3) sw_tri(&v[i], &v[i + 1], &v[i + 2], st);
+-        break;
+-    case PSP_PRIM_TRIANGLE_STRIP:
+-        for (int i = 0; i + 2 < count; i++) sw_tri(&v[i], &v[i + 1], &v[i + 2], st);
+-        break;
+-    case PSP_PRIM_TRIANGLE_FAN:
+-        for (int i = 1; i + 1 < count; i++) sw_tri(&v[0], &v[i], &v[i + 1], st);
+-        break;
+-    default:
+-        break;                       /* points, lines: not yet */
+-    }
 +static inline int uv_fp_eligible(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c) {
 +    const float lim = 1e6f;
 +    return a->u > -lim && a->u < lim && b->u > -lim && b->u < lim && c->u > -lim && c->u < lim &&
 +           a->v > -lim && a->v < lim && b->v > -lim && b->v < lim && c->v > -lim && c->v < lim;
-+}
-+
+ }
+ 
+-static void sw_noop(void) { }
 +static inline int clamp8(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
-+
+ 
+-const psp_render_backend psp_render_software = {
+-    "software", sw_init, sw_shutdown, sw_target, sw_draw, sw_noop, sw_noop
+-};
 +static __attribute__((noinline)) void sw_tri_solid_za_fn(
 +    const psp_vertex *a, const psp_vertex *b, const psp_vertex *c,
 +    const psp_draw_state *st, int minx, int maxx, int miny, int maxy,
 +    int area, float h0, float h1, float h2,
 +    int bmode, int stencil, int ztest, int zwrite, int atest, int gouraud, int fog);
-+
+ 
+-/* ---- null backend -------------------------------------------------------- */
 +static int sw_tri_opaque(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c,
 +                         const psp_draw_state *st, int minx, int maxx, int miny, int maxy,
 +                         int area, float inv, float h0, float h1, float h2, int gouraud, int fog) {
@@ -5883,7 +5949,10 @@ index 6a20fb4..8c16be7 100644
 +    const int32_t dbdx = gouraud ? (int32_t)(((-(double)dy1 * (int)B(a->rgba) - (double)dy2 * (int)B(b->rgba) - (double)dy0 * (int)B(c->rgba)) * inv_d) * 65536.0) : 0;
 +    const int32_t dadx = gouraud ? (int32_t)(((-(double)dy1 * (int)A(a->rgba) - (double)dy2 * (int)A(b->rgba) - (double)dy0 * (int)A(c->rgba)) * inv_d) * 65536.0) : 0;
 +    uint64_t px_drawn = 0;
-+
+ 
+-/* Draws nothing, and that is the point. During bring-up the question is
+- * usually "did the game ask to draw" rather than "does it look right", and the
+- * answer is clearer without pixels in the way. */
 +    if (!fog && !gouraud && !need_z && g_fb_fmt == 3) {
 +        for (int y = miny; y <= maxy; y++) {
 +            int xs, xe, w0, w1, w2;
@@ -5907,21 +5976,8 @@ index 6a20fb4..8c16be7 100644
 +        return 1;
 +    }
 +    if (fog) return 0;
- 
-     for (int y = miny; y <= maxy; y++) {
--        for (int x = minx; x <= maxx; x++) {
--            int w0 = edge(a, b, x, y);   /* weight of c */
--            int w1 = edge(b, c, x, y);   /* weight of a */
--            int w2 = edge(c, a, x, y);   /* weight of b */
--            if (!((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
--                continue;
--            float la = ((float)w1 + h1) * inv, lb = ((float)w2 + h2) * inv, lc = ((float)w0 + h0) * inv;
--            uint32_t col = c->rgba;
--            if (st->gouraud) {
--                col = rgba((int)(R(a->rgba) * la + R(b->rgba) * lb + R(c->rgba) * lc + 0.5f),
--                           (int)(G(a->rgba) * la + G(b->rgba) * lb + G(c->rgba) * lc + 0.5f),
--                           (int)(B(a->rgba) * la + B(b->rgba) * lb + B(c->rgba) * lc + 0.5f),
--                           (int)(A(a->rgba) * la + A(b->rgba) * lb + A(c->rgba) * lc + 0.5f));
++
++    for (int y = miny; y <= maxy; y++) {
 +        int xs, xe, w0, w1, w2;
 +        if (!tri_row_span(a, b, c, area, minx, maxx, y, &xs, &xe, &w0, &w1, &w2)) continue;
 +        const uint32_t fb_row_off = (uint32_t)(y * (int)g_fb_stride);
@@ -5948,11 +6004,7 @@ index 6a20fb4..8c16be7 100644
 +                        memcpy(z_base + (z_row_off + (uint32_t)x) * 2u, &zv, 2);
 +                    }
 +                }
-             }
--            fragment(st, x, y, col,
--                     a->u * la + b->u * lb + c->u * lc,
--                     a->v * la + b->v * lb + c->v * lc,
--                     a->z * la + b->z * lb + c->z * lc);
++            }
 +            const uint32_t col = gouraud
 +                ? ((uint32_t)clamp8((cr + 32768) >> 16) |
 +                   ((uint32_t)clamp8((cg + 32768) >> 16) << 8) |
@@ -5961,40 +6013,17 @@ index 6a20fb4..8c16be7 100644
 +                : flat_col;
 +            fb_write_fast_keep_alpha(fb_base, fb_row_off + (uint32_t)x, col);
 +            px_drawn++;
-         }
-     }
++        }
++    }
 +    g_pixels += px_drawn;
 +    return 1;
- }
- 
--/* A sprite is the PSP's 2D primitive: two vertices giving opposite corners of
-- * an axis-aligned rectangle, coloured by the second. The far edge is exclusive
-- * so adjacent sprites tile without overlapping. Texture coordinates run
-- * linearly from one corner to the other, so swapped corners mirror the image. */
--static void sw_sprite(const psp_vertex *a, const psp_vertex *b, const psp_draw_state *st) {
--    int x0 = a->x < b->x ? a->x : b->x, x1 = a->x > b->x ? a->x : b->x;
--    int y0 = a->y < b->y ? a->y : b->y, y1 = a->y > b->y ? a->y : b->y;
--    if (x0 == x1 || y0 == y1) return;
--    const float du = (b->u - a->u) / (float)(b->x - a->x);
--    const float dv = (b->v - a->v) / (float)(b->y - a->y);
--    for (int y = y0; y < y1; y++)
--        for (int x = x0; x < x1; x++)
--            fragment(st, x, y, b->rgba, a->u + ((float)(x - a->x) + 0.5f) * du,
--                     a->v + ((float)(y - a->y) + 0.5f) * dv, b->z);
--}
++}
++
 +static __attribute__((noinline)) void sw_tri_t8_opaque_mw(
 +    const psp_vertex *a, const psp_vertex *b, const psp_vertex *c,
 +    const psp_draw_state *st, int minx, int maxx, int miny, int maxy,
 +    int area, float h0, float h1, float h2);
- 
--static void sw_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
--    switch (prim) {
--    case PSP_PRIM_SPRITES:
--        for (int i = 0; i + 1 < count; i += 2) sw_sprite(&v[i], &v[i + 1], st);
--        break;
--    case PSP_PRIM_TRIANGLES:
--        for (int i = 0; i + 2 < count; i += 3) sw_tri(&v[i], &v[i + 1], &v[i + 2], st);
--        break;
++
 +static __attribute__((noinline)) void sw_tri_t8_opaque_fn(
 +    const psp_vertex *a, const psp_vertex *b, const psp_vertex *c,
 +    const psp_draw_state *st, int minx, int maxx, int miny, int maxy,
@@ -8717,20 +8746,18 @@ index 6a20fb4..8c16be7 100644
 +    case PSP_PRIM_TRIANGLES:
 +        for (int i = 0; i + 2 < count; i += 3) sw_tri(&v[i], &v[i + 1], &v[i + 2], st);
 +        break;
-     case PSP_PRIM_TRIANGLE_STRIP:
--        for (int i = 0; i + 2 < count; i++) sw_tri(&v[i], &v[i + 1], &v[i + 2], st);
++    case PSP_PRIM_TRIANGLE_STRIP:
 +        for (int i = 0; i + 2 < count; i++) {
 +            if (i & 1) sw_tri(&v[i + 1], &v[i], &v[i + 2], st);
 +            else       sw_tri(&v[i], &v[i + 1], &v[i + 2], st);
 +        }
-         break;
-     case PSP_PRIM_TRIANGLE_FAN:
-         for (int i = 1; i + 1 < count; i++) sw_tri(&v[0], &v[i], &v[i + 1], st);
-         break;
-     default:
--        break;                       /* points, lines: not yet */
 +        break;
-     }
++    case PSP_PRIM_TRIANGLE_FAN:
++        for (int i = 1; i + 1 < count; i++) sw_tri(&v[0], &v[i], &v[i + 1], st);
++        break;
++    default:
++        break;
++    }
 +    g_tex_in_draw = 0;
 +    g_tex_fmt_ok = 0;
 +    g_tex_base = NULL;
@@ -8739,9 +8766,33 @@ index 6a20fb4..8c16be7 100644
 +    g_tex_raw_size = 0;
 +    g_clut_fast = 0;
 +    g_fb_span.data = g_z_span.data = g_tex_span.data = NULL;
- }
++}
++
++static void sw_noop(void) { }
++
++const psp_render_backend psp_render_software = {
++    "software", sw_init, sw_shutdown, sw_target, sw_draw, sw_noop, sw_noop
++};
++
++/* ---- null backend -------------------------------------------------------- */
++
++/* Draws nothing, and that is the point. During bring-up the question is
++ * usually "did the game ask to draw" rather than "does it look right", and the
++ * answer is clearer without pixels in the way. */
  
- static void sw_noop(void) { }
+ static int null_init(int w, int h) { (void)w; (void)h; return 0; }
+ static void null_target(uint32_t a, uint32_t s, int f) { (void)a; (void)s; (void)f; }
+@@ -472,6 +4181,10 @@ static const psp_render_backend *g_backend = &psp_render_software;
+ 
+ const psp_render_backend *psp_render_current(void) { return g_backend; }
+ 
++void psp_render_set_backend(const psp_render_backend *backend) {
++    if (backend) g_backend = backend;
++}
++
+ int psp_render_select(const char *name) {
+     static const psp_render_backend *const all[] = {
+         &psp_render_software, &psp_render_null
 diff --git a/src/vfpu.c b/src/vfpu.c
 index c6fdd8b..6bd6096 100644
 --- a/src/vfpu.c

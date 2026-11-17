@@ -11,11 +11,17 @@
 #include <psprecomp/module.h>
 #include <psprecomp/dispatch.h>
 #include <psprecomp/recomp_rt.h>
+#include <psprecomp/render.h>
+
+#include "gl_present.h"
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <windows.h>
 #include <mmsystem.h>
+
+extern const psp_render_backend seto_ge_backend;
 
 void psp_recomp_register(void);   /* generated tagforce_register.c */
 int  seto_window_start(void);
@@ -2355,6 +2361,11 @@ int main(int argc, char **argv) {
             fprintf(stderr, "window: failed; continuing headless\n");
     } else {
         fprintf(stderr, "window: disabled by SETO_NO_WINDOW\n");
+    }
+    if (seto_ge_gpu_draw_mode() && getenv("SETO_RENDERER") &&
+        strcmp(getenv("SETO_RENDERER"), "gl") == 0) {
+        psp_render_set_backend(&seto_ge_backend);
+        fprintf(stderr, "render: GL GE frontend active\n");
     }
     CreateThread(NULL, 0, input_thread, NULL, 0, NULL);
     if (getenv("SETO_SHOT_DIR"))
