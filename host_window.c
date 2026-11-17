@@ -8,6 +8,7 @@
 #include <psprecomp/hle.h>
 
 #include <windows.h>
+#include <gdiplus.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,6 +32,17 @@ static HDC g_memdc;
 static HBITMAP g_membmp, g_memold;
 static int g_memw, g_memh;
 static char g_fps_text[64] = "FPS --.- | VPS --.-";
+static ULONG_PTR g_gdiplus_token;
+static int g_gdiplus_ready;
+
+static int gdiplus_start_once(void) {
+    if (g_gdiplus_ready) return 1;
+    GdiplusStartupInput in = {0};
+    in.GdiplusVersion = 1;
+    if (GdiplusStartup(&g_gdiplus_token, &in, NULL) != Ok) return 0;
+    g_gdiplus_ready = 1;
+    return 1;
+}
 
 static void update_frame(HWND hwnd) {
     if (IsIconic(hwnd)) return;
@@ -406,10 +418,34 @@ static void paint(HWND hwnd, HDC hdc) {
             dh = MulDiv(cw, 17, 30);
         }
         if (dw > 0 && dh > 0) {
-            SetStretchBltMode(g_memdc, COLORONCOLOR);
-            StretchDIBits(g_memdc, (cw - dw) / 2, (ch - dh) / 2, dw, dh,
-                          0, 0, SCREEN_W, SCREEN_H, g_dib, &g_bmi,
-                          DIB_RGB_COLORS, SRCCOPY);
+            static int filter = -1;
+            if (filter < 0) {
+                const char *f = getenv("SETO_FILTER");
+                filter = f ? atoi(f) : 0;
+            }
+            const int x = (cw - dw) / 2, y = (ch - dh) / 2;
+            int drawn = 0;
+            if (filter >= 2 && gdiplus_start_once()) {
+                GpBitmap *bmp = NULL;
+                GpGraphics *gfx = NULL;
+                if (GdipCreateBitmapFromScan0(SCREEN_W, SCREEN_H, SCREEN_W * 4,
+                                              PixelFormat32bppRGB, (BYTE *)g_dib, &bmp) == Ok &&
+                    GdipCreateFromHDC(g_memdc, &gfx) == Ok) {
+                    GdipSetInterpolationMode(gfx, InterpolationModeHighQualityBicubic);
+                    GdipSetPixelOffsetMode(gfx, PixelOffsetModeHalf);
+                    GdipDrawImageRectI(gfx, bmp, x, y, dw, dh);
+                    drawn = 1;
+                }
+                if (gfx) GdipDeleteGraphics(gfx);
+                if (bmp) GdipDisposeImage((GpImage *)bmp);
+            }
+            if (!drawn) {
+                SetStretchBltMode(g_memdc, filter == 0 ? COLORONCOLOR : HALFTONE);
+                if (filter != 0) SetBrushOrgEx(g_memdc, 0, 0, NULL);
+                StretchDIBits(g_memdc, x, y, dw, dh,
+                              0, 0, SCREEN_W, SCREEN_H, g_dib, &g_bmi,
+                              DIB_RGB_COLORS, SRCCOPY);
+            }
         }
     }
     if (g_fps_text[0]) {
@@ -568,7 +604,13 @@ static DWORD WINAPI window_thread(LPVOID unused) {
         return 1;
     }
 
-    RECT r = { 0, 0, WINDOW_W, WINDOW_H };
+    int win_w = WINDOW_W, win_h = WINDOW_H;
+    const char *scale = getenv("SETO_SCALE");
+    if (scale && atoi(scale) > 0) {
+        win_w = SCREEN_W * atoi(scale);
+        win_h = SCREEN_H * atoi(scale);
+    }
+    RECT r = { 0, 0, win_w, win_h };
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     g_hwnd = CreateWindowExW(0, wc.lpszClassName,
                              L"Seto-static \u2014 Yu-Gi-Oh! GX Tag Force",

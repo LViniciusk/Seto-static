@@ -298,7 +298,7 @@ if(EXTRA_TARGETS)
 endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavcodec libavformat libswresample libswscale libavutil)
-target_link_libraries(Seto-static PRIVATE tagforce gdi32 winmm PkgConfig::FFMPEG)
+target_link_libraries(Seto-static PRIVATE tagforce gdi32 winmm gdiplus PkgConfig::FFMPEG)
 
 add_executable(test-lbn-seek EXCLUDE_FROM_ALL tests/lbn_seek.c)
 target_link_libraries(test-lbn-seek PRIVATE psprecomp)
