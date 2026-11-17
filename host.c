@@ -885,6 +885,36 @@ static void enter_free_duel(void) {
     fprintf(stderr, "input: free duel state=%d phase=%d\n",
             psp_title_scene_state(), psp_title_scene_phase());
     if (getenv("SETO_FREE_DUEL_PLAY")) {
+        /* Headless navigation: four CROSSes leave the settings pages, then
+         * RIGHT selects the Start Duel button on the opponent/recipe summary. */
+        if (getenv("SETO_FREE_DUEL_START")) {
+            for (int i = 0; i < 4; i++) {
+                hold_pad_direct(PSP_CTRL_CROSS, 160);
+                Sleep(700);
+            }
+            psp_display_capture("build/free-start-summary.ppm");
+            for (int i = 0; i < 12 && !psp_duel_manager_start_requested(); i++) {
+                Sleep(1000);
+                if (i == 2 || i == 6) psp_display_capture("build/free-start-wait.ppm");
+            }
+            fprintf(stderr, "input: free start wait=%d phase=%d\n",
+                    psp_duel_manager_start_requested(), psp_title_scene_phase());
+            if (!psp_duel_manager_start_requested()) {
+                hold_pad_direct(PSP_CTRL_RIGHT, 120);
+                Sleep(300);
+                psp_display_capture("build/free-start-right.ppm");
+                hold_pad_direct(PSP_CTRL_CROSS, 160);
+                Sleep(1500);
+                fprintf(stderr, "input: free start right=%d phase=%d\n",
+                        psp_duel_manager_start_requested(), psp_title_scene_phase());
+            }
+            if (!psp_duel_manager_start_requested()) {
+                hold_pad_direct(PSP_CTRL_START, 160);
+                Sleep(1500);
+                fprintf(stderr, "input: free start START=%d phase=%d\n",
+                        psp_duel_manager_start_requested(), psp_title_scene_phase());
+            }
+        }
         for (int w = 0; w < 40 && !is_normal_duel_teal() && psp_title_scene_phase() != 6; w++)
             Sleep(100);
         for (int i = 0; i < 10 && !is_normal_duel_teal() && !psp_duel_manager_start_requested(); i++) {
@@ -1035,6 +1065,25 @@ static DWORD WINAPI duel_detect_thread(LPVOID unused) {
             }
         }
         Sleep(40);
+    }
+    return 0;
+}
+
+/* Per-second FPS/VPS for headless runs; the window title shows the same
+ * counters. */
+static DWORD WINAPI fps_log_thread(LPVOID unused) {
+    (void)unused;
+    uint64_t lf = psp_display_frames(), lv = psp_display_vblanks();
+    DWORD lt = GetTickCount();
+    while (!psp_exit_requested()) {
+        Sleep(1000);
+        DWORD now = GetTickCount();
+        uint64_t f = psp_display_frames(), v = psp_display_vblanks();
+        double dt = (double)(now - lt) / 1000.0;
+        fprintf(stderr, "fps: %.1f vps: %.1f frames=%llu vblanks=%llu\n",
+                (double)(f - lf) / dt, (double)(v - lv) / dt,
+                (unsigned long long)f, (unsigned long long)v);
+        lf = f; lv = v; lt = now;
     }
     return 0;
 }
@@ -2312,6 +2361,8 @@ int main(int argc, char **argv) {
         CreateThread(NULL, 0, shot_thread, NULL, 0, NULL);
     if (getenv("SETO_DUEL_DETECT"))
         CreateThread(NULL, 0, duel_detect_thread, NULL, 0, NULL);
+    if (getenv("SETO_FPS_LOG"))
+        CreateThread(NULL, 0, fps_log_thread, NULL, 0, NULL);
     if (getenv("SETO_TRACE_FIELD"))
         CreateThread(NULL, 0, field_state_monitor, NULL, 0, NULL);
     const char *cap = getenv("SETO_BRINGUP_CAP");
