@@ -433,8 +433,7 @@ static void paint(HWND hwnd, HDC hdc) {
                     GdipCreateFromHDC(g_memdc, &gfx) == Ok) {
                     GdipSetInterpolationMode(gfx, InterpolationModeHighQualityBicubic);
                     GdipSetPixelOffsetMode(gfx, PixelOffsetModeHalf);
-                    GdipDrawImageRectI(gfx, bmp, x, y, dw, dh);
-                    drawn = 1;
+                    if (GdipDrawImageRectI(gfx, bmp, x, y, dw, dh) == Ok) drawn = 1;
                 }
                 if (gfx) GdipDeleteGraphics(gfx);
                 if (bmp) GdipDisposeImage((GpImage *)bmp);

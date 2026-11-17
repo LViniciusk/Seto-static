@@ -10,9 +10,9 @@ $iniPath = Join-Path $repoRoot 'launcher.ini'
 $defaults = [ordered]@{
     scale  = '2'
     filter = '0'
-    iso    = 'C:\Users\Vinicius\Documents\Github\Seto\TF1.iso'
+    iso    = ''
     eboot  = 'build/s7-eboot-reloc.elf'
-    flash0 = 'C:\Users\Vinicius\Documents\PPSSPP\assets\flash0'
+    flash0 = ''
 }
 
 function Load-Config {
@@ -34,6 +34,7 @@ function Save-Config($cfg) {
 }
 
 function Resolve-RepoPath($p) {
+    if ([string]::IsNullOrWhiteSpace($p)) { return '' }
     if ([IO.Path]::IsPathRooted($p)) { return $p }
     return Join-Path $repoRoot $p
 }
@@ -46,13 +47,14 @@ function Start-Game($cfg, [switch]$DryRun) {
     $flash0 = Resolve-RepoPath $cfg.flash0
 
     $missing = @()
-    foreach ($p in @($iso, $eboot, $flash0)) {
-        if (!(Test-Path $p)) { $missing += $p }
+    if ([string]::IsNullOrWhiteSpace($iso) -or !(Test-Path $iso)) { $missing += 'ISO' }
+    if ([string]::IsNullOrWhiteSpace($eboot) -or !(Test-Path $eboot)) { $missing += 'EBOOT' }
+    if ([string]::IsNullOrWhiteSpace($flash0) -or !(Test-Path $flash0)) { $missing += 'flash0' }
+
+    $exe = Join-Path $repoRoot 'build/s6-build/Seto-static.exe'
+    if (!(Test-Path $exe) -or (Get-Item $exe).Length -le 1000000) {
+        $missing += 'build/s6-build/Seto-static.exe'
     }
-    $exe = Get-ChildItem (Join-Path $repoRoot 'build/s6-build') -Filter 'Seto-static*.exe' -ErrorAction SilentlyContinue |
-           Where-Object { $_.Length -gt 1000000 } |
-           Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if (!$exe) { $missing += 'build/s6-build/Seto-static*.exe' }
 
     $prx = @(
         'build/s5-font-reloc.elf', 'build/s6-title-reloc.elf',
@@ -79,13 +81,13 @@ function Start-Game($cfg, [switch]$DryRun) {
     $env:SETO_FILTER = [string]$cfg.filter
 
     if ($DryRun) {
-        Write-Output "exe: $($exe.FullName)"
+        Write-Output "exe: $exe"
         Write-Output "args: $gameArgs"
         Write-Output "env: SETO_MANUAL=1 SETO_HOLD_WINDOW=1 SETO_SCALE=$($cfg.scale) SETO_FILTER=$($cfg.filter)"
         Write-Output "flash0: $flash0"
         return
     }
-    Start-Process -FilePath $exe.FullName -ArgumentList $gameArgs -WorkingDirectory $repoRoot
+    Start-Process -FilePath $exe -ArgumentList $gameArgs -WorkingDirectory $repoRoot
 }
 
 $cfg = Load-Config
