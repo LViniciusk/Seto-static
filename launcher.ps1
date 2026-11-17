@@ -10,6 +10,7 @@ $iniPath = Join-Path $repoRoot 'launcher.ini'
 $defaults = [ordered]@{
     scale  = '2'
     filter = '0'
+    present = '0'
     iso    = ''
     eboot  = 'build/s7-eboot-reloc.elf'
     flash0 = ''
@@ -79,11 +80,13 @@ function Start-Game($cfg, [switch]$DryRun) {
     $env:SETO_HOLD_WINDOW = '1'
     $env:SETO_SCALE = [string]$cfg.scale
     $env:SETO_FILTER = [string]$cfg.filter
+    if ($cfg.present -eq 'gl') { $env:SETO_PRESENT = 'gl' }
 
     if ($DryRun) {
         Write-Output "exe: $exe"
         Write-Output "args: $gameArgs"
         Write-Output "env: SETO_MANUAL=1 SETO_HOLD_WINDOW=1 SETO_SCALE=$($cfg.scale) SETO_FILTER=$($cfg.filter)"
+        Write-Output "present: $($cfg.present)"
         Write-Output "flash0: $flash0"
         return
     }
@@ -109,6 +112,10 @@ $filterLabels = [ordered]@{
     'Bilinear (smooth)'     = '1'
     'Bicubic (high quality)' = '2'
 }
+$presentLabels = [ordered]@{
+    'GDI (default)'         = '0'
+    'OpenGL 3.3 (M0)'       = 'gl'
+}
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'Seto-static launcher'
@@ -116,7 +123,7 @@ $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
 $form.MinimizeBox = $false
-$form.ClientSize = New-Object System.Drawing.Size(560, 300)
+$form.ClientSize = New-Object System.Drawing.Size(560, 340)
 
 function Add-Label($text, $y) {
     $l = New-Object System.Windows.Forms.Label
@@ -130,6 +137,7 @@ Add-Label 'Filter' 48
 Add-Label 'ISO' 81
 Add-Label 'EBOOT' 114
 Add-Label 'flash0' 147
+Add-Label 'Presenter' 180
 
 $scaleBox = New-Object System.Windows.Forms.ComboBox
 $scaleBox.DropDownStyle = 'DropDownList'
@@ -158,35 +166,44 @@ $flashBox.SetBounds(130, 144, 410, 24)
 $flashBox.Text = [string]$cfg.flash0
 $form.Controls.Add($flashBox)
 
+$presentBox = New-Object System.Windows.Forms.ComboBox
+$presentBox.DropDownStyle = 'DropDownList'
+$presentBox.SetBounds(130, 177, 410, 24)
+foreach ($k in $presentLabels.Keys) { [void]$presentBox.Items.Add($k) }
+$form.Controls.Add($presentBox)
+
 $scaleLabel = ($scaleLabels.Keys | Where-Object { $scaleLabels[$_] -eq [string]$cfg.scale } | Select-Object -First 1)
 $filterLabel = ($filterLabels.Keys | Where-Object { $filterLabels[$_] -eq [string]$cfg.filter } | Select-Object -First 1)
+$presentLabel = ($presentLabels.Keys | Where-Object { $presentLabels[$_] -eq [string]$cfg.present } | Select-Object -First 1)
 $scaleBox.SelectedItem = if ($scaleLabel) { $scaleLabel } else { '960 x 544 (2x)' }
 $filterBox.SelectedItem = if ($filterLabel) { $filterLabel } else { 'Nearest (crisp)' }
+$presentBox.SelectedItem = if ($presentLabel) { $presentLabel } else { 'GDI (default)' }
 
 $status = New-Object System.Windows.Forms.Label
-$status.SetBounds(12, 180, 530, 40)
+$status.SetBounds(12, 213, 530, 40)
 $status.ForeColor = [System.Drawing.Color]::DarkRed
 $form.Controls.Add($status)
 
 $startBtn = New-Object System.Windows.Forms.Button
 $startBtn.Text = 'Play'
-$startBtn.SetBounds(130, 230, 120, 30)
+$startBtn.SetBounds(130, 260, 120, 30)
 $form.Controls.Add($startBtn)
 $form.AcceptButton = $startBtn
 
 $saveBtn = New-Object System.Windows.Forms.Button
 $saveBtn.Text = 'Save'
-$saveBtn.SetBounds(260, 230, 120, 30)
+$saveBtn.SetBounds(260, 260, 120, 30)
 $form.Controls.Add($saveBtn)
 
 $cancelBtn = New-Object System.Windows.Forms.Button
 $cancelBtn.Text = 'Cancel'
-$cancelBtn.SetBounds(390, 230, 120, 30)
+$cancelBtn.SetBounds(390, 260, 120, 30)
 $form.Controls.Add($cancelBtn)
 
 function Update-Config {
     $cfg.scale = $scaleLabels[[string]$scaleBox.SelectedItem]
     $cfg.filter = $filterLabels[[string]$filterBox.SelectedItem]
+    $cfg.present = $presentLabels[[string]$presentBox.SelectedItem]
     $cfg.iso = $isoBox.Text.Trim()
     $cfg.eboot = $ebootBox.Text.Trim()
     $cfg.flash0 = $flashBox.Text.Trim()
