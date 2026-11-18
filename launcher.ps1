@@ -17,6 +17,7 @@ $defaults = [ordered]@{
     iso          = ''
     eboot        = 'build/s7-eboot-reloc.elf'
     flash0       = ''
+    hd_tex_dir   = ''
     server       = ''
     nickname     = ''
 }
@@ -95,6 +96,9 @@ function Start-Game($cfg, [switch]$DryRun) {
         $env:SETO_RENDERER = 'gl'
         $env:SETO_RENDER_SCALE = [string]$cfg.render_scale
         $env:SETO_MSAA = [string]$cfg.msaa
+        if (![string]::IsNullOrWhiteSpace($cfg.hd_tex_dir)) {
+            $env:SETO_HD_TEX_DIR = Resolve-RepoPath $cfg.hd_tex_dir
+        }
     }
     if (![string]::IsNullOrWhiteSpace($cfg.server)) {
         $env:SETO_SERVER = [string]$cfg.server
@@ -106,7 +110,7 @@ function Start-Game($cfg, [switch]$DryRun) {
     if ($DryRun) {
         Write-Output "exe: $exe"
         Write-Output "args: $gameArgs"
-        Write-Output "env: SETO_MANUAL=1 SETO_HOLD_WINDOW=1 SETO_SCALE=$($cfg.scale) SETO_FILTER=$($cfg.filter) SETO_RENDER_SCALE=$($cfg.render_scale) SETO_MSAA=$($cfg.msaa) SETO_POST_FILTER=$($cfg.post_filter)"
+        Write-Output "env: SETO_MANUAL=1 SETO_HOLD_WINDOW=1 SETO_SCALE=$($cfg.scale) SETO_FILTER=$($cfg.filter) SETO_RENDER_SCALE=$($cfg.render_scale) SETO_MSAA=$($cfg.msaa) SETO_POST_FILTER=$($cfg.post_filter) SETO_HD_TEX_DIR=$($cfg.hd_tex_dir)"
         Write-Output "present: $($cfg.present)"
         Write-Output "net: server=$($cfg.server) nickname=$($cfg.nickname)"
         Write-Output "flash0: $flash0"
@@ -168,7 +172,7 @@ $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
 $form.MinimizeBox = $false
-$form.ClientSize = New-Object System.Drawing.Size(560, 506)
+$form.ClientSize = New-Object System.Drawing.Size(560, 539)
 
 function Add-Label($text, $y) {
     $l = New-Object System.Windows.Forms.Label
@@ -186,8 +190,9 @@ Add-Label 'Presenter' 180
 Add-Label 'Internal Scale' 213
 Add-Label 'MSAA (3D)' 246
 Add-Label 'Post Filter' 279
-Add-Label 'Server (host:port)' 312
-Add-Label 'Nickname' 345
+Add-Label 'HD Textures' 312
+Add-Label 'Server (host:port)' 345
+Add-Label 'Nickname' 378
 
 $scaleBox = New-Object System.Windows.Forms.ComboBox
 $scaleBox.DropDownStyle = 'DropDownList'
@@ -240,13 +245,18 @@ $postFilterBox.SetBounds(130, 276, 410, 24)
 foreach ($k in $postFilterLabels.Keys) { [void]$postFilterBox.Items.Add($k) }
 $form.Controls.Add($postFilterBox)
 
+$hdTexBox = New-Object System.Windows.Forms.TextBox
+$hdTexBox.SetBounds(130, 309, 410, 24)
+$hdTexBox.Text = [string]$cfg.hd_tex_dir
+$form.Controls.Add($hdTexBox)
+
 $serverBox = New-Object System.Windows.Forms.TextBox
-$serverBox.SetBounds(130, 309, 410, 24)
+$serverBox.SetBounds(130, 342, 410, 24)
 $serverBox.Text = [string]$cfg.server
 $form.Controls.Add($serverBox)
 
 $nicknameBox = New-Object System.Windows.Forms.TextBox
-$nicknameBox.SetBounds(130, 342, 410, 24)
+$nicknameBox.SetBounds(130, 375, 410, 24)
 $nicknameBox.Text = [string]$cfg.nickname
 $form.Controls.Add($nicknameBox)
 
@@ -264,24 +274,24 @@ $msaaBox.SelectedItem = if ($msaaLabel) { $msaaLabel } else { 'Off' }
 $postFilterBox.SelectedItem = if ($postFilterLabel) { $postFilterLabel } else { 'Off' }
 
 $status = New-Object System.Windows.Forms.Label
-$status.SetBounds(12, 378, 530, 40)
+$status.SetBounds(12, 411, 530, 40)
 $status.ForeColor = [System.Drawing.Color]::DarkRed
 $form.Controls.Add($status)
 
 $startBtn = New-Object System.Windows.Forms.Button
 $startBtn.Text = 'Play'
-$startBtn.SetBounds(130, 426, 120, 30)
+$startBtn.SetBounds(130, 459, 120, 30)
 $form.Controls.Add($startBtn)
 $form.AcceptButton = $startBtn
 
 $saveBtn = New-Object System.Windows.Forms.Button
 $saveBtn.Text = 'Save'
-$saveBtn.SetBounds(260, 426, 120, 30)
+$saveBtn.SetBounds(260, 459, 120, 30)
 $form.Controls.Add($saveBtn)
 
 $cancelBtn = New-Object System.Windows.Forms.Button
 $cancelBtn.Text = 'Cancel'
-$cancelBtn.SetBounds(390, 426, 120, 30)
+$cancelBtn.SetBounds(390, 459, 120, 30)
 $form.Controls.Add($cancelBtn)
 
 function Update-Config {
@@ -294,6 +304,7 @@ function Update-Config {
     $cfg.iso = $isoBox.Text.Trim()
     $cfg.eboot = $ebootBox.Text.Trim()
     $cfg.flash0 = $flashBox.Text.Trim()
+    $cfg.hd_tex_dir = $hdTexBox.Text.Trim()
     $cfg.server = $serverBox.Text.Trim()
     $cfg.nickname = $nicknameBox.Text.Trim()
 }

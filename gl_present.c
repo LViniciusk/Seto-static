@@ -8,12 +8,14 @@
 #include "gl_present.h"
 #include "ge_queue.h"
 
+#include <psprecomp/mem.h>
 #include <windows.h>
 #include <gdiplus.h>
 #include <GL/gl.h>
 #include <GL/glext.h>
 #include <GL/wglext.h>
 
+#include <ctype.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -1269,6 +1271,756 @@ static int ge_load_ppm_rgba(const char *path, uint32_t **out_px, int *out_w, int
     return 1;
 }
 
+static int ge_load_png_rgba(const char *path, uint32_t **out_px, int *out_w, int *out_h) {
+    WCHAR wpath[520];
+    if (!path || !path[0] || !out_px || !out_w || !out_h) return 0;
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 520) <= 0 &&
+        MultiByteToWideChar(CP_ACP, 0, path, -1, wpath, 520) <= 0)
+        return 0;
+    if (GetFileAttributesW(wpath) == INVALID_FILE_ATTRIBUTES || !ge_gdiplus_start_once())
+        return 0;
+    GpBitmap *bmp = NULL;
+    if (GdipCreateBitmapFromFile(wpath, &bmp) != Ok || !bmp) return 0;
+    UINT uw = 0, uh = 0;
+    if (GdipGetImageWidth((GpImage *)bmp, &uw) == Ok &&
+        GdipGetImageHeight((GpImage *)bmp, &uh) == Ok &&
+        uw > 0 && uh > 0 && (int)uw <= g_ge_max_dim && (int)uh <= g_ge_max_dim) {
+        GpRect rc = { 0, 0, (INT)uw, (INT)uh };
+        BitmapData bd = {0};
+        if (GdipBitmapLockBits(bmp, &rc, ImageLockModeRead,
+                               PixelFormat32bppARGB, &bd) == Ok) {
+            uint32_t *px = (uint32_t *)malloc((size_t)uw * (size_t)uh * 4u);
+            if (px) {
+                for (UINT y = 0; y < uh; y++) {
+                    const uint32_t *srow = (const uint32_t *)((const uint8_t *)bd.Scan0 +
+                                           (ptrdiff_t)y * (ptrdiff_t)bd.Stride);
+                    uint32_t *drow = px + (size_t)y * (size_t)uw;
+                    for (UINT x = 0; x < uw; x++) {
+                        const uint32_t c = srow[x];
+                        drow[x] = (c & 0xFF00FF00u) | ((c & 0x000000FFu) << 16) |
+                                  ((c & 0x00FF0000u) >> 16);
+                    }
+                }
+                GdipBitmapUnlockBits(bmp, &bd);
+                GdipDisposeImage((GpImage *)bmp);
+                *out_px = px;
+                *out_w = (int)uw;
+                *out_h = (int)uh;
+                return 1;
+            }
+            GdipBitmapUnlockBits(bmp, &bd);
+        }
+    }
+    GdipDisposeImage((GpImage *)bmp);
+    return 0;
+}
+
+/* ---- PPSSPP textures.ini / 24-hex hash pack support --------------------- */
+
+enum {
+    GE_HD_HASH_QUICK = 0,
+    GE_HD_HASH_XXH32 = 1,
+    GE_HD_HASH_XXH64 = 2
+};
+
+typedef struct {
+    uint64_t cachekey;
+    uint32_t data_hash;
+    int32_t  path_off; /* -1 = unused, -2 = explicitly ignored, >= 0 = pool offset */
+} ge_hd_ini_slot;
+
+typedef struct {
+    uint32_t addr;
+    int      from_w, from_h;
+    int      to_w, to_h;
+} ge_hd_hashrange;
+
+typedef struct {
+    int   w, h;
+    float factor;
+} ge_hd_reducerange;
+
+typedef struct {
+    uint64_t fnv_hash;
+    int32_t  path_off; /* -1 = miss, >= 0 = pool offset */
+    uint8_t  valid;
+} ge_hd_fnv_entry;
+
+#define GE_HD_FNV_CACHE_CAP 4096u
+
+static CRITICAL_SECTION g_hd_ini_lock;
+static int              g_hd_ini_lock_ready;
+static int              g_hd_ini_parsed;
+static int              g_hd_ini_active;
+static char             g_hd_base_dir[384];
+static int              g_hd_hash_mode = GE_HD_HASH_QUICK;
+static int              g_hd_ignore_address;
+static int              g_hd_reduce_hash;
+static float            g_hd_reduce_global = 0.5f;
+static int              g_hd_skip_dxt1_128x64;
+static int              g_hd_skip_dxt1_128x128;
+static ge_hd_ini_slot  *g_hd_ini_table;
+static uint32_t         g_hd_ini_cap;
+static uint32_t         g_hd_ini_count;
+static char            *g_hd_path_pool;
+static size_t           g_hd_path_len;
+static size_t           g_hd_path_cap;
+static uint64_t         g_hd_dhash_bloom[256]; /* 16384-bit bloom on data_hash */
+static int              g_hd_has_zero_dhash;
+static ge_hd_hashrange  g_hd_hashranges[64];
+static int              g_hd_nhashranges;
+static ge_hd_reducerange g_hd_reduceranges[64];
+static int              g_hd_nreduceranges;
+static ge_hd_fnv_entry  g_hd_fnv_cache[GE_HD_FNV_CACHE_CAP];
+
+static uint32_t ge_rotl32(uint32_t x, int r) {
+    return (x << r) | (x >> (32 - r));
+}
+
+static uint64_t ge_rotl64(uint64_t x, int r) {
+    return (x << r) | (x >> (64 - r));
+}
+
+static uint32_t ge_read_le32(const uint8_t *p) {
+    uint32_t v;
+    memcpy(&v, p, 4);
+    return v;
+}
+
+static uint64_t ge_read_le64(const uint8_t *p) {
+    uint64_t v;
+    memcpy(&v, p, 8);
+    return v;
+}
+
+static uint32_t ge_xxh32(const void *input, size_t len, uint32_t seed) {
+    static const uint32_t P1 = 0x9E3779B1u;
+    static const uint32_t P2 = 0x85EBCA77u;
+    static const uint32_t P3 = 0xC2B2AE3Du;
+    static const uint32_t P4 = 0x27D4EB2Fu;
+    static const uint32_t P5 = 0x165667B1u;
+    const uint8_t *p = (const uint8_t *)input;
+    const uint8_t *b_end = p + len;
+    uint32_t h32;
+
+    if (len >= 16u) {
+        const uint8_t *limit = b_end - 16u;
+        uint32_t v1 = seed + P1 + P2;
+        uint32_t v2 = seed + P2;
+        uint32_t v3 = seed + 0u;
+        uint32_t v4 = seed - P1;
+        do {
+            v1 = ge_rotl32(v1 + ge_read_le32(p + 0) * P2, 13) * P1;
+            v2 = ge_rotl32(v2 + ge_read_le32(p + 4) * P2, 13) * P1;
+            v3 = ge_rotl32(v3 + ge_read_le32(p + 8) * P2, 13) * P1;
+            v4 = ge_rotl32(v4 + ge_read_le32(p + 12) * P2, 13) * P1;
+            p += 16;
+        } while (p <= limit);
+        h32 = ge_rotl32(v1, 1) + ge_rotl32(v2, 7) + ge_rotl32(v3, 12) + ge_rotl32(v4, 18);
+    } else {
+        h32 = seed + P5;
+    }
+
+    h32 += (uint32_t)len;
+    while (p + 4 <= b_end) {
+        h32 += ge_read_le32(p) * P3;
+        h32 = ge_rotl32(h32, 17) * P4;
+        p += 4;
+    }
+    while (p < b_end) {
+        h32 += (uint32_t)(*p++) * P5;
+        h32 = ge_rotl32(h32, 11) * P1;
+    }
+
+    h32 ^= h32 >> 15;
+    h32 *= P2;
+    h32 ^= h32 >> 13;
+    h32 *= P3;
+    h32 ^= h32 >> 16;
+    return h32;
+}
+
+static uint64_t ge_xxh64_round(uint64_t acc, uint64_t val) {
+    static const uint64_t P1 = 11400714785074694791ULL;
+    static const uint64_t P2 = 14029467366897019727ULL;
+    acc += val * P2;
+    acc = ge_rotl64(acc, 31);
+    acc *= P1;
+    return acc;
+}
+
+static uint64_t ge_xxh64_merge(uint64_t acc, uint64_t val) {
+    static const uint64_t P1 = 11400714785074694791ULL;
+    static const uint64_t P4 = 9650029242287828579ULL;
+    val = ge_xxh64_round(0, val);
+    acc ^= val;
+    acc = acc * P1 + P4;
+    return acc;
+}
+
+static uint64_t ge_xxh64(const void *input, size_t len, uint64_t seed) {
+    static const uint64_t P1 = 11400714785074694791ULL;
+    static const uint64_t P2 = 14029467366897019727ULL;
+    static const uint64_t P3 = 1609587929392839161ULL;
+    static const uint64_t P4 = 9650029242287828579ULL;
+    static const uint64_t P5 = 2870177450012600261ULL;
+    const uint8_t *p = (const uint8_t *)input;
+    const uint8_t *b_end = p + len;
+    uint64_t h64;
+
+    if (len >= 32u) {
+        const uint8_t *limit = b_end - 32u;
+        uint64_t v1 = seed + P1 + P2;
+        uint64_t v2 = seed + P2;
+        uint64_t v3 = seed + 0ULL;
+        uint64_t v4 = seed - P1;
+        do {
+            v1 = ge_xxh64_round(v1, ge_read_le64(p + 0));
+            v2 = ge_xxh64_round(v2, ge_read_le64(p + 8));
+            v3 = ge_xxh64_round(v3, ge_read_le64(p + 16));
+            v4 = ge_xxh64_round(v4, ge_read_le64(p + 24));
+            p += 32;
+        } while (p <= limit);
+        h64 = ge_rotl64(v1, 1) + ge_rotl64(v2, 7) + ge_rotl64(v3, 12) + ge_rotl64(v4, 18);
+        h64 = ge_xxh64_merge(h64, v1);
+        h64 = ge_xxh64_merge(h64, v2);
+        h64 = ge_xxh64_merge(h64, v3);
+        h64 = ge_xxh64_merge(h64, v4);
+    } else {
+        h64 = seed + P5;
+    }
+
+    h64 += (uint64_t)len;
+    while (p + 8 <= b_end) {
+        uint64_t k1 = ge_xxh64_round(0, ge_read_le64(p));
+        h64 ^= k1;
+        h64 = ge_rotl64(h64, 27) * P1 + P4;
+        p += 8;
+    }
+    if (p + 4 <= b_end) {
+        h64 ^= (uint64_t)ge_read_le32(p) * P1;
+        h64 = ge_rotl64(h64, 23) * P2 + P3;
+        p += 4;
+    }
+    while (p < b_end) {
+        h64 ^= (uint64_t)(*p++) * P5;
+        h64 = ge_rotl64(h64, 11) * P1;
+    }
+
+    h64 ^= h64 >> 33;
+    h64 *= P2;
+    h64 ^= h64 >> 29;
+    h64 *= P3;
+    h64 ^= h64 >> 32;
+    return h64;
+}
+
+static uint32_t ge_quick_tex_hash(const void *checkp, uint32_t size, int aligned16) {
+    uint32_t check = 0;
+    const uint8_t *bytes = (const uint8_t *)checkp;
+    if (aligned16 && (size & 0x3fu) == 0u) {
+        union {
+            uint32_t x32[4];
+            uint16_t x16[8];
+        } cursor, cursor2, blk[4];
+        static const uint16_t init_c2[8] = {
+            0xc00bu, 0x9bd9u, 0x4b73u, 0xb651u, 0x4d9bu, 0x4309u, 0x0083u, 0x0001u
+        };
+        memset(&cursor, 0, sizeof cursor);
+        for (int j = 0; j < 8; j++) cursor2.x16[j] = init_c2[j];
+
+        const uint32_t n16 = size / 16u;
+        for (uint32_t i = 0; i < n16; i += 4u) {
+            memcpy(blk, bytes + (size_t)i * 16u, 64u);
+            for (int j = 0; j < 8; j++)
+                cursor.x16[j] = (uint16_t)(cursor.x16[j] + (uint16_t)(blk[0].x16[j] * cursor2.x16[j]));
+            for (int j = 0; j < 4; j++) {
+                cursor.x32[j] ^= blk[1].x32[j];
+                cursor.x32[j] += blk[2].x32[j];
+            }
+            for (int j = 0; j < 8; j++)
+                cursor.x16[j] ^= (uint16_t)(blk[3].x16[j] * cursor2.x16[j]);
+            for (int j = 0; j < 8; j++)
+                cursor2.x16[j] = (uint16_t)(cursor2.x16[j] + 0x2455u);
+        }
+        for (int j = 0; j < 4; j++)
+            cursor.x32[j] += cursor2.x32[j];
+        check = cursor.x32[0] + cursor.x32[1] + cursor.x32[2] + cursor.x32[3];
+    } else {
+        const uint32_t n8 = size / 8u;
+        for (uint32_t i = 0; i < n8; i++) {
+            check += ge_read_le32(bytes + (size_t)i * 8u);
+            check ^= ge_read_le32(bytes + (size_t)i * 8u + 4u);
+        }
+    }
+    return check;
+}
+
+static uint32_t ge_hd_slot_hash(uint64_t cachekey, uint32_t data_hash) {
+    uint64_t k = cachekey ^ ((uint64_t)data_hash * 0x9E3779B97F4A7C15ULL);
+    k ^= k >> 33;
+    k *= 0xFF51AFD7ED558CCDULL;
+    k ^= k >> 33;
+    return (uint32_t)k;
+}
+
+static int ge_hd_pool_append(const char *rel) {
+    if (!rel || !rel[0]) return -2;
+    const size_t n = strlen(rel) + 1u;
+    if (g_hd_path_len + n > g_hd_path_cap) {
+        size_t ncap = g_hd_path_cap ? g_hd_path_cap * 2u : 65536u;
+        while (ncap < g_hd_path_len + n) ncap *= 2u;
+        char *np = (char *)realloc(g_hd_path_pool, ncap);
+        if (!np) return -1;
+        g_hd_path_pool = np;
+        g_hd_path_cap = ncap;
+    }
+    const int off = (int)g_hd_path_len;
+    memcpy(g_hd_path_pool + g_hd_path_len, rel, n);
+    g_hd_path_len += n;
+    return off;
+}
+
+static void ge_hd_table_put(uint64_t cachekey, uint32_t data_hash, int32_t path_off) {
+    if (g_hd_ini_cap == 0u || (g_hd_ini_count + 1u) * 2u > g_hd_ini_cap) {
+        const uint32_t ncap = g_hd_ini_cap ? g_hd_ini_cap * 2u : 8192u;
+        ge_hd_ini_slot *nt = (ge_hd_ini_slot *)malloc((size_t)ncap * sizeof *nt);
+        if (!nt) return;
+        for (uint32_t i = 0; i < ncap; i++) nt[i].path_off = -1;
+        for (uint32_t i = 0; i < g_hd_ini_cap; i++) {
+            if (g_hd_ini_table[i].path_off != -1) {
+                uint32_t idx = ge_hd_slot_hash(g_hd_ini_table[i].cachekey,
+                                               g_hd_ini_table[i].data_hash) & (ncap - 1u);
+                while (nt[idx].path_off != -1) idx = (idx + 1u) & (ncap - 1u);
+                nt[idx] = g_hd_ini_table[i];
+            }
+        }
+        free(g_hd_ini_table);
+        g_hd_ini_table = nt;
+        g_hd_ini_cap = ncap;
+    }
+    uint32_t idx = ge_hd_slot_hash(cachekey, data_hash) & (g_hd_ini_cap - 1u);
+    while (g_hd_ini_table[idx].path_off != -1) {
+        if (g_hd_ini_table[idx].cachekey == cachekey &&
+            g_hd_ini_table[idx].data_hash == data_hash) {
+            g_hd_ini_table[idx].path_off = path_off;
+            return;
+        }
+        idx = (idx + 1u) & (g_hd_ini_cap - 1u);
+    }
+    g_hd_ini_table[idx].cachekey = cachekey;
+    g_hd_ini_table[idx].data_hash = data_hash;
+    g_hd_ini_table[idx].path_off = path_off;
+    g_hd_ini_count++;
+    if (data_hash == 0u) {
+        g_hd_has_zero_dhash = 1;
+    } else {
+        const uint32_t b1 = (data_hash * 0x9E3779B1u) >> 18;
+        const uint32_t b2 = (data_hash * 0x85EBCA77u) >> 18;
+        g_hd_dhash_bloom[b1 >> 6] |= (1ULL << (b1 & 63u));
+        g_hd_dhash_bloom[b2 >> 6] |= (1ULL << (b2 & 63u));
+    }
+}
+
+static int32_t ge_hd_table_get(uint64_t cachekey, uint32_t data_hash) {
+    if (!g_hd_ini_table || g_hd_ini_cap == 0u) return -1;
+    uint32_t idx = ge_hd_slot_hash(cachekey, data_hash) & (g_hd_ini_cap - 1u);
+    while (g_hd_ini_table[idx].path_off != -1) {
+        if (g_hd_ini_table[idx].cachekey == cachekey &&
+            g_hd_ini_table[idx].data_hash == data_hash)
+            return g_hd_ini_table[idx].path_off;
+        idx = (idx + 1u) & (g_hd_ini_cap - 1u);
+    }
+    return -1;
+}
+
+static int ge_hd_dhash_maybe_present(uint32_t data_hash) {
+    if (data_hash == 0u) return g_hd_has_zero_dhash;
+    const uint32_t b1 = (data_hash * 0x9E3779B1u) >> 18;
+    const uint32_t b2 = (data_hash * 0x85EBCA77u) >> 18;
+    return ((g_hd_dhash_bloom[b1 >> 6] & (1ULL << (b1 & 63u))) != 0ULL) &&
+           ((g_hd_dhash_bloom[b2 >> 6] & (1ULL << (b2 & 63u))) != 0ULL);
+}
+
+static int32_t ge_hd_lookup_wildcard(uint64_t cachekey, uint32_t hash) {
+    const uint64_t eff_ck = g_hd_ignore_address ? (cachekey & 0xFFFFFFFFULL) : cachekey;
+    int32_t r = ge_hd_table_get(eff_ck, hash);
+    if (r != -1) return r;
+
+    r = ge_hd_table_get(cachekey & 0xFFFFFFFFULL, 0u);
+    if (r != -1) return r;
+
+    if (!g_hd_ignore_address) {
+        r = ge_hd_table_get(cachekey, 0u);
+        if (r != -1) return r;
+    }
+
+    r = ge_hd_table_get(cachekey & 0xFFFFFFFFULL, hash);
+    if (r != -1) return r;
+
+    if (!g_hd_ignore_address) {
+        r = ge_hd_table_get(cachekey & ~0xFFFFFFFFULL, hash);
+        if (r != -1) return r;
+        r = ge_hd_table_get(cachekey & ~0xFFFFFFFFULL, 0u);
+        if (r != -1) return r;
+    }
+
+    return ge_hd_table_get(0ULL, hash);
+}
+
+static char *ge_trim_str(char *s) {
+    while (*s && (unsigned char)*s <= ' ') s++;
+    size_t len = strlen(s);
+    while (len > 0 && (unsigned char)s[len - 1u] <= ' ') s[--len] = '\0';
+    return s;
+}
+
+static int ge_parse_hex24(const char *s, uint64_t *out_ck, uint32_t *out_dh) {
+    if (!s || strlen(s) != 24u) return 0;
+    for (int i = 0; i < 24; i++) {
+        if (!isxdigit((unsigned char)s[i])) return 0;
+    }
+    char ck_str[17], dh_str[9];
+    memcpy(ck_str, s, 16);
+    ck_str[16] = '\0';
+    memcpy(dh_str, s + 16, 8);
+    dh_str[8] = '\0';
+    *out_ck = strtoull(ck_str, NULL, 16);
+    *out_dh = (uint32_t)strtoul(dh_str, NULL, 16);
+    return 1;
+}
+
+static void ge_hd_ini_reset(void) {
+    free(g_hd_ini_table);
+    g_hd_ini_table = NULL;
+    g_hd_ini_cap = 0;
+    g_hd_ini_count = 0;
+    free(g_hd_path_pool);
+    g_hd_path_pool = NULL;
+    g_hd_path_len = 0;
+    g_hd_path_cap = 0;
+    memset(g_hd_dhash_bloom, 0, sizeof g_hd_dhash_bloom);
+    g_hd_has_zero_dhash = 0;
+    g_hd_nhashranges = 0;
+    g_hd_nreduceranges = 0;
+    memset(g_hd_fnv_cache, 0, sizeof g_hd_fnv_cache);
+    g_hd_ini_parsed = 0;
+    g_hd_ini_active = 0;
+    g_hd_base_dir[0] = '\0';
+}
+
+static void ge_hd_ini_load_once(const char *env_dir) {
+    if (g_hd_ini_parsed) return;
+    g_hd_ini_parsed = 1;
+    if (!env_dir || !env_dir[0]) return;
+
+    snprintf(g_hd_base_dir, sizeof g_hd_base_dir, "%s", env_dir);
+    char ini_path[440];
+    snprintf(ini_path, sizeof ini_path, "%s/textures.ini", g_hd_base_dir);
+    FILE *f = fopen(ini_path, "rb");
+    if (!f) {
+        snprintf(ini_path, sizeof ini_path, "%s/ULUS10136/textures.ini", env_dir);
+        f = fopen(ini_path, "rb");
+        if (f)
+            snprintf(g_hd_base_dir, sizeof g_hd_base_dir, "%s/ULUS10136", env_dir);
+    }
+
+    if (f) {
+        g_hd_hash_mode = GE_HD_HASH_QUICK;
+        g_hd_ignore_address = 0;
+        g_hd_reduce_hash = 0;
+        g_hd_reduce_global = 0.5f;
+        g_hd_skip_dxt1_128x64 = 0;
+        g_hd_skip_dxt1_128x128 = 0;
+
+        char section[32] = "";
+        char line[1024];
+        int first_line = 1;
+        while (fgets(line, sizeof line, f)) {
+            char *p = line;
+            if (first_line) {
+                first_line = 0;
+                if ((uint8_t)p[0] == 0xEFu && (uint8_t)p[1] == 0xBBu && (uint8_t)p[2] == 0xBFu)
+                    p += 3;
+            }
+            char *hash_comment = strchr(p, '#');
+            if (hash_comment) *hash_comment = '\0';
+            p = ge_trim_str(p);
+            if (!p[0] || p[0] == ';') continue;
+
+            if (p[0] == '[') {
+                char *endb = strchr(p, ']');
+                if (endb) {
+                    *endb = '\0';
+                    snprintf(section, sizeof section, "%s", ge_trim_str(p + 1));
+                    for (int i = 0; section[i]; i++)
+                        section[i] = (char)tolower((unsigned char)section[i]);
+                }
+                continue;
+            }
+
+            char *eq = strchr(p, '=');
+            if (!eq) continue;
+            *eq = '\0';
+            char *k = ge_trim_str(p);
+            char *v = ge_trim_str(eq + 1);
+
+            if (strcmp(section, "options") == 0) {
+                if (_stricmp(k, "hash") == 0) {
+                    if (_stricmp(v, "xxh32") == 0) g_hd_hash_mode = GE_HD_HASH_XXH32;
+                    else if (_stricmp(v, "xxh64") == 0) g_hd_hash_mode = GE_HD_HASH_XXH64;
+                    else g_hd_hash_mode = GE_HD_HASH_QUICK;
+                } else if (_stricmp(k, "ignoreAddress") == 0) {
+                    g_hd_ignore_address = (_stricmp(v, "true") == 0 || strcmp(v, "1") == 0);
+                } else if (_stricmp(k, "reduceHash") == 0) {
+                    g_hd_reduce_hash = (_stricmp(v, "true") == 0 || strcmp(v, "1") == 0);
+                } else if (_stricmp(k, "reduceHashGlobalValue") == 0) {
+                    g_hd_reduce_global = (float)atof(v);
+                } else if (_stricmp(k, "skipLastDXT1Blocks128x64") == 0) {
+                    g_hd_skip_dxt1_128x64 = atoi(v);
+                } else if (_stricmp(k, "skipLastDXT1Blocks128x128") == 0) {
+                    g_hd_skip_dxt1_128x128 = atoi(v);
+                }
+            } else if (strcmp(section, "hashes") == 0) {
+                uint64_t ck = 0;
+                uint32_t dh = 0;
+                if (ge_parse_hex24(k, &ck, &dh)) {
+                    char *pipe = strchr(v, '|');
+                    if (pipe) {
+                        *pipe = '\0';
+                        v = ge_trim_str(v);
+                    }
+                    int32_t poff = v[0] ? ge_hd_pool_append(v) : -2;
+                    if (poff != -1)
+                        ge_hd_table_put(ck, dh, poff);
+                }
+            } else if (strcmp(section, "hashranges") == 0 && g_hd_nhashranges < 64) {
+                unsigned int addr = 0;
+                int fw = 0, fh = 0, tw = 0, th = 0;
+                if (sscanf(k, "%x,%d,%d", &addr, &fw, &fh) == 3 &&
+                    sscanf(v, "%d,%d", &tw, &th) == 2) {
+                    g_hd_hashranges[g_hd_nhashranges].addr = addr;
+                    g_hd_hashranges[g_hd_nhashranges].from_w = fw;
+                    g_hd_hashranges[g_hd_nhashranges].from_h = fh;
+                    g_hd_hashranges[g_hd_nhashranges].to_w = tw;
+                    g_hd_hashranges[g_hd_nhashranges].to_h = th;
+                    g_hd_nhashranges++;
+                }
+            } else if (strcmp(section, "reducehashranges") == 0 && g_hd_nreduceranges < 64) {
+                int rw = 0, rh = 0;
+                float rf = 0.5f;
+                if (sscanf(k, "%d,%d", &rw, &rh) == 2 && sscanf(v, "%f", &rf) == 1) {
+                    g_hd_reduceranges[g_hd_nreduceranges].w = rw;
+                    g_hd_reduceranges[g_hd_nreduceranges].h = rh;
+                    g_hd_reduceranges[g_hd_nreduceranges].factor = rf;
+                    g_hd_nreduceranges++;
+                }
+            }
+        }
+        fclose(f);
+        if (g_hd_hash_mode == GE_HD_HASH_QUICK)
+            g_hd_reduce_hash = 0;
+    }
+
+    /* Also scan g_hd_base_dir for direct <24-hex>.png filenames. */
+    char pattern[440];
+    snprintf(pattern, sizeof pattern, "%s/*.png", g_hd_base_dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE hfind = FindFirstFileA(pattern, &fd);
+    if (hfind != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            size_t flen = strlen(fd.cFileName);
+            if (flen == 28u && _stricmp(fd.cFileName + 24, ".png") == 0) {
+                char hex24[25];
+                memcpy(hex24, fd.cFileName, 24);
+                hex24[24] = '\0';
+                uint64_t ck = 0;
+                uint32_t dh = 0;
+                if (ge_parse_hex24(hex24, &ck, &dh) && ge_hd_table_get(ck, dh) == -1) {
+                    int32_t poff = ge_hd_pool_append(fd.cFileName);
+                    if (poff >= 0) ge_hd_table_put(ck, dh, poff);
+                }
+            }
+        } while (FindNextFileA(hfind, &fd));
+        FindClose(hfind);
+    }
+
+    if (g_hd_ini_count > 0u) {
+        g_hd_ini_active = 1;
+        fprintf(stderr, "gl: loaded %u HD texture mappings from %s (mode=%s, ignoreAddress=%d)\n",
+                g_hd_ini_count, g_hd_base_dir,
+                g_hd_hash_mode == GE_HD_HASH_XXH32 ? "xxh32" :
+                (g_hd_hash_mode == GE_HD_HASH_XXH64 ? "xxh64" : "quick"),
+                g_hd_ignore_address);
+    }
+}
+
+static uint32_t ge_compute_ppsspp_data_hash(const psp_draw_state *st, int h_override,
+                                            int force_aligned) {
+    static const uint32_t TEX_BPP[16] = {
+        16u, 16u, 16u, 32u, 4u, 8u, 16u, 32u, 4u, 8u, 8u, 0u, 0u, 0u, 0u, 0u
+    };
+    static const uint32_t ALIGN_MASK16[16] = {
+        0x7F8u, 0x7F8u, 0x7F8u, 0x7FCu, 0x7E0u, 0x7F0u, 0x7F8u, 0x7FCu,
+        0x7FFu, 0x7FFu, 0x7FFu, 0u, 0u, 0u, 0u, 0u
+    };
+    if (!st || st->tex_fmt < 0 || st->tex_fmt > PSP_TPSM_DXT5) return 0u;
+    const uint32_t bpp = TEX_BPP[st->tex_fmt];
+    if (bpp == 0u) return 0u;
+
+    uint32_t bufw = (uint32_t)st->tex_bw & ALIGN_MASK16[st->tex_fmt];
+    if (bufw == 0u) bufw = (8u * 16u) / bpp;
+
+    int w = st->tex_w;
+    int h = h_override > 0 ? h_override : st->tex_h;
+    for (int i = 0; i < g_hd_nhashranges; i++) {
+        if (g_hd_hashranges[i].addr == st->tex_addr &&
+            g_hd_hashranges[i].from_w == st->tex_w &&
+            g_hd_hashranges[i].from_h == st->tex_h) {
+            w = g_hd_hashranges[i].to_w;
+            h = g_hd_hashranges[i].to_h;
+            break;
+        }
+    }
+    if (w <= 0 || h <= 0) return 0u;
+
+    float reduce_factor = 1.0f;
+    if (g_hd_reduce_hash) {
+        reduce_factor = g_hd_reduce_global;
+        for (int i = 0; i < g_hd_nreduceranges; i++) {
+            if (g_hd_reduceranges[i].w == w && g_hd_reduceranges[i].h == h) {
+                reduce_factor = g_hd_reduceranges[i].factor;
+                break;
+            }
+        }
+        if (reduce_factor < 0.0f) reduce_factor = 0.0f;
+        if (reduce_factor > 1.0f) reduce_factor = 1.0f;
+    }
+
+    const int aligned16 = force_aligned || ((st->tex_addr & 0xFu) == 0u);
+    if ((int)bufw <= w) {
+        const uint32_t total_px = bufw * (uint32_t)h + (uint32_t)(w - (int)bufw);
+        uint32_t size_ram = (uint32_t)((float)((bpp * total_px) / 8u) * reduce_factor);
+        if (st->tex_fmt == PSP_TPSM_DXT1 && w == 128 && h == 64 &&
+            g_hd_skip_dxt1_128x64 > 0 && (uint32_t)(8 * g_hd_skip_dxt1_128x64) < size_ram)
+            size_ram -= (uint32_t)(8 * g_hd_skip_dxt1_128x64);
+        if (st->tex_fmt == PSP_TPSM_DXT1 && w == 128 && h == 128 &&
+            g_hd_skip_dxt1_128x128 > 0 && (uint32_t)(8 * g_hd_skip_dxt1_128x128) < size_ram)
+            size_ram -= (uint32_t)(8 * g_hd_skip_dxt1_128x128);
+        if (size_ram == 0u) return 0u;
+        const uint8_t *checkp = (const uint8_t *)psp_mem_unwatched_ptr(st->tex_addr, size_ram);
+        if (!checkp) return 0u;
+        if (g_hd_hash_mode == GE_HD_HASH_XXH32)
+            return ge_xxh32(checkp, size_ram, 0xBACD7814u);
+        if (g_hd_hash_mode == GE_HD_HASH_XXH64)
+            return (uint32_t)ge_xxh64(checkp, size_ram, 0xBACD7814u);
+        return ge_quick_tex_hash(checkp, size_ram, aligned16);
+    } else {
+        const uint32_t bytes_per_line = (uint32_t)((float)((bpp * (uint32_t)w) / 8u) * reduce_factor);
+        const uint32_t stride = (bpp * bufw) / 8u;
+        const uint32_t size_ram = (uint32_t)(h - 1) * stride + bytes_per_line;
+        if (size_ram == 0u) return 0u;
+        const uint8_t *checkp = (const uint8_t *)psp_mem_unwatched_ptr(st->tex_addr, size_ram);
+        if (!checkp) return 0u;
+        uint32_t result = 0u;
+        for (int y = 0; y < h; y++) {
+            uint32_t row_hash;
+            if (g_hd_hash_mode == GE_HD_HASH_XXH32)
+                row_hash = ge_xxh32(checkp, bytes_per_line, 0xBACD7814u);
+            else if (g_hd_hash_mode == GE_HD_HASH_XXH64)
+                row_hash = (uint32_t)ge_xxh64(checkp, bytes_per_line, 0xBACD7814u);
+            else
+                row_hash = ge_quick_tex_hash(checkp, bytes_per_line,
+                                             aligned16 && ((stride & 0xFu) == 0u));
+            result = (result * 11u) ^ row_hash;
+            checkp += stride;
+        }
+        return result;
+    }
+}
+
+static int ge_log2_dim(int v) {
+    int l = 0;
+    while ((1 << l) < v && l < 15) l++;
+    return l;
+}
+
+static int32_t ge_hd_match_state_locked(const psp_draw_state *st) {
+    if (!g_hd_ini_active || !st || st->tex_w <= 0 || st->tex_h <= 0) return -1;
+    const uint16_t dim = (uint16_t)((ge_log2_dim(st->tex_h) << 8) | ge_log2_dim(st->tex_w));
+    const uint64_t addr_hi = ((uint64_t)(st->tex_addr & 0x3FFFFFFFu)) << 32;
+    const int has_clut = (st->tex_fmt & 4) != 0;
+
+    const int h_candidates[3] = { st->tex_h, 272, 256 };
+    const int n_hcand = (st->tex_h == 512) ? 3 : 1;
+
+    for (int hi = 0; hi < n_hcand; hi++) {
+        for (int align_try = 0; align_try < 2; align_try++) {
+            if (align_try == 1 && (st->tex_addr & 0xFu) == 0u) break;
+            const uint32_t dhash = ge_compute_ppsspp_data_hash(st, h_candidates[hi], align_try);
+            if (!has_clut) {
+                const uint64_t ck = addr_hi | (uint64_t)dim;
+                const int32_t poff = ge_hd_lookup_wildcard(ck, dhash);
+                if (poff != -1) return poff;
+                if (hi == 0 && align_try == 0) {
+                    static int n_trace_miss;
+                    const char *tr = getenv("SETO_TRACE_HD_TEX");
+                    if (tr && tr[0] && n_trace_miss < 64) {
+                        n_trace_miss++;
+                        fprintf(stderr, "gl: HD miss %016llx%08x (addr=%08X fmt=%d %dx%d bw=%d swz=%d)\n",
+                                (unsigned long long)ck, dhash, st->tex_addr, st->tex_fmt,
+                                st->tex_w, st->tex_h, st->tex_bw, st->tex_swizzle);
+                    }
+                }
+            } else if (st->clut) {
+                const uint32_t cmode32 = 0xC5000000u |
+                    ((uint32_t)(st->clut_start & 0x1F) << 16) |
+                    ((uint32_t)(st->clut_mask & 0xFF) << 8) |
+                    ((uint32_t)(st->clut_shift & 0x1F) << 2) |
+                    (uint32_t)(st->clut_fmt & 3);
+                const uint32_t entry_sz = (st->clut_fmt == 3) ? 4u : 2u;
+                const uint32_t base_b = (uint32_t)(st->clut_start & 0x1F) * 16u * entry_sz;
+                const uint32_t def_load = (st->tex_fmt == PSP_TPSM_T4) ? (16u * entry_sz) : (256u * entry_sz);
+                uint32_t def_ext = base_b + def_load;
+                if (def_ext > 1024u) def_ext = 1024u;
+                if (def_ext < 32u) def_ext = 32u;
+
+                const uint32_t ch_def = ge_xxh32(st->clut, def_ext, 0xC0108888u) ^ cmode32;
+                int32_t poff = ge_hd_lookup_wildcard(addr_hi | (uint64_t)((uint32_t)dim ^ ch_def), dhash);
+                if (poff != -1) return poff;
+
+                if (ge_hd_dhash_maybe_present(dhash) || g_hd_has_zero_dhash) {
+                    for (uint32_t ext = 32u; ext <= 1024u; ext += 32u) {
+                        if (ext == def_ext) continue;
+                        const uint32_t ch = ge_xxh32(st->clut, ext, 0xC0108888u) ^ cmode32;
+                        poff = ge_hd_lookup_wildcard(addr_hi | (uint64_t)((uint32_t)dim ^ ch), dhash);
+                        if (poff != -1) return poff;
+                    }
+                }
+            }
+        }
+    }
+    return -1;
+}
+
+void seto_ge_hd_note_tex(uint64_t fnv_hash, const psp_draw_state *st) {
+    const char *dir = getenv("SETO_HD_TEX_DIR");
+    if (!dir || !dir[0] || !fnv_hash || !st || !g_hd_ini_lock_ready) return;
+
+    EnterCriticalSection(&g_hd_ini_lock);
+    ge_hd_ini_load_once(dir);
+    if (g_hd_ini_active) {
+        const uint32_t slot = (uint32_t)(fnv_hash ^ (fnv_hash >> 32)) & (GE_HD_FNV_CACHE_CAP - 1u);
+        if (!g_hd_fnv_cache[slot].valid || g_hd_fnv_cache[slot].fnv_hash != fnv_hash) {
+            g_hd_fnv_cache[slot].fnv_hash = fnv_hash;
+            g_hd_fnv_cache[slot].path_off = ge_hd_match_state_locked(st);
+            g_hd_fnv_cache[slot].valid = 1;
+        }
+    }
+    LeaveCriticalSection(&g_hd_ini_lock);
+}
+
 static int ge_try_load_hd_tex(uint64_t hash, int orig_w, int orig_h,
                               uint32_t **out_px, int *out_w, int *out_h) {
     const char *dir = getenv("SETO_HD_TEX_DIR");
@@ -1277,56 +2029,58 @@ static int ge_try_load_hd_tex(uint64_t hash, int orig_w, int orig_h,
         if (g_hd_miss_hashes[i] == hash) return 0;
     }
 
-    char path[320];
-    snprintf(path, sizeof path, "%s/%016llx.png", dir, (unsigned long long)hash);
-    WCHAR wpath[320];
-    if (MultiByteToWideChar(CP_ACP, 0, path, -1, wpath, 320) > 0 &&
-        GetFileAttributesW(wpath) != INVALID_FILE_ATTRIBUTES &&
-        ge_gdiplus_start_once()) {
-        GpBitmap *bmp = NULL;
-        if (GdipCreateBitmapFromFile(wpath, &bmp) == Ok && bmp) {
-            UINT uw = 0, uh = 0;
-            if (GdipGetImageWidth((GpImage *)bmp, &uw) == Ok &&
-                GdipGetImageHeight((GpImage *)bmp, &uh) == Ok &&
-                uw > 0 && uh > 0 && (int)uw <= g_ge_max_dim && (int)uh <= g_ge_max_dim) {
-                GpRect rc = { 0, 0, (INT)uw, (INT)uh };
-                BitmapData bd = {0};
-                if (GdipBitmapLockBits(bmp, &rc, ImageLockModeRead,
-                                       PixelFormat32bppARGB, &bd) == Ok) {
-                    uint32_t *px = (uint32_t *)malloc((size_t)uw * (size_t)uh * 4u);
-                    if (px) {
-                        for (UINT y = 0; y < uh; y++) {
-                            const uint32_t *srow = (const uint32_t *)((const uint8_t *)bd.Scan0 +
-                                                   (ptrdiff_t)y * (ptrdiff_t)bd.Stride);
-                            uint32_t *drow = px + (size_t)y * (size_t)uw;
-                            for (UINT x = 0; x < uw; x++) {
-                                const uint32_t c = srow[x];
-                                drow[x] = (c & 0xFF00FF00u) | ((c & 0x000000FFu) << 16) |
-                                          ((c & 0x00FF0000u) >> 16);
-                            }
-                        }
-                        GdipBitmapUnlockBits(bmp, &bd);
-                        GdipDisposeImage((GpImage *)bmp);
-                        *out_px = px;
-                        *out_w = (int)uw;
-                        *out_h = (int)uh;
-                        if (g_hd_logged < 8) {
-                            g_hd_logged++;
-                            fprintf(stderr, "gl: HD texture %016llx (%dx%d -> %dx%d)\n",
-                                    (unsigned long long)hash, orig_w, orig_h, *out_w, *out_h);
-                        }
-                        return 1;
-                    }
-                    GdipBitmapUnlockBits(bmp, &bd);
-                }
+    char ini_rel[260] = "";
+    char base_dir[384] = "";
+    int32_t ini_poff = -1;
+    if (g_hd_ini_lock_ready) {
+        EnterCriticalSection(&g_hd_ini_lock);
+        ge_hd_ini_load_once(dir);
+        snprintf(base_dir, sizeof base_dir, "%s", g_hd_base_dir[0] ? g_hd_base_dir : dir);
+        if (g_hd_ini_active) {
+            const uint32_t slot = (uint32_t)(hash ^ (hash >> 32)) & (GE_HD_FNV_CACHE_CAP - 1u);
+            if (g_hd_fnv_cache[slot].valid && g_hd_fnv_cache[slot].fnv_hash == hash) {
+                ini_poff = g_hd_fnv_cache[slot].path_off;
+                if (ini_poff >= 0 && g_hd_path_pool)
+                    snprintf(ini_rel, sizeof ini_rel, "%s", g_hd_path_pool + ini_poff);
             }
-            GdipDisposeImage((GpImage *)bmp);
+        }
+        LeaveCriticalSection(&g_hd_ini_lock);
+    } else {
+        snprintf(base_dir, sizeof base_dir, "%s", dir);
+    }
+
+    char path[640];
+    if (ini_poff == -2) {
+        g_hd_miss_hashes[g_hd_miss_cursor & 511] = hash;
+        g_hd_miss_cursor++;
+        return 0;
+    }
+    if (ini_poff >= 0 && ini_rel[0]) {
+        snprintf(path, sizeof path, "%s/%s", base_dir, ini_rel);
+        if (ge_load_png_rgba(path, out_px, out_w, out_h) ||
+            ge_load_ppm_rgba(path, out_px, out_w, out_h)) {
+            if (g_hd_logged < 16) {
+                g_hd_logged++;
+                fprintf(stderr, "gl: HD texture %016llx -> %s (%dx%d -> %dx%d)\n",
+                        (unsigned long long)hash, ini_rel, orig_w, orig_h, *out_w, *out_h);
+            }
+            return 1;
         }
     }
 
-    snprintf(path, sizeof path, "%s/%016llx.ppm", dir, (unsigned long long)hash);
+    snprintf(path, sizeof path, "%s/%016llx.png", base_dir, (unsigned long long)hash);
+    if (ge_load_png_rgba(path, out_px, out_w, out_h)) {
+        if (g_hd_logged < 16) {
+            g_hd_logged++;
+            fprintf(stderr, "gl: HD texture %016llx (%dx%d -> %dx%d)\n",
+                    (unsigned long long)hash, orig_w, orig_h, *out_w, *out_h);
+        }
+        return 1;
+    }
+
+    snprintf(path, sizeof path, "%s/%016llx.ppm", base_dir, (unsigned long long)hash);
     if (ge_load_ppm_rgba(path, out_px, out_w, out_h)) {
-        if (g_hd_logged < 8) {
+        if (g_hd_logged < 16) {
             g_hd_logged++;
             fprintf(stderr, "gl: HD texture %016llx (%dx%d -> %dx%d)\n",
                     (unsigned long long)hash, orig_w, orig_h, *out_w, *out_h);
@@ -2732,6 +3486,13 @@ static void ge_stop(void) {
         DeleteCriticalSection(&g_ge_rb_lock);
         g_ge_rb_lock_ready = 0;
     }
+    if (g_hd_ini_lock_ready) {
+        EnterCriticalSection(&g_hd_ini_lock);
+        ge_hd_ini_reset();
+        LeaveCriticalSection(&g_hd_ini_lock);
+        DeleteCriticalSection(&g_hd_ini_lock);
+        g_hd_ini_lock_ready = 0;
+    }
     if (g_ge_lock_ready) {
         DeleteCriticalSection(&g_ge_lock);
         g_ge_lock_ready = 0;
@@ -2765,6 +3526,8 @@ static int ge_start(PFNWGLCREATECONTEXTATTRIBSARBPROC create_ctx) {
     g_ge_lock_ready = 1;
     InitializeCriticalSection(&g_ge_rb_lock);
     g_ge_rb_lock_ready = 1;
+    InitializeCriticalSection(&g_hd_ini_lock);
+    g_hd_ini_lock_ready = 1;
     if (ge_queue_init(&g_ge_q, 1024) != 0) {
         fprintf(stderr, "gl: GE queue init failed\n");
         ge_stop();

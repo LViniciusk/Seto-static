@@ -765,6 +765,7 @@ static int ge_emit_chunk(int prim, const psp_vertex *verts, int nverts,
     }
     uint32_t *copy = ge_tex_copy(tex_px, tw, th);
     if (!copy) return 0;
+    seto_ge_hd_note_tex(hash, st);
     if (!seto_ge_gpu_enqueue_draw(prim, verts, nverts, st, fbo_slot,
                                   copy, victim, -1, hash)) {
         free(copy);

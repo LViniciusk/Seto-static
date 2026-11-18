@@ -139,7 +139,7 @@ The software renderer remains authoritative until M3:
 - `SETO_FILTER=0|1|2`: Window present scaler (`0` nearest, `1` bilinear, `2` Lanczos2).
 - `SETO_POST_FILTER=0|1|2|3` (or `off|cas|lcd|crt`): Presenter post-processing filter.
 - `SETO_DUMP_TEX_DIR=<dir>`: Dump unique decoded textures once as `<16-hex-hash>.png`.
-- `SETO_HD_TEX_DIR=<dir>`: Load upscaled `<16-hex-hash>.png` or `.ppm` texture overrides.
+- `SETO_HD_TEX_DIR=<dir>`: Load upscaled texture overrides from PPSSPP texture packs (`textures.ini` with `hash = quick | xxh32 | xxh64`, `[hashes]`, `[hashranges]`, `[reducehashranges]`, `ignoreAddress`, `<24-hex>.png`, and `<dir>/ULUS10136/textures.ini` auto-discovery) as well as direct `<16-hex-hash>.png` or `.ppm` files.
 - `SETO_GL_HUD=1|0`: Toggle the OpenGL FPS/VPS badge overlay (default on).
 - `SETO_GE_EAGER_SYNC=1`: Force synchronous VRAM readback on every `ge_present`.
 - `SETO_GL_PRESENT_SHOT_DIR=<dir>` / `SETO_GL_PRESENT_SHOT_EVERY=<N>`: Capture presented backbuffer PPMs including post filters and GL overlays.
