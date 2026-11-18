@@ -494,6 +494,8 @@ void extra_import_forward(uint32_t nid) {
     psp_cpu.r[PSP_REG_GP] = caller_gp;
 }
 
+#include "seto_net.h"
+
 /* ---- Firmware HLE handlers for module_htmlview (net/http/ssl/utility) --- */
 
 enum {
@@ -506,158 +508,7 @@ enum {
 static int g_html_status = HTML_STATUS_NONE;
 static uint32_t g_html_param;
 
-static int g_netconf_status = HTML_STATUS_NONE;
-static uint32_t g_netconf_param;
-static int g_adhocctl_state;
-static char g_adhoc_group[8];
-static int g_adhoc_handler_id = 1;
-static int g_matching_id = 1;
-static int g_pdp_id = 1;
-static int g_ptp_id = 1;
-
 static void hle_net_ok(void) { psp_ret(0); }
-
-static void hle_net_mac(void) {
-    static const uint8_t mac[6] = { 0x02u, 0x00u, 0x5Eu, 0x54u, 0x4Fu, 0x01u };
-    uint32_t dst = psp_arg(0);
-    if (!dst) {
-        psp_ret(0x80410001u);
-        return;
-    }
-    for (uint32_t i = 0; i < 6u; i++) psp_write8(dst + i, mac[i]);
-    psp_ret(0);
-}
-
-static void hle_net_ether_ntostr(void) {
-    uint32_t src = psp_arg(0);
-    uint32_t dst = psp_arg(1);
-    if (!src || !dst) {
-        psp_ret(0x80410001u);
-        return;
-    }
-    char buf[24];
-    snprintf(buf, sizeof buf, "%02x:%02x:%02x:%02x:%02x:%02x",
-             psp_read8(src + 0u), psp_read8(src + 1u), psp_read8(src + 2u),
-             psp_read8(src + 3u), psp_read8(src + 4u), psp_read8(src + 5u));
-    for (uint32_t i = 0; buf[i]; i++) psp_write8(dst + i, (uint8_t)buf[i]);
-    psp_write8(dst + 17u, 0);
-    psp_ret(0);
-}
-
-static void hle_netconf_init_start(void) {
-    uint32_t param = psp_arg(0);
-    g_netconf_param = param;
-    if (param) {
-        psp_write32(param + 0x1Cu, 0);
-        uint32_t action = psp_read32(param + 0x30u);
-        if (action == 3u || action == 4u || action == 5u) {
-            uint32_t adhocp = psp_read32(param + 0x34u);
-            if (adhocp) {
-                for (int i = 0; i < 8; i++)
-                    g_adhoc_group[i] = (char)psp_read8(adhocp + (uint32_t)i);
-            }
-        }
-    }
-    g_netconf_status = HTML_STATUS_INIT;
-    psp_ret(0);
-}
-
-static void hle_netconf_get_status(void) {
-    int cur = g_netconf_status;
-    if (cur == HTML_STATUS_INIT) g_netconf_status = HTML_STATUS_RUN;
-    else if (cur == HTML_STATUS_SHUT) g_netconf_status = HTML_STATUS_NONE;
-    psp_ret((uint32_t)cur);
-}
-
-static void hle_netconf_update(void) {
-    if (g_netconf_status == HTML_STATUS_RUN) {
-        if (g_netconf_param) {
-            psp_write32(g_netconf_param + 0x1Cu, 0);
-            uint32_t action = psp_read32(g_netconf_param + 0x30u);
-            if (action == 3u || action == 4u || action == 5u)
-                g_adhocctl_state = 1;
-        }
-        g_netconf_status = HTML_STATUS_QUIT;
-    }
-    psp_ret(0);
-}
-
-static void hle_netconf_shutdown_start(void) {
-    g_netconf_status = HTML_STATUS_SHUT;
-    psp_ret(0);
-}
-
-static void hle_adhoc_init(void) {
-    g_adhocctl_state = 0;
-    memset(g_adhoc_group, 0, sizeof g_adhoc_group);
-    psp_ret(0);
-}
-
-static void hle_adhoc_term(void) {
-    g_adhocctl_state = 0;
-    psp_ret(0);
-}
-
-static void hle_adhocctl_add_handler(void) {
-    psp_ret((uint32_t)g_adhoc_handler_id++);
-}
-
-static void hle_adhocctl_disconnect(void) {
-    g_adhocctl_state = 0;
-    memset(g_adhoc_group, 0, sizeof g_adhoc_group);
-    psp_ret(0);
-}
-
-static void hle_adhocctl_get_state(void) {
-    uint32_t out = psp_arg(0);
-    if (!out) {
-        psp_ret(0x80410701u);
-        return;
-    }
-    psp_write32(out, (uint32_t)g_adhocctl_state);
-    psp_ret(0);
-}
-
-static void hle_adhocctl_get_parameter(void) {
-    static const uint8_t mac[6] = { 0x02u, 0x00u, 0x5Eu, 0x54u, 0x4Fu, 0x01u };
-    uint32_t out = psp_arg(0);
-    if (!out) {
-        psp_ret(0x80410701u);
-        return;
-    }
-    /* PSP SceNetAdhocctlParams: channel(4) + name(8) + nickname(128) + bssid(6). */
-    for (uint32_t i = 0; i < 148u; i++) psp_write8(out + i, 0);
-    psp_write32(out + 0u, 1u);
-    for (uint32_t i = 0; i < 8u; i++) psp_write8(out + 4u + i, (uint8_t)g_adhoc_group[i]);
-    for (uint32_t i = 0; i < 6u; i++) psp_write8(out + 140u + i, mac[i]);
-    psp_ret(0);
-}
-
-static void hle_adhocctl_get_name_by_addr(void) {
-    uint32_t out = psp_arg(1);
-    if (out) psp_write8(out, 0);
-    psp_ret(0);
-}
-
-static void hle_adhocctl_no_peer(void) {
-    psp_ret(0x80410701u);
-}
-
-static void hle_adhoc_no_data(void) {
-    psp_ret(0x80410709u);
-}
-
-static void hle_adhoc_pdp_create(void) {
-    psp_ret((uint32_t)g_pdp_id++);
-}
-
-static void hle_adhoc_ptp_open(void) {
-    psp_ret((uint32_t)g_ptp_id++);
-}
-
-static void hle_adhoc_matching_create(void) {
-    psp_ret((uint32_t)g_matching_id++);
-}
 
 static void hle_html_init_start(void) {
     uint32_t param = psp_arg(0);
@@ -694,8 +545,6 @@ void psp_extra_bind_hle(void) {
         const char *name;
         psp_hle_fn fn;
     } named[] = {
-        { 0x39AF39A6u, "sceNet",         "sceNetInit",                        hle_net_ok },
-        { 0x281928A9u, "sceNet",         "sceNetTerm",                        hle_net_ok },
         { 0x17943399u, "sceNetInet",     "sceNetInetInit",                    hle_net_ok },
         { 0xA9ED66B9u, "sceNetInet",     "sceNetInetTerm",                    hle_net_ok },
         { 0xE2F91F9Bu, "sceNetApctl",    "sceNetApctlInit",                   hle_net_ok },
@@ -708,51 +557,10 @@ void psp_extra_bind_hle(void) {
         { 0xD1C8945Eu, "sceHttp",        "sceHttpEnd",                        hle_net_ok },
         { 0xF1657B22u, "sceHttp",        "sceHttpLoadSystemCookie",           hle_net_ok },
         { 0x76D1363Bu, "sceHttp",        "sceHttpSaveSystemCookie",           hle_net_ok },
-        { 0x1579A159u, "sceUtility",     "sceUtilityLoadNetModule",           hle_net_ok },
-        { 0x64D50C56u, "sceUtility",     "sceUtilityUnloadNetModule",         hle_net_ok },
         { 0xCDC3AA41u, "sceUtility",     "sceUtilityHtmlViewerInitStart",     hle_html_init_start },
         { 0xBDA7D894u, "sceUtility",     "sceUtilityHtmlViewerGetStatus",     hle_html_get_status },
         { 0x05AFB9E4u, "sceUtility",     "sceUtilityHtmlViewerUpdate",        hle_html_update },
         { 0xF5CE1134u, "sceUtility",     "sceUtilityHtmlViewerShutdownStart", hle_html_shutdown_start },
-        { 0x4DB1E739u, "sceUtility",     "sceUtilityNetconfInitStart",        hle_netconf_init_start },
-        { 0x6332AA39u, "sceUtility",     "sceUtilityNetconfGetStatus",        hle_netconf_get_status },
-        { 0x91E70E35u, "sceUtility",     "sceUtilityNetconfUpdate",           hle_netconf_update },
-        { 0xF88155F6u, "sceUtility",     "sceUtilityNetconfShutdownStart",    hle_netconf_shutdown_start },
-        { 0x0C622081u, "sceWlanDrv",     "sceWlanGetEtherAddr",               hle_net_mac },
-        { 0x0BF0A3AEu, "sceNet",         "sceNetGetLocalEtherAddr",           hle_net_mac },
-        { 0x89360950u, "sceNet",         "sceNetEtherNtostr",                 hle_net_ether_ntostr },
-        { 0xE1D621D7u, "sceNetAdhoc",    "sceNetAdhocInit",                   hle_adhoc_init },
-        { 0xA62C6F57u, "sceNetAdhoc",    "sceNetAdhocTerm",                   hle_adhoc_term },
-        { 0x6F92741Bu, "sceNetAdhoc",    "sceNetAdhocPdpCreate",              hle_adhoc_pdp_create },
-        { 0x7F27BB5Eu, "sceNetAdhoc",    "sceNetAdhocPdpDelete",              hle_net_ok },
-        { 0xABED3790u, "sceNetAdhoc",    "sceNetAdhocPdpSend",                hle_net_ok },
-        { 0xDFE53E03u, "sceNetAdhoc",    "sceNetAdhocPdpRecv",                hle_adhoc_no_data },
-        { 0x877F6D66u, "sceNetAdhoc",    "sceNetAdhocPtpOpen",                hle_adhoc_ptp_open },
-        { 0x4DA4C788u, "sceNetAdhoc",    "sceNetAdhocPtpSend",                hle_net_ok },
-        { 0x8BEA2B3Eu, "sceNetAdhoc",    "sceNetAdhocPtpRecv",                hle_adhoc_no_data },
-        { 0x9DF81198u, "sceNetAdhoc",    "sceNetAdhocPtpAccept",              hle_adhoc_no_data },
-        { 0x9AC2EEACu, "sceNetAdhoc",    "sceNetAdhocPtpFlush",               hle_net_ok },
-        { 0xE08BDAC1u, "sceNetAdhoc",    "sceNetAdhocPtpListen",              hle_adhoc_ptp_open },
-        { 0x157E6225u, "sceNetAdhoc",    "sceNetAdhocPtpClose",               hle_net_ok },
-        { 0xE26F226Eu, "sceNetAdhocctl", "sceNetAdhocctlInit",                hle_net_ok },
-        { 0x9D689E13u, "sceNetAdhocctl", "sceNetAdhocctlTerm",                hle_adhoc_term },
-        { 0x20B317A0u, "sceNetAdhocctl", "sceNetAdhocctlAddHandler",          hle_adhocctl_add_handler },
-        { 0x6402490Bu, "sceNetAdhocctl", "sceNetAdhocctlDelHandler",          hle_net_ok },
-        { 0x34401D65u, "sceNetAdhocctl", "sceNetAdhocctlDisconnect",          hle_adhocctl_disconnect },
-        { 0x75ECD386u, "sceNetAdhocctl", "sceNetAdhocctlGetState",            hle_adhocctl_get_state },
-        { 0x08FFF7A0u, "sceNetAdhocctl", "sceNetAdhocctlScan",                hle_net_ok },
-        { 0x8916C003u, "sceNetAdhocctl", "sceNetAdhocctlGetNameByAddr",       hle_adhocctl_get_name_by_addr },
-        { 0x8DB83FDCu, "sceNetAdhocctl", "sceNetAdhocctlGetPeerInfo",         hle_adhocctl_no_peer },
-        { 0xDED9D28Eu, "sceNetAdhocctl", "sceNetAdhocctlGetParameter",        hle_adhocctl_get_parameter },
-        { 0x2A2A1E07u, "sceNetAdhocMatching", "sceNetAdhocMatchingInit",              hle_net_ok },
-        { 0x7945ECDAu, "sceNetAdhocMatching", "sceNetAdhocMatchingTerm",              hle_net_ok },
-        { 0xCA5EDA6Fu, "sceNetAdhocMatching", "sceNetAdhocMatchingCreate",            hle_adhoc_matching_create },
-        { 0xF16EAF4Fu, "sceNetAdhocMatching", "sceNetAdhocMatchingDelete",            hle_net_ok },
-        { 0x93EF3843u, "sceNetAdhocMatching", "sceNetAdhocMatchingStart",             hle_net_ok },
-        { 0x32B156B3u, "sceNetAdhocMatching", "sceNetAdhocMatchingStop",              hle_net_ok },
-        { 0x5E3D4B79u, "sceNetAdhocMatching", "sceNetAdhocMatchingSelectTarget",      hle_net_ok },
-        { 0x8F58BEDFu, "sceNetAdhocMatching", "sceNetAdhocMatchingCancelTargetWithOpt", hle_net_ok },
-        { 0xB58E61B7u, "sceNetAdhocMatching", "sceNetAdhocMatchingSetHelloOpt",       hle_net_ok },
     };
     for (size_t i = 0; i < sizeof named / sizeof named[0]; i++)
         psp_hle_register(named[i].nid, named[i].lib, named[i].name, named[i].fn);
@@ -760,4 +568,6 @@ void psp_extra_bind_hle(void) {
     psp_hle_register_unnamed(0x87797BDDu, "sceHttp", hle_net_ok);
     psp_hle_register_unnamed(0xE4D21302u, "sceHttp", hle_net_ok);
     psp_hle_register_unnamed(0xF9D8EB63u, "sceHttp", hle_net_ok);
+
+    seto_net_register_hle();
 }

@@ -205,7 +205,7 @@ add_extra_corpus(conv         convmachine  CONVMACHINE)
 add_extra_corpus(password     password     PASSWORD)
 add_extra_corpus(htmlview     htmlview     HTMLVIEW)
 
-set(SETO_SOURCES host.c host_window.c umd.c fpl.c font_prx.c multimedia.c)
+set(SETO_SOURCES host.c host_window.c umd.c fpl.c font_prx.c multimedia.c seto_net.c)
 if(TITLE_SOURCES)
     list(APPEND SETO_SOURCES title_prx.c)
 endif()
@@ -298,10 +298,13 @@ if(EXTRA_TARGETS)
 endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavcodec libavformat libswresample libswscale libavutil)
-target_link_libraries(Seto-static PRIVATE tagforce gdi32 winmm gdiplus PkgConfig::FFMPEG)
+target_link_libraries(Seto-static PRIVATE tagforce gdi32 winmm ws2_32 gdiplus PkgConfig::FFMPEG)
 
 add_executable(test-lbn-seek EXCLUDE_FROM_ALL tests/lbn_seek.c)
 target_link_libraries(test-lbn-seek PRIVATE psprecomp)
 
 add_executable(bench-render EXCLUDE_FROM_ALL tests/render_bench.c)
 target_link_libraries(bench-render PRIVATE psprecomp)
+
+add_executable(test-seto-net EXCLUDE_FROM_ALL tests/seto_net_test.c seto_net.c)
+target_link_libraries(test-seto-net PRIVATE psprecomp $<$<BOOL:${WIN32}>:ws2_32>)

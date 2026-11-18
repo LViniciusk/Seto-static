@@ -27,6 +27,7 @@ void psp_umd_set_iso(const char *path);
 void psp_fpl_register(void);
 void seto_multimedia_register(void);
 void seto_multimedia_shutdown(void);
+#include "seto_net.h"
 int  psp_font_image_load(const char *path);
 int  psp_font_bind(void);
 #ifdef HAVE_FONT_CORPUS
@@ -2207,6 +2208,7 @@ int main(int argc, char **argv) {
     seto_osk_register();
     psp_recomp_register();
     seto_multimedia_register();
+    seto_net_register_hle();
 
     /* S5: the pre-relocated PRX image plus its namespaced corpus. The image is
      * placed, its exports are bound to the seven NIDs and called from the
@@ -2379,12 +2381,14 @@ int main(int argc, char **argv) {
      * short grace slice so the last presses can request modules. */
     int idle = 0;
     while (!psp_exit_requested() && idle < 5000) {
-        const uint32_t step = g_input_done ? 16u : 50u;
+        const uint32_t step = (g_input_done || seto_net_is_online()) ? 16u : 50u;
         psp_threadman_host_sleep_ms(step);
+        seto_net_pump_callbacks();
         idle = g_input_done ? idle + (int)step : 0;
     }
     seto_window_stop();
     seto_multimedia_shutdown();
+    seto_net_shutdown();
     timeEndPeriod(1);
     report("run ended");
     return 0;
