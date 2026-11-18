@@ -865,6 +865,7 @@ static void ensure_connected(void) {
     memset(&hello, 0, sizeof(hello));
     memcpy(hello.product, g_product, SETO_PRODUCT_LEN);
     memcpy(hello.nickname, g_nickname, SETO_NICKNAME_LEN);
+    memcpy(hello.preferred_mac, g_local_mac, SETO_MAC_LEN);
 
     seto_hdr_t hdr = {
         .magic   = SETO_PROTO_MAGIC,
@@ -1095,8 +1096,19 @@ static void hle_net_init(void) {
 }
 
 static void hle_net_term(void) {
-    seto_net_shutdown();
-    g_offline_logged = 0; /* Allow reconnect if player re-enters Lab */
+    /* Keep the persistent TCP session and assigned MAC alive across lobby
+     * re-entries: modlabo caches sceWlanGetEtherAddr at startup and rejects
+     * subsequent sessions if sceNetGetLocalEtherAddr changes after sceNetTerm! */
+    if (g_online && g_adhocctl_state != PSP_ADHOCCTL_STATE_DISCONNECTED)
+        (void)net_send(SETO_OP_ADHOCCTL_LEAVE, NULL, 0);
+    mtx_lock(&g_state_lock);
+    clear_runtime_queues_locked();
+    g_adhocctl_state = PSP_ADHOCCTL_STATE_DISCONNECTED;
+    g_netconf_status = PSP_UTILITY_STATUS_NONE;
+    memset(g_adhoc_group, 0, sizeof(g_adhoc_group));
+    memset(g_ctl_handlers, 0, sizeof(g_ctl_handlers));
+    mtx_unlock(&g_state_lock);
+    g_offline_logged = 0;
     psp_ret(0u);
 }
 
@@ -1238,7 +1250,11 @@ static void hle_adhocctl_init(void) {
             if (!c) break;
             prod[i] = c;
         }
-        if (prod[0]) snprintf(g_product, sizeof(g_product), "%s", prod);
+        if (prod[0] &&
+            strcmp(prod, "ULJM05151") != 0 &&
+            strcmp(prod, "ULES00600") != 0) {
+            snprintf(g_product, sizeof(g_product), "%s", prod);
+        }
     }
     ensure_connected();
     psp_ret(0u);
