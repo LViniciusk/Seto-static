@@ -24,7 +24,9 @@ typedef struct {
     int valid;
     uint32_t addr;
     uint32_t end_addr;
-    int w, h, fmt, swz;
+    int bw, w, h, fmt, swz;
+    int has_raw_hash;
+    uint64_t raw_hash;
     uint64_t hash;
     uint32_t lru;
 } ge_prod_tex_slot;
@@ -618,10 +620,87 @@ static void ge_log_draw(int prim, int n, const psp_draw_state *st, int tw, int t
     ge_logged_draw++;
 }
 
+static uint64_t ge_fnv_bytes(uint64_t h, const uint8_t *p, size_t n) {
+    size_t i = 0;
+    for (; i + 8u <= n; i += 8u) {
+        uint64_t w;
+        memcpy(&w, p + i, 8);
+        h ^= w;
+        h *= 1099511628211ULL;
+    }
+    for (; i < n; i++) {
+        h ^= (uint64_t)p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static uint64_t ge_fnv_u32(uint64_t h, uint32_t v) {
+    h ^= (uint64_t)v;
+    return h * 1099511628211ULL;
+}
+
+static int ge_compute_raw_tex_hash(const psp_draw_state *st, uint64_t *out_hash) {
+    static const int TEX_BPP[11] = { 16, 16, 16, 32, 4, 8, 16, 32, 4, 8, 8 };
+    if (!st || !out_hash || st->tex_w <= 0 || st->tex_h <= 0 || st->tex_bw <= 0 ||
+        st->tex_fmt < 0 || st->tex_fmt > PSP_TPSM_DXT5)
+        return 0;
+    if (st->tex_fmt >= PSP_TPSM_T4 && st->tex_fmt <= PSP_TPSM_T32 && !st->clut)
+        return 0;
+    if (st->tex_fmt >= PSP_TPSM_DXT1 && st->tex_bw < 4)
+        return 0;
+
+    uint64_t size;
+    if (st->tex_fmt >= PSP_TPSM_DXT1) {
+        size = ((uint64_t)((st->tex_h - 1) / 4) * (uint32_t)(st->tex_bw / 4) +
+                (uint32_t)((st->tex_w - 1) / 4) + 1u) *
+               (st->tex_fmt == PSP_TPSM_DXT1 ? 8u : 16u);
+    } else {
+        const uint32_t bpp = (uint32_t)TEX_BPP[st->tex_fmt];
+        const uint64_t row = (uint64_t)(uint32_t)st->tex_bw * bpp / 8u;
+        const uint64_t x = (uint64_t)(uint32_t)(st->tex_w - 1) * bpp / 8u;
+        const uint32_t y = (uint32_t)(st->tex_h - 1);
+        if (st->tex_swizzle) {
+            const uint64_t blocks = row >= 16u ? row / 16u : 1u;
+            uint64_t last = (y / 8u * blocks) * 128u + (y & 7u) * 16u;
+            if (y >= 8u) {
+                const uint64_t prev = ((y / 8u - 1u) * blocks) * 128u + 112u;
+                if (prev > last) last = prev;
+            }
+            size = last + x / 16u * 128u + (x & 15u);
+        } else {
+            size = y * row + x;
+        }
+        size += bpp < 8u ? 1u : bpp / 8u;
+    }
+    if (size == 0u || size > (uint64_t)PSP_VRAM_SIZE * 2u) return 0;
+
+    const uint8_t *raw = (const uint8_t *)psp_mem_unwatched_ptr(st->tex_addr, (uint32_t)size);
+    if (!raw) return 0;
+
+    uint64_t h = 14695981039346656037ULL;
+    h = ge_fnv_u32(h, (uint32_t)st->tex_bw);
+    h = ge_fnv_u32(h, (uint32_t)st->tex_w);
+    h = ge_fnv_u32(h, (uint32_t)st->tex_h);
+    h = ge_fnv_u32(h, (uint32_t)st->tex_fmt);
+    h = ge_fnv_u32(h, (uint32_t)st->tex_swizzle);
+    h = ge_fnv_bytes(h, raw, (size_t)size);
+    if (st->tex_fmt >= PSP_TPSM_T4 && st->tex_fmt <= PSP_TPSM_T32) {
+        h = ge_fnv_u32(h, (uint32_t)st->clut_fmt);
+        h = ge_fnv_u32(h, (uint32_t)st->clut_shift);
+        h = ge_fnv_u32(h, (uint32_t)st->clut_mask);
+        h = ge_fnv_u32(h, (uint32_t)st->clut_start);
+        h = ge_fnv_bytes(h, st->clut, 1024u);
+    }
+    *out_hash = h ^ (h >> 33);
+    return 1;
+}
+
 static int ge_emit_chunk(int prim, const psp_vertex *verts, int nverts,
                          const psp_draw_state *st, int fbo_slot,
                          const uint32_t *tex_px, int tw, int th,
-                         uint64_t hash, int fbo_tex_slot) {
+                         uint64_t hash, int fbo_tex_slot,
+                         int pre_hit_slot, int has_raw_hash, uint64_t raw_hash) {
     if (nverts <= 0) return 1;
     if (!seto_gl_present_active()) {
         ge_prod_cache_reset();
@@ -629,16 +708,26 @@ static int ge_emit_chunk(int prim, const psp_vertex *verts, int nverts,
     }
     if (fbo_tex_slot >= 0) {
         if (!seto_ge_gpu_enqueue_draw(prim, verts, nverts, st, fbo_slot,
-                                      NULL, -1, fbo_tex_slot)) {
+                                      NULL, -1, fbo_tex_slot, 0u)) {
             ge_note_reject("queue", prim, nverts, st);
             return 0;
         }
         ge_log_draw(prim, nverts, st, st->tex_w, st->tex_h);
         return 1;
     }
+    if (pre_hit_slot >= 0) {
+        if (!seto_ge_gpu_enqueue_draw(prim, verts, nverts, st, fbo_slot,
+                                      NULL, pre_hit_slot, -1, hash)) {
+            ge_note_reject("queue", prim, nverts, st);
+            return 0;
+        }
+        g_prod_tex[pre_hit_slot].lru = ++g_prod_lru;
+        ge_log_draw(prim, nverts, st, tw, th);
+        return 1;
+    }
     if (!tex_px) {
         if (!seto_ge_gpu_enqueue_draw(prim, verts, nverts, st, fbo_slot,
-                                      NULL, -1, -1)) {
+                                      NULL, -1, -1, 0u)) {
             ge_note_reject("queue", prim, nverts, st);
             return 0;
         }
@@ -651,8 +740,9 @@ static int ge_emit_chunk(int prim, const psp_vertex *verts, int nverts,
     int victim = 0;
     for (int i = 0; i < GE_TEX_CACHE_SLOTS; i++) {
         const ge_prod_tex_slot *s = &g_prod_tex[i];
-        if (s->valid && s->addr == taddr && s->w == tw && s->h == th &&
-            s->fmt == st->tex_fmt && s->swz == st->tex_swizzle && s->hash == hash) {
+        if (s->valid && s->addr == taddr && s->bw == st->tex_bw &&
+            s->w == tw && s->h == th && s->fmt == st->tex_fmt &&
+            s->swz == st->tex_swizzle && s->hash == hash) {
             hit = i;
             break;
         }
@@ -661,18 +751,22 @@ static int ge_emit_chunk(int prim, const psp_vertex *verts, int nverts,
     }
     if (hit >= 0) {
         if (!seto_ge_gpu_enqueue_draw(prim, verts, nverts, st, fbo_slot,
-                                      NULL, hit, -1)) {
+                                      NULL, hit, -1, hash)) {
             ge_note_reject("queue", prim, nverts, st);
             return 0;
         }
         g_prod_tex[hit].lru = ++g_prod_lru;
+        if (has_raw_hash) {
+            g_prod_tex[hit].has_raw_hash = 1;
+            g_prod_tex[hit].raw_hash = raw_hash;
+        }
         ge_log_draw(prim, nverts, st, tw, th);
         return 1;
     }
     uint32_t *copy = ge_tex_copy(tex_px, tw, th);
     if (!copy) return 0;
     if (!seto_ge_gpu_enqueue_draw(prim, verts, nverts, st, fbo_slot,
-                                  copy, victim, -1)) {
+                                  copy, victim, -1, hash)) {
         free(copy);
         g_prod_tex[victim].valid = 0;
         ge_note_reject("queue", prim, nverts, st);
@@ -682,10 +776,13 @@ static int ge_emit_chunk(int prim, const psp_vertex *verts, int nverts,
     g_prod_tex[victim].addr = taddr;
     g_prod_tex[victim].end_addr =
         taddr + ge_tex_byte_span(st->tex_bw, tw, th, st->tex_fmt);
+    g_prod_tex[victim].bw = st->tex_bw;
     g_prod_tex[victim].w = tw;
     g_prod_tex[victim].h = th;
     g_prod_tex[victim].fmt = st->tex_fmt;
     g_prod_tex[victim].swz = st->tex_swizzle;
+    g_prod_tex[victim].has_raw_hash = has_raw_hash;
+    g_prod_tex[victim].raw_hash = raw_hash;
     g_prod_tex[victim].hash = hash;
     g_prod_tex[victim].lru = ++g_prod_lru;
     ge_log_draw(prim, nverts, st, tw, th);
@@ -701,13 +798,17 @@ typedef struct {
     int tw, th;
     uint64_t hash;
     int fbo_tex_slot;
+    int pre_hit_slot;
+    int has_raw_hash;
+    uint64_t raw_hash;
     int failed;
 } ge_tri_batch;
 
 static void ge_batch_flush(ge_tri_batch *b) {
     if (b->failed || b->n <= 0) { b->n = 0; return; }
     if (!ge_emit_chunk(PSP_PRIM_TRIANGLES, b->verts, b->n, b->st, b->fbo_slot,
-                       b->tex_px, b->tw, b->th, b->hash, b->fbo_tex_slot)) {
+                       b->tex_px, b->tw, b->th, b->hash, b->fbo_tex_slot,
+                       b->pre_hit_slot, b->has_raw_hash, b->raw_hash)) {
         b->failed = 1;
     }
     b->n = 0;
@@ -809,6 +910,9 @@ static void ge_draw(int prim, const psp_vertex *v, int count,
     int tw = 0, th = 0;
     uint64_t tex_hash = 0;
     int fbo_tex_slot = -1;
+    int pre_hit_slot = -1;
+    int has_raw_hash = 0;
+    uint64_t raw_hash = 0;
     if (st->tex_enable && !st->clear) {
         fbo_tex_slot = ge_find_tex_fbo(st);
         if (fbo_tex_slot < 0) {
@@ -817,19 +921,39 @@ static void ge_draw(int prim, const psp_vertex *v, int count,
                     ge_vram_addr(st->tex_addr),
                     ge_tex_byte_span(st->tex_bw, st->tex_w, st->tex_h, st->tex_fmt));
             }
-            if (!psp_render_texture_rgba(st, &tex_px, &tw, &th)) {
-                ge_note_reject("decode", prim, count, st);
-                ge_sw_fallback_draw(prim, v, count, st, slot, draw_h);
-                return;
+            const char *trace_txt = getenv("SETO_TRACE_TEXT");
+            has_raw_hash = ge_compute_raw_tex_hash(st, &raw_hash);
+            if (has_raw_hash && (!trace_txt || !trace_txt[0])) {
+                const uint32_t taddr = ge_vram_addr(st->tex_addr);
+                for (int i = 0; i < GE_TEX_CACHE_SLOTS; i++) {
+                    const ge_prod_tex_slot *s = &g_prod_tex[i];
+                    if (s->valid && s->has_raw_hash && s->addr == taddr &&
+                        s->bw == st->tex_bw && s->w == st->tex_w &&
+                        s->h == st->tex_h && s->fmt == st->tex_fmt &&
+                        s->swz == st->tex_swizzle && s->raw_hash == raw_hash) {
+                        pre_hit_slot = i;
+                        tw = s->w;
+                        th = s->h;
+                        tex_hash = s->hash;
+                        break;
+                    }
+                }
             }
-            tex_hash = ge_tex_hash(tex_px, tw, th);
-            if (!ge_logged_tex) {
-                ge_logged_tex = 1;
-                fprintf(stderr, "render: first GL texture %dx%d fmt=%d\n", tw, th,
-                        st->tex_fmt);
+            if (pre_hit_slot < 0) {
+                if (!psp_render_texture_rgba(st, &tex_px, &tw, &th)) {
+                    ge_note_reject("decode", prim, count, st);
+                    ge_sw_fallback_draw(prim, v, count, st, slot, draw_h);
+                    return;
+                }
+                tex_hash = ge_tex_hash(tex_px, tw, th);
+                if (!ge_logged_tex) {
+                    ge_logged_tex = 1;
+                    fprintf(stderr, "render: first GL texture %dx%d fmt=%d\n", tw, th,
+                            st->tex_fmt);
+                }
+                if (tw <= 256 && th <= 256)
+                    ge_trace_text(prim, v, count, st, tw, th, tex_px);
             }
-            if (tw <= 256 && th <= 256)
-                ge_trace_text(prim, v, count, st, tw, th, tex_px);
         }
     }
 
@@ -848,10 +972,12 @@ static void ge_draw(int prim, const psp_vertex *v, int count,
             const int n = ge_sprites_to_tris(v + off, pairs * 2, sprites);
             if (!n) continue;
             if (!ge_emit_chunk(PSP_PRIM_TRIANGLES, sprites, n, &sp_st, slot,
-                               tex_px, tw, th, tex_hash, fbo_tex_slot)) {
+                               tex_px, tw, th, tex_hash, fbo_tex_slot,
+                               pre_hit_slot, has_raw_hash, raw_hash)) {
                 emitted_ok = 0;
                 break;
             }
+            if (tex_px && pre_hit_slot < 0) pre_hit_slot = -1; /* slot updated after 1st chunk */
         }
     } else if (prim == PSP_PRIM_POINTS) {
         psp_vertex pts[GE_MAX_VERTS];
@@ -861,7 +987,8 @@ static void ge_draw(int prim, const psp_vertex *v, int count,
             pts[n++] = v[i];
             if (n == GE_MAX_VERTS) {
                 if (!ge_emit_chunk(PSP_PRIM_POINTS, pts, n, st, slot,
-                                   tex_px, tw, th, tex_hash, fbo_tex_slot)) {
+                                   tex_px, tw, th, tex_hash, fbo_tex_slot,
+                                   pre_hit_slot, has_raw_hash, raw_hash)) {
                     emitted_ok = 0;
                     break;
                 }
@@ -870,7 +997,8 @@ static void ge_draw(int prim, const psp_vertex *v, int count,
         }
         if (emitted_ok && n > 0) {
             if (!ge_emit_chunk(PSP_PRIM_POINTS, pts, n, st, slot,
-                               tex_px, tw, th, tex_hash, fbo_tex_slot))
+                               tex_px, tw, th, tex_hash, fbo_tex_slot,
+                               pre_hit_slot, has_raw_hash, raw_hash))
                 emitted_ok = 0;
         }
     } else if (prim == PSP_PRIM_LINES || prim == PSP_PRIM_LINE_STRIP) {
@@ -887,7 +1015,8 @@ static void ge_draw(int prim, const psp_vertex *v, int count,
             }
             if (n + 2 > GE_MAX_VERTS) {
                 if (!ge_emit_chunk(PSP_PRIM_LINES, lines, n, st, slot,
-                                   tex_px, tw, th, tex_hash, fbo_tex_slot)) {
+                                   tex_px, tw, th, tex_hash, fbo_tex_slot,
+                                   pre_hit_slot, has_raw_hash, raw_hash)) {
                     emitted_ok = 0;
                     break;
                 }
@@ -898,7 +1027,8 @@ static void ge_draw(int prim, const psp_vertex *v, int count,
         }
         if (emitted_ok && n > 0) {
             if (!ge_emit_chunk(PSP_PRIM_LINES, lines, n, st, slot,
-                               tex_px, tw, th, tex_hash, fbo_tex_slot))
+                               tex_px, tw, th, tex_hash, fbo_tex_slot,
+                               pre_hit_slot, has_raw_hash, raw_hash))
                 emitted_ok = 0;
         }
     } else {
@@ -911,6 +1041,9 @@ static void ge_draw(int prim, const psp_vertex *v, int count,
         b.th = th;
         b.hash = tex_hash;
         b.fbo_tex_slot = fbo_tex_slot;
+        b.pre_hit_slot = pre_hit_slot;
+        b.has_raw_hash = has_raw_hash;
+        b.raw_hash = raw_hash;
         b.failed = 0;
         if (prim == PSP_PRIM_TRIANGLES) {
             for (int i = 0; i + 2 < count; i += 3)
@@ -1039,9 +1172,14 @@ static void ge_sync(void) {
     }
 }
 
+static __thread int g_in_raw_disp_read;
+
 static uint32_t *ge_capture_ram_frame_bottom_up(void) {
     uint32_t top_down[480 * 272];
-    if (psp_display_read(top_down) != 0) return NULL;
+    g_in_raw_disp_read = 1;
+    const int ok = (psp_display_read(top_down) == 0);
+    g_in_raw_disp_read = 0;
+    if (!ok) return NULL;
     uint32_t *out = (uint32_t *)malloc(sizeof top_down);
     if (!out) return NULL;
     for (int y = 0; y < 272; y++)
@@ -1101,7 +1239,7 @@ static void ge_present(void) {
     }
     if (disp_slot >= 0) {
         ge_prod_fbo *df = &g_prod_fbos[disp_slot];
-        if (!oracle && df->dirty)
+        if (!oracle && df->dirty && getenv("SETO_GE_EAGER_SYNC"))
             ge_sync_fbo_to_vram(disp_slot);
         df->drawn_since_present = 0;
         df->last_vram_sig = ge_vram_sample_sig(disp_addr, disp_stride, disp_fmt);
@@ -1132,7 +1270,21 @@ static void ge_present(void) {
     seto_ge_gpu_present(disp_slot, ram_frame, cap);
 }
 
+static int ge_read_display(uint32_t *out) {
+    if (!out || g_in_raw_disp_read || ge_sw_oracle() ||
+        !seto_ge_gpu_draw_mode() || !seto_gl_present_active() ||
+        !seto_gl_present_has_gpu_frame())
+        return -1;
+    uint32_t disp_addr = 0, disp_stride = 0;
+    int disp_fmt = 3;
+    psp_display_get_framebuf(&disp_addr, &disp_stride, &disp_fmt);
+    disp_addr = ge_vram_addr(disp_addr);
+    if (!ge_is_vram_target(disp_addr, disp_stride, disp_fmt))
+        return -1;
+    return seto_ge_gpu_read_front(out);
+}
+
 const psp_render_backend seto_ge_backend = {
     "gl", ge_init, ge_shutdown, ge_set_target, ge_draw, ge_finish, ge_present,
-    ge_transfer, ge_sync
+    ge_transfer, ge_sync, ge_read_display
 };

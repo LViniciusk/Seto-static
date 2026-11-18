@@ -1,6 +1,6 @@
 # GE GPU backend — architecture and plan
 
-Status: design; M0 (OpenGL presenter) implemented on `feat/gl-present-m0`.
+Status: complete; M0–M5 implemented and validated on `feat/gl-present-m0`.
 No PR until the GE backend is complete.
 
 ## Goal
@@ -109,15 +109,40 @@ The software renderer remains authoritative until M3:
 
 - **M0** (done): OpenGL 3.3 presenter, shared 480x272 texture, Lanczos2,
   `SETO_PRESENT=gl`, GDI fallback, launcher selector.
-- **M1**: GPU thread + queue/context plumbing; `psp_render_gl` frontend that
-  runs software + enqueues snapshots; GPU draws untextured colored primitives
-  to an FBO; window presents the FBO. Test: duel board primitives vs software.
-- **M2**: textured draws: formats/CLUT/swizzle, combine, filtering. Test:
-  cards/UI/3D textures vs software captures.
-- **M3**: framebuffer manager: FBO per target, readbacks, framebuffer textures,
-  block transfers, effects; per-draw fallback.
-- **M4**: physical scale 1x/2x/4x/10x; 2D smart filtering; resize; present.
-- **M5**: MSAA, HD texture replacement, post filters, performance.
+- **M1** (done): GPU thread + SPSC ring queue + shared context; untextured
+  GE primitives drawn to an FBO and presented to the window.
+- **M2** (done): textured draws (formats/CLUT/swizzle, combine modes, alpha/
+  color/stencil/depth tests, blending, fog, LMODE specular) verified against
+  software lockstep captures.
+- **M3** (done): authoritative multi-target FBO manager (`GE_MAX_FBOS=16`),
+  on-demand readbacks, FBO-as-texture + self-texturing, `GE_TRXKICK` blits,
+  per-draw software fallbacks with VRAM<->FBO sync, RAM display buffer path.
+- **M4** (done): physical scale `1x..10x` / `auto`, subpixel 3D vertex
+  precision (`fx, fy, clip_w`), smart 2D texel-edge scaling, dynamic resize,
+  and scaled FBO-to-FBO blits/readbacks.
+- **M5** (done): on-demand display readback hook (`psp_render_backend.read_display`),
+  lazy `ge_present` VRAM sync, raw texel + CLUT FNV-1a pre-hash skipping CPU
+  texture decode on cache hits, pre-allocated `glBufferSubData` VBO +
+  `glFenceSync`/`glWaitSync` non-blocking sync, hardware 3D MSAA (`2x/4x/8x`),
+  GDI+ PNG HD texture dump & replacement (`SETO_DUMP_TEX_DIR` /
+  `SETO_HD_TEX_DIR`), post-processing shaders (`CAS`, `PSP LCD`, `CRT`),
+  composited OpenGL FPS HUD & OSK overlay, and launcher controls.
+
+## M5 Environment Variables & Launcher Controls
+
+- `SETO_RENDERER=gl`: Select `seto_ge_backend` (software remains default).
+- `SETO_PRESENT=gl`: Enable the OpenGL 3.3 presenter window.
+- `SETO_GE_GPU=draw`: Run the GE command queue + OpenGL 3.3 GPU renderer.
+- `SETO_RENDER_SCALE=auto|1..10`: Internal render resolution multiplier.
+- `SETO_SMART_2D=1|0`: Enable/disable crisp smart-2D filtering on non-HD 2D sprites.
+- `SETO_MSAA=0|2|4|8`: Hardware MSAA sample count for 3D draws (clamped to `GL_MAX_SAMPLES` and adaptively capped to `<= 21M` samples/FBO at extreme internal scales unless `SETO_FORCE_MSAA=1`; disabled automatically for through-mode 2D and clear passes).
+- `SETO_FILTER=0|1|2`: Window present scaler (`0` nearest, `1` bilinear, `2` Lanczos2).
+- `SETO_POST_FILTER=0|1|2|3` (or `off|cas|lcd|crt`): Presenter post-processing filter.
+- `SETO_DUMP_TEX_DIR=<dir>`: Dump unique decoded textures once as `<16-hex-hash>.png`.
+- `SETO_HD_TEX_DIR=<dir>`: Load upscaled `<16-hex-hash>.png` or `.ppm` texture overrides.
+- `SETO_GL_HUD=1|0`: Toggle the OpenGL FPS/VPS badge overlay (default on).
+- `SETO_GE_EAGER_SYNC=1`: Force synchronous VRAM readback on every `ge_present`.
+- `SETO_GL_PRESENT_SHOT_DIR=<dir>` / `SETO_GL_PRESENT_SHOT_EVERY=<N>`: Capture presented backbuffer PPMs including post filters and GL overlays.
 
 ## Testing
 

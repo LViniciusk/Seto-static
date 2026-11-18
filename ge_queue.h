@@ -31,6 +31,7 @@ typedef struct {
     int32_t  sy;
     int32_t  dx;
     int32_t  dy;
+    uint64_t tex_hash;
     /* Heap payload owned by the queue / GPU thread and freed after use (or on
      * ge_queue_destroy): decoded RGBA8888 texture on GE_CMD_DRAW, bottom-up
      * RGBA8888 target upload on GE_CMD_UPLOAD_TARGET, or bottom-up 480x272
@@ -67,6 +68,9 @@ typedef struct {
 int  ge_queue_init(ge_queue *q, uint32_t capacity); /* power of two */
 void ge_queue_destroy(ge_queue *q);
 int  ge_queue_push(ge_queue *q, ge_cmd c);          /* 0 = full */
+int  ge_queue_push_ptr(ge_queue *q, const ge_cmd *c);
 int  ge_queue_pop(ge_queue *q, ge_cmd *out);        /* 0 = empty */
+const ge_cmd *ge_queue_peek(const ge_queue *q);
+void ge_queue_drop(ge_queue *q);
 
 #endif

@@ -8,12 +8,15 @@ $repoRoot = $PSScriptRoot
 $iniPath = Join-Path $repoRoot 'launcher.ini'
 
 $defaults = [ordered]@{
-    scale  = '2'
-    filter = '0'
-    present = '0'
-    iso    = ''
-    eboot  = 'build/s7-eboot-reloc.elf'
-    flash0 = ''
+    scale        = '2'
+    render_scale = 'auto'
+    msaa         = '0'
+    filter       = '0'
+    post_filter  = '0'
+    present      = '0'
+    iso          = ''
+    eboot        = 'build/s7-eboot-reloc.elf'
+    flash0       = ''
 }
 
 function Load-Config {
@@ -82,17 +85,20 @@ function Start-Game($cfg, [switch]$DryRun) {
     $env:SETO_FILTER = [string]$cfg.filter
     if ($cfg.present -eq 'gl' -or $cfg.present -eq 'ge' -or $cfg.present -eq 'ged') {
         $env:SETO_PRESENT = 'gl'
+        $env:SETO_POST_FILTER = [string]$cfg.post_filter
     }
     if ($cfg.present -eq 'ge') { $env:SETO_GE_GPU = 'test' }
     if ($cfg.present -eq 'ged') {
         $env:SETO_GE_GPU = 'draw'
         $env:SETO_RENDERER = 'gl'
+        $env:SETO_RENDER_SCALE = [string]$cfg.render_scale
+        $env:SETO_MSAA = [string]$cfg.msaa
     }
 
     if ($DryRun) {
         Write-Output "exe: $exe"
         Write-Output "args: $gameArgs"
-        Write-Output "env: SETO_MANUAL=1 SETO_HOLD_WINDOW=1 SETO_SCALE=$($cfg.scale) SETO_FILTER=$($cfg.filter)"
+        Write-Output "env: SETO_MANUAL=1 SETO_HOLD_WINDOW=1 SETO_SCALE=$($cfg.scale) SETO_FILTER=$($cfg.filter) SETO_RENDER_SCALE=$($cfg.render_scale) SETO_MSAA=$($cfg.msaa) SETO_POST_FILTER=$($cfg.post_filter)"
         Write-Output "present: $($cfg.present)"
         Write-Output "flash0: $flash0"
         return
@@ -119,11 +125,32 @@ $filterLabels = [ordered]@{
     'Bilinear (smooth)'     = '1'
     'Bicubic (high quality)' = '2'
 }
+$renderScaleLabels = [ordered]@{
+    'Auto (match window)' = 'auto'
+    '1x (480 x 272)'       = '1'
+    '2x (960 x 544)'       = '2'
+    '3x (1440 x 816)'      = '3'
+    '4x (1920 x 1088)'     = '4'
+    '6x (2880 x 1632)'     = '6'
+    '8x (3840 x 2176)'     = '8'
+}
+$msaaLabels = [ordered]@{
+    'Off' = '0'
+    '2x'  = '2'
+    '4x'  = '4'
+    '8x'  = '8'
+}
+$postFilterLabels = [ordered]@{
+    'Off'           = '0'
+    'CAS Sharpen'   = '1'
+    'PSP LCD'       = '2'
+    'CRT Scanlines' = '3'
+}
 $presentLabels = [ordered]@{
-    'GDI (default)'         = '0'
-    'OpenGL 3.3 (M0)'       = 'gl'
-    'OpenGL GE test (M1.0)' = 'ge'
-    'OpenGL GE draw (M1.1)' = 'ged'
+    'GDI (default)'                    = '0'
+    'OpenGL 3.3 Presenter (M0)'        = 'gl'
+    'OpenGL GE test (M1.0)'            = 'ge'
+    'OpenGL 3.3 GE GPU Hardware (M5)'  = 'ged'
 }
 
 $form = New-Object System.Windows.Forms.Form
@@ -132,7 +159,7 @@ $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
 $form.MinimizeBox = $false
-$form.ClientSize = New-Object System.Drawing.Size(560, 340)
+$form.ClientSize = New-Object System.Drawing.Size(560, 440)
 
 function Add-Label($text, $y) {
     $l = New-Object System.Windows.Forms.Label
@@ -147,6 +174,9 @@ Add-Label 'ISO' 81
 Add-Label 'EBOOT' 114
 Add-Label 'flash0' 147
 Add-Label 'Presenter' 180
+Add-Label 'Internal Scale' 213
+Add-Label 'MSAA (3D)' 246
+Add-Label 'Post Filter' 279
 
 $scaleBox = New-Object System.Windows.Forms.ComboBox
 $scaleBox.DropDownStyle = 'DropDownList'
@@ -181,38 +211,65 @@ $presentBox.SetBounds(130, 177, 410, 24)
 foreach ($k in $presentLabels.Keys) { [void]$presentBox.Items.Add($k) }
 $form.Controls.Add($presentBox)
 
+$renderScaleBox = New-Object System.Windows.Forms.ComboBox
+$renderScaleBox.DropDownStyle = 'DropDownList'
+$renderScaleBox.SetBounds(130, 210, 410, 24)
+foreach ($k in $renderScaleLabels.Keys) { [void]$renderScaleBox.Items.Add($k) }
+$form.Controls.Add($renderScaleBox)
+
+$msaaBox = New-Object System.Windows.Forms.ComboBox
+$msaaBox.DropDownStyle = 'DropDownList'
+$msaaBox.SetBounds(130, 243, 410, 24)
+foreach ($k in $msaaLabels.Keys) { [void]$msaaBox.Items.Add($k) }
+$form.Controls.Add($msaaBox)
+
+$postFilterBox = New-Object System.Windows.Forms.ComboBox
+$postFilterBox.DropDownStyle = 'DropDownList'
+$postFilterBox.SetBounds(130, 276, 410, 24)
+foreach ($k in $postFilterLabels.Keys) { [void]$postFilterBox.Items.Add($k) }
+$form.Controls.Add($postFilterBox)
+
 $scaleLabel = ($scaleLabels.Keys | Where-Object { $scaleLabels[$_] -eq [string]$cfg.scale } | Select-Object -First 1)
 $filterLabel = ($filterLabels.Keys | Where-Object { $filterLabels[$_] -eq [string]$cfg.filter } | Select-Object -First 1)
 $presentLabel = ($presentLabels.Keys | Where-Object { $presentLabels[$_] -eq [string]$cfg.present } | Select-Object -First 1)
+$renderScaleLabel = ($renderScaleLabels.Keys | Where-Object { $renderScaleLabels[$_] -eq [string]$cfg.render_scale } | Select-Object -First 1)
+$msaaLabel = ($msaaLabels.Keys | Where-Object { $msaaLabels[$_] -eq [string]$cfg.msaa } | Select-Object -First 1)
+$postFilterLabel = ($postFilterLabels.Keys | Where-Object { $postFilterLabels[$_] -eq [string]$cfg.post_filter } | Select-Object -First 1)
 $scaleBox.SelectedItem = if ($scaleLabel) { $scaleLabel } else { '960 x 544 (2x)' }
 $filterBox.SelectedItem = if ($filterLabel) { $filterLabel } else { 'Nearest (crisp)' }
 $presentBox.SelectedItem = if ($presentLabel) { $presentLabel } else { 'GDI (default)' }
+$renderScaleBox.SelectedItem = if ($renderScaleLabel) { $renderScaleLabel } else { 'Auto (match window)' }
+$msaaBox.SelectedItem = if ($msaaLabel) { $msaaLabel } else { 'Off' }
+$postFilterBox.SelectedItem = if ($postFilterLabel) { $postFilterLabel } else { 'Off' }
 
 $status = New-Object System.Windows.Forms.Label
-$status.SetBounds(12, 213, 530, 40)
+$status.SetBounds(12, 312, 530, 40)
 $status.ForeColor = [System.Drawing.Color]::DarkRed
 $form.Controls.Add($status)
 
 $startBtn = New-Object System.Windows.Forms.Button
 $startBtn.Text = 'Play'
-$startBtn.SetBounds(130, 260, 120, 30)
+$startBtn.SetBounds(130, 360, 120, 30)
 $form.Controls.Add($startBtn)
 $form.AcceptButton = $startBtn
 
 $saveBtn = New-Object System.Windows.Forms.Button
 $saveBtn.Text = 'Save'
-$saveBtn.SetBounds(260, 260, 120, 30)
+$saveBtn.SetBounds(260, 360, 120, 30)
 $form.Controls.Add($saveBtn)
 
 $cancelBtn = New-Object System.Windows.Forms.Button
 $cancelBtn.Text = 'Cancel'
-$cancelBtn.SetBounds(390, 260, 120, 30)
+$cancelBtn.SetBounds(390, 360, 120, 30)
 $form.Controls.Add($cancelBtn)
 
 function Update-Config {
     $cfg.scale = $scaleLabels[[string]$scaleBox.SelectedItem]
     $cfg.filter = $filterLabels[[string]$filterBox.SelectedItem]
     $cfg.present = $presentLabels[[string]$presentBox.SelectedItem]
+    $cfg.render_scale = $renderScaleLabels[[string]$renderScaleBox.SelectedItem]
+    $cfg.msaa = $msaaLabels[[string]$msaaBox.SelectedItem]
+    $cfg.post_filter = $postFilterLabels[[string]$postFilterBox.SelectedItem]
     $cfg.iso = $isoBox.Text.Trim()
     $cfg.eboot = $ebootBox.Text.Trim()
     $cfg.flash0 = $flashBox.Text.Trim()

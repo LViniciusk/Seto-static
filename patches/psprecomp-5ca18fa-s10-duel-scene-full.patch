@@ -183,7 +183,7 @@ index 132306f..e5ab735 100644
   * hot path in any recompiled game; correctness first. */
  static inline float psp_fsqrt(float v) {
 diff --git a/include/psprecomp/render.h b/include/psprecomp/render.h
-index 81ee925..9c66c4c 100644
+index 81ee925..88d5476 100644
 --- a/include/psprecomp/render.h
 +++ b/include/psprecomp/render.h
 @@ -24,6 +24,9 @@ typedef struct {
@@ -236,7 +236,7 @@ index 81ee925..9c66c4c 100644
  } psp_draw_state;
  
  typedef struct {
-@@ -107,6 +136,15 @@ typedef struct {
+@@ -107,6 +136,19 @@ typedef struct {
  
      /* sceDisplaySetFrameBuf -- show what has accumulated. */
      void (*present)(void);
@@ -249,10 +249,14 @@ index 81ee925..9c66c4c 100644
 +
 +    /* Flush GPU-rendered targets back to guest VRAM. Optional (may be NULL). */
 +    void (*sync)(void);
++
++    /* Read current 480x272 display frame (top-down 0xAABBGGRR). Optional;
++     * returns 0 on success or -1 to fall back to reading guest VRAM. */
++    int  (*read_display)(uint32_t *out_480x272);
  } psp_render_backend;
  
  /* Select a backend by name ("software", "null", ...). Returns 0 on success,
-@@ -116,6 +154,17 @@ int psp_render_select(const char *name);
+@@ -116,6 +158,17 @@ int psp_render_select(const char *name);
  /* The active backend. Never NULL -- defaults to software. */
  const psp_render_backend *psp_render_current(void);
  
@@ -270,7 +274,7 @@ index 81ee925..9c66c4c 100644
  /* Backends provided by the runtime. */
  extern const psp_render_backend psp_render_software;
  extern const psp_render_backend psp_render_null;
-@@ -127,6 +176,11 @@ void     psp_render_reset_pixels(void);
+@@ -127,6 +180,11 @@ void     psp_render_reset_pixels(void);
  /* One pixel in format 0-3 (565, 5551, 4444, 8888) as 0xAABBGGRR. The 16-bit
   * formats replicate their high bits into the low ones. */
  uint32_t psp_color_expand(uint32_t px, int fmt);
@@ -699,7 +703,7 @@ index 0000000..2d76123
 +    psp_hle_register(0x6A8C3CD5, "sceAtrac3plus", "sceAtracDecodeData",         hle_AtracDecodeData);
 +}
 diff --git a/src/hle/display.c b/src/hle/display.c
-index 73f6653..fa42363 100644
+index 73f6653..7ef78a1 100644
 --- a/src/hle/display.c
 +++ b/src/hle/display.c
 @@ -12,6 +12,7 @@
@@ -767,7 +771,7 @@ index 73f6653..fa42363 100644
  /* Write the current framebuffer as a binary PPM. Returns 0 on success, -1 if
   * no framebuffer has been set yet (which is itself worth knowing during
   * bring-up: the game never got as far as showing anything). */
-@@ -65,6 +100,26 @@ int psp_display_capture(const char *path) {
+@@ -65,14 +100,45 @@ int psp_display_capture(const char *path) {
      return 0;
  }
  
@@ -794,8 +798,13 @@ index 73f6653..fa42363 100644
  /* The front buffer, converted, for a window or a capture. Read while the game
   * runs: a frame being drawn into the *back* buffer is never seen, which is the
   * point of the game double-buffering. */
-@@ -73,6 +128,13 @@ int psp_display_read(uint32_t *out) {
+ int psp_display_read(uint32_t *out) {
++    if (!out) return -1;
+     const uint32_t addr = g_fb_addr, stride = g_fb_width, fmt = g_fb_format;
      if (!addr) return -1;
++    if (psp_render_current()->read_display &&
++        psp_render_current()->read_display(out) == 0)
++        return 0;
      const int bpp = (fmt == PSP_DISPLAY_PIXEL_FORMAT_8888) ? 4 : 2;
      for (int y = 0; y < PSP_SCREEN_H; y++) {
 +        const uint32_t row = addr + (uint32_t)(y * (int)stride) * (uint32_t)bpp;
@@ -808,7 +817,7 @@ index 73f6653..fa42363 100644
          for (int x = 0; x < PSP_SCREEN_W; x++) {
              uint32_t at = addr + (uint32_t)(y * (int)stride + x) * (uint32_t)bpp;
              uint32_t px = (bpp == 4) ? psp_read32(at) : psp_read16(at);
-@@ -82,6 +144,18 @@ int psp_display_read(uint32_t *out) {
+@@ -82,6 +148,18 @@ int psp_display_read(uint32_t *out) {
      return 0;
  }
  
@@ -827,7 +836,7 @@ index 73f6653..fa42363 100644
  /* ---- the calls ----------------------------------------------------------- */
  
  static void hle_SetMode(void) {
-@@ -97,6 +171,20 @@ static void hle_SetFrameBuf(void) {
+@@ -97,6 +175,22 @@ static void hle_SetFrameBuf(void) {
      g_fb_width  = psp_arg(1);
      g_fb_format = psp_arg(2);
      if (!g_fb_width) g_fb_width = 512;
@@ -838,7 +847,9 @@ index 73f6653..fa42363 100644
 +    if (g_fb_addr) {
 +        present_lock_ensure();
 +        host_mutex_lock(&g_present_lock);
-+        if (psp_display_read(g_present_px) == 0) {
++        if (psp_render_current()->read_display) {
++            g_present_valid = 0;
++        } else if (psp_display_read(g_present_px) == 0) {
 +            g_present_valid = 1;
 +            g_present_last_us = host_deadline_us();
 +        }
@@ -848,7 +859,7 @@ index 73f6653..fa42363 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -115,9 +203,21 @@ static void hle_WaitVblank(void) {
+@@ -115,9 +209,21 @@ static void hle_WaitVblank(void) {
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
@@ -4606,7 +4617,7 @@ index 7e4aff8..5092b53 100644
      free(b);
  
 diff --git a/src/render.c b/src/render.c
-index 6a20fb4..435825e 100644
+index 6a20fb4..c66ca65 100644
 --- a/src/render.c
 +++ b/src/render.c
 @@ -9,14 +9,18 @@
@@ -8912,7 +8923,7 @@ index 6a20fb4..435825e 100644
  const psp_render_backend psp_render_software = {
 -    "software", sw_init, sw_shutdown, sw_target, sw_draw, sw_noop, sw_noop
 +    "software", sw_init, sw_shutdown, sw_target, sw_draw, sw_noop, sw_noop,
-+    NULL, NULL
++    NULL, NULL, NULL
  };
  
  /* ---- null backend -------------------------------------------------------- */
@@ -8922,7 +8933,7 @@ index 6a20fb4..435825e 100644
  const psp_render_backend psp_render_null = {
 -    "null", null_init, null_noop, null_target, null_draw, null_noop, null_noop
 +    "null", null_init, null_noop, null_target, null_draw, null_noop, null_noop,
-+    NULL, NULL
++    NULL, NULL, NULL
  };
  
  /* ---- selection ----------------------------------------------------------- */
@@ -10040,7 +10051,7 @@ index b41d6ef..30e595d 100644
      psp_mem_free();
  
 diff --git a/tests/test_raster.c b/tests/test_raster.c
-index 0f821b5..bf85e5a 100644
+index 0f821b5..5cdfd61 100644
 --- a/tests/test_raster.c
 +++ b/tests/test_raster.c
 @@ -16,6 +16,7 @@
@@ -10351,7 +10362,7 @@ index 0f821b5..bf85e5a 100644
      CHECK(psp_ge_pixels() == 4 * 16, "indexed sprites drew the same boxes again: %llu pixels",
            (unsigned long long)psp_ge_pixels());
  }
-@@ -666,9 +774,726 @@ static void lit_quad(float lx, float lz) {
+@@ -666,9 +774,754 @@ static void lit_quad(float lx, float lz) {
  
  static void test_lighting(void) {
      lit_quad(0, 1);
@@ -10975,7 +10986,7 @@ index 0f821b5..bf85e5a 100644
 +    /* 3. Backend hooks: finish, transfer, sync, display framebuf & present order. */
 +    static const psp_render_backend mock_be = {
 +        "m3-mock", mock_m3_init, mock_m3_shutdown, mock_m3_target,
-+        mock_m3_draw, mock_m3_finish, mock_m3_present, mock_m3_transfer, mock_m3_sync
++        mock_m3_draw, mock_m3_finish, mock_m3_present, mock_m3_transfer, mock_m3_sync, NULL
 +    };
 +    memset(&g_m3_mock, 0, sizeof g_m3_mock);
 +    psp_render_set_backend(&mock_be);
@@ -11048,7 +11059,7 @@ index 0f821b5..bf85e5a 100644
 +static void test_m4_subpixel_vertex(void) {
 +    static const psp_render_backend cap_be = {
 +        "m4-cap", mock_m3_init, mock_m3_shutdown, mock_m3_target,
-+        mock_m4_draw, mock_m3_finish, mock_m3_present, NULL, NULL
++        mock_m4_draw, mock_m3_finish, mock_m3_present, NULL, NULL, NULL
 +    };
 +    g_m4_count = 0;
 +    psp_render_set_backend(&cap_be);
@@ -11077,10 +11088,38 @@ index 0f821b5..bf85e5a 100644
 +          "m4 subpixel fx keeps fractional part: %g", (double)g_m4_captured[0].fx);
 +    CHECK(g_m4_captured[0].clip_w == 1.0f, "m4 clip_w set cleanly: %g", (double)g_m4_captured[0].clip_w);
 +    psp_render_set_backend(&psp_render_software);
++}
++
++static int g_m5_rd_calls;
++static int g_m5_rd_ret;
++static int mock_m5_read_display(uint32_t *out) {
++    g_m5_rd_calls++;
++    if (g_m5_rd_ret != 0) return g_m5_rd_ret;
++    for (int i = 0; i < 480 * 272; i++) out[i] = 0xAA112233u;
++    return 0;
++}
++
++static void test_m5_read_display(void) {
++    static const psp_render_backend rd_be = {
++        "m5-rd", mock_m3_init, mock_m3_shutdown, mock_m3_target,
++        mock_m4_draw, mock_m3_finish, NULL, NULL, NULL, mock_m5_read_display
++    };
++    static uint32_t buf[480 * 272];
++    g_m5_rd_calls = 0;
++    g_m5_rd_ret = 0;
++    psp_write32(FB, 0xFF445566u);
++    psp_render_set_backend(&rd_be);
++    call(0x289D82FEu, FB, 512, 3, 0);
++    CHECK(psp_display_read(buf) == 0 && g_m5_rd_calls == 1 && buf[0] == 0xAA112233u,
++          "m5 read_display hook overrides VRAM read");
++    g_m5_rd_ret = -1;
++    CHECK(psp_display_read(buf) == 0 && g_m5_rd_calls == 2 && buf[0] == 0xFF445566u,
++          "m5 read_display -1 falls back to VRAM");
++    psp_render_set_backend(&psp_render_software);
  }
  
  int main(void) {
-@@ -690,10 +1515,74 @@ int main(void) {
+@@ -690,10 +1543,75 @@ int main(void) {
      test_clear_mode_and_scissor();
      test_dxt1();
      test_depth();
@@ -11152,6 +11191,7 @@ index 0f821b5..bf85e5a 100644
 +
 +    test_m3_backend_hooks();
 +    test_m4_subpixel_vertex();
++    test_m5_read_display();
  
      psp_mem_free();
      printf(failures ? "raster: %d failure(s)\n" : "raster: all tests passed\n", failures);

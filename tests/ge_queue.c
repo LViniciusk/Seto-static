@@ -1,5 +1,6 @@
 #include "ge_queue.h"
 
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,12 +44,13 @@ int main(void) {
         }
     }
 
-    /* Verify GE_CMD_DRAW payload copy (tex_slot, count, verts, tex pointer). */
+    /* Verify GE_CMD_DRAW payload copy (tex_slot, tex_hash, count, verts, tex pointer). */
     memset(&c, 0, sizeof c);
     c.type = GE_CMD_DRAW;
     c.prim = PSP_PRIM_TRIANGLES;
     c.count = 1;
     c.tex_slot = 7;
+    c.tex_hash = 0x0123456789ABCDEFULL;
     c.tex = (uint32_t *)malloc(16);
     if (!c.tex) return fail("malloc tex");
     c.tex[0] = 0xDEADBEEFu;
@@ -61,7 +63,8 @@ int main(void) {
     }
     memset(&c, 0, sizeof c);
     if (!ge_queue_pop(&q, &c)) return fail("pop draw");
-    if (c.type != GE_CMD_DRAW || c.tex_slot != 7 || c.count != 1 ||
+    if (c.type != GE_CMD_DRAW || c.tex_slot != 7 ||
+        c.tex_hash != 0x0123456789ABCDEFULL || c.count != 1 ||
         c.verts[0].x != 123 || c.verts[0].y != 45 || c.verts[0].rgba != 0x11223344u ||
         !c.tex || c.tex[0] != 0xDEADBEEFu) {
         free(c.tex);
@@ -117,6 +120,21 @@ int main(void) {
     memset(&c, 0, sizeof c);
     if (!ge_queue_pop(&q, &c) || c.type != GE_CMD_RESIZE || c.w != 4)
         return fail("pop resize");
+
+    /* Verify push_ptr, peek, and drop without full struct copy. */
+    if (ge_queue_peek(&q) != NULL) return fail("peek empty");
+    memset(&c, 0, offsetof(ge_cmd, verts));
+    c.type = GE_CMD_DRAW;
+    c.prim = PSP_PRIM_TRIANGLES;
+    c.count = 3;
+    c.verts[0].x = 10; c.verts[1].x = 20; c.verts[2].x = 30;
+    if (!ge_queue_push_ptr(&q, &c)) return fail("push_ptr draw");
+    const ge_cmd *pk = ge_queue_peek(&q);
+    if (!pk || pk->type != GE_CMD_DRAW || pk->count != 3 ||
+        pk->verts[0].x != 10 || pk->verts[2].x != 30)
+        return fail("peek draw mismatch");
+    ge_queue_drop(&q);
+    if (ge_queue_peek(&q) != NULL) return fail("peek after drop");
 
     /* Leave unpopped commands with malloc'd tex so destroy cleans them up. */
     memset(&c, 0, sizeof c);

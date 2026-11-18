@@ -973,16 +973,16 @@ static void enter_free_duel(void) {
         fprintf(stderr, "input: free duel play start=%d\n",
                 psp_duel_manager_start_requested());
         if (psp_duel_manager_start_requested()) {
-            for (int i = 0; i < 20 && !psp_exit_requested(); i++) {
+            for (int i = 0; i < 24 && !psp_exit_requested(); i++) {
                 Sleep(2500);
-                if (getenv("SETO_DUEL_ADVANCE") && (i == 2 || i == 4 || i == 6 || i == 8)) {
+                if (getenv("SETO_DUEL_ADVANCE") && (i >= 2 && i <= 14 && (i % 2) == 0)) {
                     psp_ctrl_set(PSP_CTRL_CROSS, 128, 128);
-                    Sleep(60);
+                    Sleep(140);
                     psp_ctrl_set(0, 128, 128);
                 }
-                if (getenv("SETO_DUEL_ADVANCE") && i == 13) {
+                if (getenv("SETO_DUEL_ADVANCE") && i == 16) {
                     psp_ctrl_set(PSP_CTRL_TRIANGLE, 128, 128);
-                    Sleep(60);
+                    Sleep(140);
                     psp_ctrl_set(0, 128, 128);
                 }
                 if (getenv("SETO_TRACE_DUEL") && (i == 3 || i == 7 || i == 11 || i == 14 || i == 16))
