@@ -17,6 +17,8 @@ $defaults = [ordered]@{
     iso          = ''
     eboot        = 'build/s7-eboot-reloc.elf'
     flash0       = ''
+    server       = ''
+    nickname     = ''
 }
 
 function Load-Config {
@@ -94,12 +96,19 @@ function Start-Game($cfg, [switch]$DryRun) {
         $env:SETO_RENDER_SCALE = [string]$cfg.render_scale
         $env:SETO_MSAA = [string]$cfg.msaa
     }
+    if (![string]::IsNullOrWhiteSpace($cfg.server)) {
+        $env:SETO_SERVER = [string]$cfg.server
+    }
+    if (![string]::IsNullOrWhiteSpace($cfg.nickname)) {
+        $env:SETO_NICKNAME = [string]$cfg.nickname
+    }
 
     if ($DryRun) {
         Write-Output "exe: $exe"
         Write-Output "args: $gameArgs"
         Write-Output "env: SETO_MANUAL=1 SETO_HOLD_WINDOW=1 SETO_SCALE=$($cfg.scale) SETO_FILTER=$($cfg.filter) SETO_RENDER_SCALE=$($cfg.render_scale) SETO_MSAA=$($cfg.msaa) SETO_POST_FILTER=$($cfg.post_filter)"
         Write-Output "present: $($cfg.present)"
+        Write-Output "net: server=$($cfg.server) nickname=$($cfg.nickname)"
         Write-Output "flash0: $flash0"
         return
     }
@@ -159,7 +168,7 @@ $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
 $form.MinimizeBox = $false
-$form.ClientSize = New-Object System.Drawing.Size(560, 440)
+$form.ClientSize = New-Object System.Drawing.Size(560, 506)
 
 function Add-Label($text, $y) {
     $l = New-Object System.Windows.Forms.Label
@@ -177,6 +186,8 @@ Add-Label 'Presenter' 180
 Add-Label 'Internal Scale' 213
 Add-Label 'MSAA (3D)' 246
 Add-Label 'Post Filter' 279
+Add-Label 'Server (host:port)' 312
+Add-Label 'Nickname' 345
 
 $scaleBox = New-Object System.Windows.Forms.ComboBox
 $scaleBox.DropDownStyle = 'DropDownList'
@@ -229,6 +240,16 @@ $postFilterBox.SetBounds(130, 276, 410, 24)
 foreach ($k in $postFilterLabels.Keys) { [void]$postFilterBox.Items.Add($k) }
 $form.Controls.Add($postFilterBox)
 
+$serverBox = New-Object System.Windows.Forms.TextBox
+$serverBox.SetBounds(130, 309, 410, 24)
+$serverBox.Text = [string]$cfg.server
+$form.Controls.Add($serverBox)
+
+$nicknameBox = New-Object System.Windows.Forms.TextBox
+$nicknameBox.SetBounds(130, 342, 410, 24)
+$nicknameBox.Text = [string]$cfg.nickname
+$form.Controls.Add($nicknameBox)
+
 $scaleLabel = ($scaleLabels.Keys | Where-Object { $scaleLabels[$_] -eq [string]$cfg.scale } | Select-Object -First 1)
 $filterLabel = ($filterLabels.Keys | Where-Object { $filterLabels[$_] -eq [string]$cfg.filter } | Select-Object -First 1)
 $presentLabel = ($presentLabels.Keys | Where-Object { $presentLabels[$_] -eq [string]$cfg.present } | Select-Object -First 1)
@@ -243,24 +264,24 @@ $msaaBox.SelectedItem = if ($msaaLabel) { $msaaLabel } else { 'Off' }
 $postFilterBox.SelectedItem = if ($postFilterLabel) { $postFilterLabel } else { 'Off' }
 
 $status = New-Object System.Windows.Forms.Label
-$status.SetBounds(12, 312, 530, 40)
+$status.SetBounds(12, 378, 530, 40)
 $status.ForeColor = [System.Drawing.Color]::DarkRed
 $form.Controls.Add($status)
 
 $startBtn = New-Object System.Windows.Forms.Button
 $startBtn.Text = 'Play'
-$startBtn.SetBounds(130, 360, 120, 30)
+$startBtn.SetBounds(130, 426, 120, 30)
 $form.Controls.Add($startBtn)
 $form.AcceptButton = $startBtn
 
 $saveBtn = New-Object System.Windows.Forms.Button
 $saveBtn.Text = 'Save'
-$saveBtn.SetBounds(260, 360, 120, 30)
+$saveBtn.SetBounds(260, 426, 120, 30)
 $form.Controls.Add($saveBtn)
 
 $cancelBtn = New-Object System.Windows.Forms.Button
 $cancelBtn.Text = 'Cancel'
-$cancelBtn.SetBounds(390, 360, 120, 30)
+$cancelBtn.SetBounds(390, 426, 120, 30)
 $form.Controls.Add($cancelBtn)
 
 function Update-Config {
@@ -273,6 +294,8 @@ function Update-Config {
     $cfg.iso = $isoBox.Text.Trim()
     $cfg.eboot = $ebootBox.Text.Trim()
     $cfg.flash0 = $flashBox.Text.Trim()
+    $cfg.server = $serverBox.Text.Trim()
+    $cfg.nickname = $nicknameBox.Text.Trim()
 }
 
 $startBtn.Add_Click({
