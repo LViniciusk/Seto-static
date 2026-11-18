@@ -1,12 +1,14 @@
-/* M2 frontend: keep the software renderer authoritative for guest VRAM and
- * enqueue a snapshot of every supported draw. Textures are decoded to
- * RGBA8888 by the runtime's cache/decoder so both backends share one oracle,
- * with a lockstep producer-side cache to avoid redundant GPU uploads. */
+/* M3 frontend: GPU FBOs are authoritative in hardware mode (`SETO_GL_SHOT_DIR`
+ * and `SETO_GE_SW_ORACLE=1` unset), supporting up to GE_MAX_FBOS VRAM render
+ * targets, FBO-as-texture with self-texturing, per-draw software fallbacks
+ * with VRAM<->FBO sync/upload, GE_TRXKICK block transfers, and display-aware
+ * presentation (including RAM display buffers such as decoded .pmf frames). */
 
 #include "gl_present.h"
 #include "ge_queue.h"
 
 #include <psprecomp/hle.h>
+#include <psprecomp/mem.h>
 #include <psprecomp/render.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,23 +17,381 @@
 static int ge_logged_draw;
 static int ge_logged_tex;
 static int g_target_fmt = 3;
-static uint32_t g_target_addr;
+static uint32_t g_target_addr = PSP_VRAM_BASE;
 static uint32_t g_target_stride = 512u;
 
 typedef struct {
     int valid;
     uint32_t addr;
+    uint32_t end_addr;
     int w, h, fmt, swz;
     uint64_t hash;
     uint32_t lru;
 } ge_prod_tex_slot;
 
+typedef struct {
+    int      used;
+    uint32_t addr;
+    uint32_t stride;
+    int      fmt;
+    int      w;
+    int      h;
+    int      used_h;
+    uint32_t zaddr;
+    int      zbw;
+    int      dirty;
+    int      z_dirty;
+    int      stencil_written;
+    uint32_t lru;
+} ge_prod_fbo;
+
 static ge_prod_tex_slot g_prod_tex[GE_TEX_CACHE_SLOTS];
 static uint32_t g_prod_lru;
+
+static ge_prod_fbo g_prod_fbos[GE_MAX_FBOS];
+static uint32_t g_fbo_lru;
+static int g_cur_gpu_slot = -1;
+
+static uint32_t ge_vram_addr(uint32_t addr) {
+    const uint32_t raw = addr & PSP_ADDR_MASK;
+    if (raw < PSP_VRAM_SIZE) return PSP_VRAM_BASE | raw;
+    return raw;
+}
+
+static int ge_is_vram_target(uint32_t addr, uint32_t stride, int fmt) {
+    return addr >= PSP_VRAM_BASE && addr < PSP_VRAM_BASE + PSP_VRAM_SIZE &&
+           stride > 0u && stride <= 1024u && fmt >= 0 && fmt <= 3;
+}
+
+static int ge_sw_oracle(void) {
+    const char *dir = getenv("SETO_GL_SHOT_DIR");
+    if (dir && dir[0]) return 1;
+    const char *orac = getenv("SETO_GE_SW_ORACLE");
+    return orac && orac[0] && orac[0] != '0';
+}
+
+static uint32_t ge_fmt_bpp(int fmt) {
+    return fmt == 3 ? 4u : 2u;
+}
+
+static uint32_t ge_tex_byte_span(int bw, int tw, int th, int fmt) {
+    const uint64_t stride = (uint64_t)(bw > 0 ? bw : tw);
+    const uint64_t rows = (uint64_t)(th > 0 ? th : 1);
+    uint64_t bytes = 0;
+    if (fmt == PSP_TPSM_T4 || fmt == PSP_TPSM_DXT1)
+        bytes = (stride * rows + 1u) / 2u;
+    else if (fmt == PSP_TPSM_T8 || fmt == PSP_TPSM_DXT3 || fmt == PSP_TPSM_DXT5)
+        bytes = stride * rows;
+    else if (fmt == PSP_TPSM_8888 || fmt == PSP_TPSM_T32)
+        bytes = stride * rows * 4u;
+    else
+        bytes = stride * rows * 2u;
+    if (bytes > PSP_VRAM_SIZE) bytes = PSP_VRAM_SIZE;
+    return (uint32_t)bytes;
+}
 
 static void ge_prod_cache_reset(void) {
     memset(g_prod_tex, 0, sizeof g_prod_tex);
     g_prod_lru = 0;
+    memset(g_prod_fbos, 0, sizeof g_prod_fbos);
+    g_fbo_lru = 0;
+    g_cur_gpu_slot = -1;
+}
+
+static void ge_invalidate_tex_range(uint32_t addr, uint32_t bytes) {
+    if (bytes == 0u) return;
+    const uint64_t end = (uint64_t)addr + (uint64_t)bytes;
+    for (int i = 0; i < GE_TEX_CACHE_SLOTS; i++) {
+        if (!g_prod_tex[i].valid) continue;
+        if ((uint64_t)g_prod_tex[i].addr < end && (uint64_t)g_prod_tex[i].end_addr > addr)
+            g_prod_tex[i].valid = 0;
+    }
+}
+
+static int ge_max_vram_rows(uint32_t addr, uint32_t stride, int fmt) {
+    const uint32_t bpp = ge_fmt_bpp(fmt);
+    if (addr < PSP_VRAM_BASE || addr >= PSP_VRAM_BASE + PSP_VRAM_SIZE || stride == 0u)
+        return 1;
+    const uint32_t avail = (PSP_VRAM_BASE + PSP_VRAM_SIZE) - addr;
+    const uint32_t row_bytes = stride * bpp;
+    uint32_t rows = avail / row_bytes;
+    if (rows < 1u) rows = 1u;
+    if (rows > 1024u) rows = 1024u;
+    return (int)rows;
+}
+
+static int ge_fbo_safe_rows(int slot) {
+    const ge_prod_fbo *f = &g_prod_fbos[slot];
+    const uint32_t bpp = ge_fmt_bpp(f->fmt);
+    uint32_t limit = PSP_VRAM_BASE + PSP_VRAM_SIZE;
+    for (int i = 0; i < GE_MAX_FBOS; i++) {
+        if (i == slot || !g_prod_fbos[i].used) continue;
+        if (g_prod_fbos[i].addr > f->addr && g_prod_fbos[i].addr < limit)
+            limit = g_prod_fbos[i].addr;
+    }
+    if (f->zaddr > f->addr && f->zaddr < limit)
+        limit = f->zaddr;
+    const uint32_t row_bytes = f->stride * bpp;
+    uint32_t rows = (limit - f->addr) / (row_bytes ? row_bytes : 4u);
+    if (rows < 1u) rows = 1u;
+    if (rows > (uint32_t)f->h) rows = (uint32_t)f->h;
+    return (int)rows;
+}
+
+static int ge_sync_fbo_to_vram(int slot) {
+    if (slot < 0 || slot >= GE_MAX_FBOS) return 0;
+    ge_prod_fbo *f = &g_prod_fbos[slot];
+    if (!f->used || !f->dirty) return 0;
+    if (!seto_ge_gpu_draw_mode() || !seto_gl_present_active() || ge_sw_oracle())
+        return 0;
+
+    int w = f->w;
+    if (w > (int)f->stride) w = (int)f->stride;
+    int h = f->used_h > 0 ? f->used_h : 1;
+    const int safe_h = ge_fbo_safe_rows(slot);
+    if (h > safe_h) h = safe_h;
+    if (w <= 0 || h <= 0) return 0;
+
+    const size_t npx = (size_t)w * (size_t)h;
+    uint32_t *rgba = (uint32_t *)malloc(npx * sizeof(uint32_t));
+    if (!rgba) return -1;
+    const int need_ds = f->z_dirty || (f->stencil_written && f->fmt != 0);
+    uint32_t *ds = need_ds ? (uint32_t *)malloc(npx * sizeof(uint32_t)) : NULL;
+    if (need_ds && !ds) {
+        free(rgba);
+        return -1;
+    }
+
+    if (seto_ge_gpu_readback(slot, w, h, rgba, ds) != 0) {
+        free(ds);
+        free(rgba);
+        return -1;
+    }
+
+    const uint32_t bpp = ge_fmt_bpp(f->fmt);
+    for (int y = 0; y < h; y++) {
+        const uint32_t *srow = rgba + (size_t)(h - 1 - y) * (size_t)w;
+        const uint32_t *drow = ds ? ds + (size_t)(h - 1 - y) * (size_t)w : NULL;
+        const uint32_t raddr = f->addr + (uint32_t)y * f->stride * bpp;
+        void *vp = psp_mem_unwatched_ptr(raddr, (uint32_t)w * bpp);
+        if (f->fmt == 3) {
+            if (vp && !(f->stencil_written && drow)) {
+                memcpy(vp, srow, (size_t)w * 4u);
+            } else if (vp) {
+                uint32_t *dst32 = (uint32_t *)vp;
+                for (int x = 0; x < w; x++)
+                    dst32[x] = (srow[x] & 0x00FFFFFFu) | ((drow[x] & 0xFFu) << 24);
+            } else {
+                for (int x = 0; x < w; x++) {
+                    uint32_t c = srow[x];
+                    if (f->stencil_written && drow)
+                        c = (c & 0x00FFFFFFu) | ((drow[x] & 0xFFu) << 24);
+                    psp_write32(raddr + (uint32_t)x * 4u, c);
+                }
+            }
+        } else {
+            uint16_t *dst16 = (uint16_t *)vp;
+            for (int x = 0; x < w; x++) {
+                uint32_t c = srow[x];
+                if (f->stencil_written && drow && f->fmt != 0)
+                    c = (c & 0x00FFFFFFu) | ((drow[x] & 0xFFu) << 24);
+                const uint16_t p = (uint16_t)psp_color_pack(c, f->fmt);
+                if (dst16) dst16[x] = p;
+                else psp_write16(raddr + (uint32_t)x * 2u, p);
+            }
+        }
+
+        if (f->z_dirty && drow && f->zaddr && f->zbw > 0) {
+            const uint32_t zr = f->zaddr + (uint32_t)y * (uint32_t)f->zbw * 2u;
+            if (zr >= PSP_VRAM_BASE &&
+                (uint64_t)zr + (uint64_t)w * 2u <= PSP_VRAM_BASE + PSP_VRAM_SIZE) {
+                uint16_t *zp = (uint16_t *)psp_mem_unwatched_ptr(zr, (uint32_t)w * 2u);
+                for (int x = 0; x < w; x++) {
+                    const uint32_t d24 = drow[x] >> 8;
+                    const uint16_t z16 = (uint16_t)(((16777215ULL - d24) * 65535ULL +
+                                                     8388607ULL) / 16777215ULL);
+                    if (zp) zp[x] = z16;
+                    else psp_write16(zr + (uint32_t)x * 2u, z16);
+                }
+            }
+        }
+    }
+
+    f->dirty = 0;
+    f->z_dirty = 0;
+    free(ds);
+    free(rgba);
+    return 0;
+}
+
+static void ge_sync_overlapping_fbos(uint32_t addr, uint32_t bytes) {
+    if (bytes == 0u || ge_sw_oracle()) return;
+    const uint64_t end = (uint64_t)addr + (uint64_t)bytes;
+    for (int i = 0; i < GE_MAX_FBOS; i++) {
+        const ge_prod_fbo *f = &g_prod_fbos[i];
+        if (!f->used || !f->dirty) continue;
+        const int h = f->used_h > 0 ? f->used_h : f->h;
+        const uint64_t fend = (uint64_t)f->addr +
+                              (uint64_t)h * (uint64_t)f->stride * ge_fmt_bpp(f->fmt);
+        if ((uint64_t)f->addr < end && fend > addr)
+            ge_sync_fbo_to_vram(i);
+    }
+}
+
+static int ge_upload_vram_to_fbo(int slot, int h) {
+    if (slot < 0 || slot >= GE_MAX_FBOS) return 0;
+    ge_prod_fbo *f = &g_prod_fbos[slot];
+    if (!f->used) return 0;
+    if (h <= 0) h = 1;
+    const int max_r = ge_max_vram_rows(f->addr, f->stride, f->fmt);
+    if (h > f->h) h = f->h;
+    if (h > max_r) h = max_r;
+    const int w = f->w;
+    if (w <= 0 || h <= 0) return 0;
+
+    uint32_t *rgba = (uint32_t *)malloc((size_t)w * (size_t)h * sizeof(uint32_t));
+    if (!rgba) return 0;
+
+    const uint32_t bpp = ge_fmt_bpp(f->fmt);
+    for (int y = 0; y < h; y++) {
+        uint32_t *drow = rgba + (size_t)(h - 1 - y) * (size_t)w;
+        const uint32_t raddr = f->addr + (uint32_t)y * f->stride * bpp;
+        const void *vp = psp_mem_unwatched_ptr(raddr, (uint32_t)w * bpp);
+        if (f->fmt == 3) {
+            if (vp) memcpy(drow, vp, (size_t)w * 4u);
+            else {
+                for (int x = 0; x < w; x++)
+                    drow[x] = psp_read32(raddr + (uint32_t)x * 4u);
+            }
+        } else {
+            const uint16_t *src16 = (const uint16_t *)vp;
+            for (int x = 0; x < w; x++) {
+                const uint16_t p = src16 ? src16[x]
+                                         : psp_read16(raddr + (uint32_t)x * 2u);
+                drow[x] = psp_color_expand(p, f->fmt);
+            }
+        }
+    }
+
+    if (!seto_ge_gpu_enqueue_upload(slot, w, h, rgba)) {
+        free(rgba);
+        return 0;
+    }
+    if (h > f->used_h) f->used_h = h;
+    ge_invalidate_tex_range(f->addr, (uint32_t)h * f->stride * bpp);
+    return 1;
+}
+
+static int ge_vram_has_nonzero(uint32_t addr, int w, int h, uint32_t stride, int fmt) {
+    const uint32_t bpp = ge_fmt_bpp(fmt);
+    const int max_r = ge_max_vram_rows(addr, stride, fmt);
+    if (h > max_r) h = max_r;
+    for (int y = 0; y < h; y++) {
+        const uint32_t raddr = addr + (uint32_t)y * stride * bpp;
+        const void *vp = psp_mem_unwatched_ptr(raddr, (uint32_t)w * bpp);
+        if (vp) {
+            const uint32_t nbytes = (uint32_t)w * bpp;
+            const uint8_t *p = (const uint8_t *)vp;
+            for (uint32_t i = 0; i < nbytes; i++)
+                if (p[i]) return 1;
+        } else if (bpp == 4u) {
+            for (int x = 0; x < w; x++)
+                if (psp_read32(raddr + (uint32_t)x * 4u)) return 1;
+        } else {
+            for (int x = 0; x < w; x++)
+                if (psp_read16(raddr + (uint32_t)x * 2u)) return 1;
+        }
+    }
+    return 0;
+}
+
+static int ge_find_fbo_exact(uint32_t addr) {
+    for (int i = 0; i < GE_MAX_FBOS; i++) {
+        if (g_prod_fbos[i].used && g_prod_fbos[i].addr == addr)
+            return i;
+    }
+    return -1;
+}
+
+static int ge_fbo_ensure(uint32_t addr, uint32_t stride, int fmt, int min_h) {
+    if (!ge_is_vram_target(addr, stride, fmt)) return -1;
+    const int max_r = ge_max_vram_rows(addr, stride, fmt);
+    const int want_w = (int)stride;
+    int init_h = min_h > 272 ? min_h : 272;
+    if (init_h > max_r) init_h = max_r;
+
+    int free_idx = -1;
+    int victim = 0;
+    for (int i = 0; i < GE_MAX_FBOS; i++) {
+        ge_prod_fbo *f = &g_prod_fbos[i];
+        if (!f->used) {
+            if (free_idx < 0) free_idx = i;
+            continue;
+        }
+        if (f->addr == addr) {
+            if (f->stride == stride && f->fmt == fmt) {
+                int new_h = f->h;
+                if (min_h > new_h) {
+                    new_h = min_h;
+                    if (new_h > max_r) new_h = max_r;
+                }
+                if (new_h > f->h || g_cur_gpu_slot != i) {
+                    if (!seto_ge_gpu_enqueue_target(i, f->addr, f->stride,
+                                                    f->fmt, f->w, new_h))
+                        return -1;
+                    f->h = new_h;
+                    g_cur_gpu_slot = i;
+                }
+                f->lru = ++g_fbo_lru;
+                return i;
+            }
+            free_idx = i;
+            break;
+        }
+        if (g_prod_fbos[victim].used && f->lru < g_prod_fbos[victim].lru)
+            victim = i;
+    }
+
+    int slot = free_idx >= 0 ? free_idx : victim;
+    ge_prod_fbo *f = &g_prod_fbos[slot];
+    if (f->used && free_idx < 0)
+        ge_sync_fbo_to_vram(slot);
+
+    memset(f, 0, sizeof *f);
+    f->used = 1;
+    f->addr = addr;
+    f->stride = stride;
+    f->fmt = fmt;
+    f->w = want_w;
+    f->h = init_h;
+    f->lru = ++g_fbo_lru;
+
+    if (!seto_ge_gpu_enqueue_target(slot, addr, stride, fmt, want_w, init_h)) {
+        f->used = 0;
+        return -1;
+    }
+    g_cur_gpu_slot = slot;
+
+    if (!ge_sw_oracle() && ge_vram_has_nonzero(addr, want_w, init_h, stride, fmt)) {
+        ge_upload_vram_to_fbo(slot, init_h);
+        f->dirty = 0;
+    }
+    return slot;
+}
+
+static int ge_find_tex_fbo(const psp_draw_state *st) {
+    if (!st || !st->tex_enable || st->clear) return -1;
+    if (st->tex_swizzle || st->tex_fmt < 0 || st->tex_fmt > 3) return -1;
+    const uint32_t taddr = ge_vram_addr(st->tex_addr);
+    for (int i = 0; i < GE_MAX_FBOS; i++) {
+        const ge_prod_fbo *f = &g_prod_fbos[i];
+        if (!f->used || f->addr != taddr) continue;
+        if (st->tex_fmt == f->fmt && (uint32_t)st->tex_bw == f->stride &&
+            st->tex_w > 0 && st->tex_h > 0 &&
+            st->tex_w <= f->w && st->tex_h <= f->h)
+            return i;
+    }
+    return -1;
 }
 
 static void ge_trace_text(int prim, const psp_vertex *v, int count, const psp_draw_state *st,
@@ -79,12 +439,11 @@ static void ge_shutdown(void) {
 }
 
 static void ge_set_target(uint32_t addr, uint32_t stride, int fmt) {
+    addr = ge_vram_addr(addr);
     g_target_addr = addr;
     g_target_stride = stride;
     g_target_fmt = fmt;
     psp_render_software.set_target(addr, stride, fmt);
-    if (seto_ge_gpu_draw_mode())
-        seto_ge_gpu_enqueue_target(addr, stride, fmt);
 }
 
 static int ge_rgb_mask_supported(uint32_t write_mask) {
@@ -97,10 +456,6 @@ static int ge_rgb_mask_supported(uint32_t write_mask) {
 }
 
 static int ge_state_supported(const psp_draw_state *st) {
-    /* M2: clear, 2D/3D textured draws, stencil, fog, specular lmode, ctest,
-     * alpha test with mask, zrange/depth, blend ops/SFIX/DFIX/2x-alpha, byte masks.
-     * Logic ops, partial channel bitmasks, GU_ABS blend, dst-alpha blend (4/5/8/9
-     * when blend_op <= 2), and 16-bit INCR/DECR stencil stay software. */
     if (!ge_rgb_mask_supported(st->write_mask)) return 0;
     if (st->clear) return 1;
     if (st->logic_enable) return 0;
@@ -162,10 +517,6 @@ static int ge_prim_supported(int prim, const psp_draw_state *st) {
     return prim >= PSP_PRIM_POINTS && prim <= PSP_PRIM_SPRITES;
 }
 
-/* A GE sprite is a pair of corners; the software samples it as an axis-aligned
- * rectangle with u along x and v along y, using the second corner's colour and
- * depth for every pixel. Expand each pair to two triangles with the matching
- * corner UVs. A 90-degree transposed blit is skipped (software-only for now). */
 static int ge_sprites_to_tris(const psp_vertex *v, int count, psp_vertex *out) {
     int n = 0;
     if ((count & 1) || count <= 0) return 0;
@@ -189,7 +540,6 @@ static int ge_sprites_to_tris(const psp_vertex *v, int count, psp_vertex *out) {
         bl.x = x0; bl.y = y1;
         br.x = x1; br.y = y1;
         if (transposed) {
-            /* The software's 90-degree blit: u runs along y, v along x. */
             const float duy = tdu / sdy, dvx = tdv / sdx;
             tl.u = a->u + (float)(y0 - a->y) * duy;
             tl.v = a->v + (float)(x0 - a->x) * dvx;
@@ -238,27 +588,39 @@ static void ge_log_draw(int prim, int n, const psp_draw_state *st, int tw, int t
 }
 
 static int ge_emit_chunk(int prim, const psp_vertex *verts, int nverts,
-                         const psp_draw_state *st, const uint32_t *tex_px,
-                         int tw, int th, int have_hash, uint64_t hash) {
+                         const psp_draw_state *st, int fbo_slot,
+                         const uint32_t *tex_px, int tw, int th,
+                         uint64_t hash, int fbo_tex_slot) {
     if (nverts <= 0) return 1;
     if (!seto_gl_present_active()) {
         ge_prod_cache_reset();
         return 0;
     }
+    if (fbo_tex_slot >= 0) {
+        if (!seto_ge_gpu_enqueue_draw(prim, verts, nverts, st, fbo_slot,
+                                      NULL, -1, fbo_tex_slot)) {
+            ge_note_reject("queue", prim, nverts, st);
+            return 0;
+        }
+        ge_log_draw(prim, nverts, st, st->tex_w, st->tex_h);
+        return 1;
+    }
     if (!tex_px) {
-        if (!seto_ge_gpu_enqueue_draw(prim, verts, nverts, st, NULL, -1)) {
+        if (!seto_ge_gpu_enqueue_draw(prim, verts, nverts, st, fbo_slot,
+                                      NULL, -1, -1)) {
             ge_note_reject("queue", prim, nverts, st);
             return 0;
         }
         ge_log_draw(prim, nverts, st, 0, 0);
         return 1;
     }
-    (void)have_hash;
+
+    const uint32_t taddr = ge_vram_addr(st->tex_addr);
     int hit = -1;
     int victim = 0;
     for (int i = 0; i < GE_TEX_CACHE_SLOTS; i++) {
         const ge_prod_tex_slot *s = &g_prod_tex[i];
-        if (s->valid && s->addr == st->tex_addr && s->w == tw && s->h == th &&
+        if (s->valid && s->addr == taddr && s->w == tw && s->h == th &&
             s->fmt == st->tex_fmt && s->swz == st->tex_swizzle && s->hash == hash) {
             hit = i;
             break;
@@ -267,7 +629,8 @@ static int ge_emit_chunk(int prim, const psp_vertex *verts, int nverts,
         if (!s->valid || s->lru < g_prod_tex[victim].lru) victim = i;
     }
     if (hit >= 0) {
-        if (!seto_ge_gpu_enqueue_draw(prim, verts, nverts, st, NULL, hit)) {
+        if (!seto_ge_gpu_enqueue_draw(prim, verts, nverts, st, fbo_slot,
+                                      NULL, hit, -1)) {
             ge_note_reject("queue", prim, nverts, st);
             return 0;
         }
@@ -277,14 +640,17 @@ static int ge_emit_chunk(int prim, const psp_vertex *verts, int nverts,
     }
     uint32_t *copy = ge_tex_copy(tex_px, tw, th);
     if (!copy) return 0;
-    if (!seto_ge_gpu_enqueue_draw(prim, verts, nverts, st, copy, victim)) {
+    if (!seto_ge_gpu_enqueue_draw(prim, verts, nverts, st, fbo_slot,
+                                  copy, victim, -1)) {
         free(copy);
         g_prod_tex[victim].valid = 0;
         ge_note_reject("queue", prim, nverts, st);
         return 0;
     }
     g_prod_tex[victim].valid = 1;
-    g_prod_tex[victim].addr = st->tex_addr;
+    g_prod_tex[victim].addr = taddr;
+    g_prod_tex[victim].end_addr =
+        taddr + ge_tex_byte_span(st->tex_bw, tw, th, st->tex_fmt);
     g_prod_tex[victim].w = tw;
     g_prod_tex[victim].h = th;
     g_prod_tex[victim].fmt = st->tex_fmt;
@@ -299,16 +665,18 @@ typedef struct {
     psp_vertex verts[GE_MAX_VERTS];
     int n;
     const psp_draw_state *st;
+    int fbo_slot;
     const uint32_t *tex_px;
     int tw, th;
     uint64_t hash;
+    int fbo_tex_slot;
     int failed;
 } ge_tri_batch;
 
 static void ge_batch_flush(ge_tri_batch *b) {
     if (b->failed || b->n <= 0) { b->n = 0; return; }
-    if (!ge_emit_chunk(PSP_PRIM_TRIANGLES, b->verts, b->n, b->st,
-                       b->tex_px, b->tw, b->th, b->tex_px != NULL, b->hash)) {
+    if (!ge_emit_chunk(PSP_PRIM_TRIANGLES, b->verts, b->n, b->st, b->fbo_slot,
+                       b->tex_px, b->tw, b->th, b->hash, b->fbo_tex_slot)) {
         b->failed = 1;
     }
     b->n = 0;
@@ -335,42 +703,103 @@ static void ge_batch_push_tri(ge_tri_batch *b, const psp_vertex *a,
     b->verts[b->n++] = vc;
 }
 
+static void ge_sw_fallback_draw(int prim, const psp_vertex *v, int count,
+                                const psp_draw_state *st, int slot, int draw_h) {
+    const int oracle = ge_sw_oracle();
+    if (!oracle) {
+        if (slot >= 0) ge_sync_fbo_to_vram(slot);
+        else ge_sync_overlapping_fbos(g_target_addr,
+                                      (uint32_t)draw_h * g_target_stride * ge_fmt_bpp(g_target_fmt));
+        if (st && st->tex_enable && !st->clear) {
+            ge_sync_overlapping_fbos(ge_vram_addr(st->tex_addr),
+                                     ge_tex_byte_span(st->tex_bw, st->tex_w, st->tex_h, st->tex_fmt));
+        }
+    }
+    psp_render_software.draw(prim, v, count, st);
+    if (slot >= 0) {
+        ge_prod_fbo *f = &g_prod_fbos[slot];
+        int up_h = f->used_h > draw_h ? f->used_h : draw_h;
+        const int safe_h = ge_fbo_safe_rows(slot);
+        if (up_h > safe_h) up_h = safe_h;
+        if (ge_upload_vram_to_fbo(slot, up_h))
+            f->dirty = 0;
+    } else {
+        ge_invalidate_tex_range(g_target_addr,
+                                (uint32_t)draw_h * g_target_stride * ge_fmt_bpp(g_target_fmt));
+    }
+}
+
 static void ge_draw(int prim, const psp_vertex *v, int count,
                     const psp_draw_state *st) {
-    psp_render_software.draw(prim, v, count, st);
-    if (!seto_ge_gpu_draw_mode()) return;
-    if (g_target_addr != 0u &&
-        (g_target_stride != 512u ||
-         (g_target_addr != 0x04000000u && g_target_addr != 0x04088000u &&
-          g_target_addr != 0x04044000u))) {
-        ge_note_reject("offscreen", prim, count, st);
+    const int oracle = ge_sw_oracle();
+    if (!seto_ge_gpu_draw_mode() || !seto_gl_present_active()) {
+        psp_render_software.draw(prim, v, count, st);
         return;
     }
-    if (!v || count <= 0) return;
-    if (!ge_state_supported(st)) { ge_note_reject("state", prim, count, st); return; }
-    if (!ge_prim_supported(prim, st)) { ge_note_reject("prim", prim, count, st); return; }
+    if (!v || count <= 0 || !st) return;
+
+    int draw_h = st->sc_y1 >= 0 ? st->sc_y1 + 1 : 272;
+    if (st->reg_enable && st->reg_y1 >= 0 && st->reg_y1 + 1 < draw_h)
+        draw_h = st->reg_y1 + 1;
+    if (draw_h < 1) draw_h = 1;
+    if (draw_h > 1024) draw_h = 1024;
+
+    if (!ge_is_vram_target(g_target_addr, g_target_stride, g_target_fmt)) {
+        ge_note_reject("offscreen", prim, count, st);
+        ge_sw_fallback_draw(prim, v, count, st, -1, draw_h);
+        return;
+    }
+
+    int slot = ge_fbo_ensure(g_target_addr, g_target_stride, g_target_fmt, draw_h);
+    if (slot < 0) {
+        psp_render_software.draw(prim, v, count, st);
+        return;
+    }
+
+    if (!ge_state_supported(st)) {
+        ge_note_reject("state", prim, count, st);
+        ge_sw_fallback_draw(prim, v, count, st, slot, draw_h);
+        return;
+    }
+    if (!ge_prim_supported(prim, st)) {
+        ge_note_reject("prim", prim, count, st);
+        ge_sw_fallback_draw(prim, v, count, st, slot, draw_h);
+        return;
+    }
 
     const uint32_t *tex_px = NULL;
     int tw = 0, th = 0;
     uint64_t tex_hash = 0;
+    int fbo_tex_slot = -1;
     if (st->tex_enable && !st->clear) {
-        if (!psp_render_texture_rgba(st, &tex_px, &tw, &th)) {
-            ge_note_reject("decode", prim, count, st);
-            return;
+        fbo_tex_slot = ge_find_tex_fbo(st);
+        if (fbo_tex_slot < 0) {
+            if (!oracle) {
+                ge_sync_overlapping_fbos(
+                    ge_vram_addr(st->tex_addr),
+                    ge_tex_byte_span(st->tex_bw, st->tex_w, st->tex_h, st->tex_fmt));
+            }
+            if (!psp_render_texture_rgba(st, &tex_px, &tw, &th)) {
+                ge_note_reject("decode", prim, count, st);
+                ge_sw_fallback_draw(prim, v, count, st, slot, draw_h);
+                return;
+            }
+            tex_hash = ge_tex_hash(tex_px, tw, th);
+            if (!ge_logged_tex) {
+                ge_logged_tex = 1;
+                fprintf(stderr, "render: first GL texture %dx%d fmt=%d\n", tw, th,
+                        st->tex_fmt);
+            }
+            if (tw <= 256 && th <= 256)
+                ge_trace_text(prim, v, count, st, tw, th, tex_px);
         }
-        tex_hash = ge_tex_hash(tex_px, tw, th);
-        if (!ge_logged_tex) {
-            ge_logged_tex = 1;
-            fprintf(stderr, "render: first GL texture %dx%d fmt=%d\n", tw, th,
-                    st->tex_fmt);
-        }
-        if (tw <= 256 && th <= 256)
-            ge_trace_text(prim, v, count, st, tw, th, tex_px);
     }
 
+    if (oracle)
+        psp_render_software.draw(prim, v, count, st);
+
+    int emitted_ok = 1;
     if (prim == PSP_PRIM_SPRITES) {
-        /* 85 sprites fill 510 verts (<= GE_MAX_VERTS) with two triangles each.
-         * Hardware sprites never backface-cull (unlike triangles). */
         const int max_pairs = GE_MAX_VERTS / 6;
         psp_vertex sprites[GE_MAX_VERTS];
         psp_draw_state sp_st = *st;
@@ -380,32 +809,33 @@ static void ge_draw(int prim, const psp_vertex *v, int count,
             if (pairs > max_pairs) pairs = max_pairs;
             const int n = ge_sprites_to_tris(v + off, pairs * 2, sprites);
             if (!n) continue;
-            if (!ge_emit_chunk(PSP_PRIM_TRIANGLES, sprites, n, &sp_st,
-                               tex_px, tw, th, tex_px != NULL, tex_hash))
-                return;
+            if (!ge_emit_chunk(PSP_PRIM_TRIANGLES, sprites, n, &sp_st, slot,
+                               tex_px, tw, th, tex_hash, fbo_tex_slot)) {
+                emitted_ok = 0;
+                break;
+            }
         }
-        return;
-    }
-
-    if (prim == PSP_PRIM_POINTS) {
+    } else if (prim == PSP_PRIM_POINTS) {
         psp_vertex pts[GE_MAX_VERTS];
         int n = 0;
         for (int i = 0; i < count; i++) {
             if (v[i].behind) continue;
             pts[n++] = v[i];
             if (n == GE_MAX_VERTS) {
-                if (!ge_emit_chunk(PSP_PRIM_POINTS, pts, n, st,
-                                   tex_px, tw, th, tex_px != NULL, tex_hash))
-                    return;
+                if (!ge_emit_chunk(PSP_PRIM_POINTS, pts, n, st, slot,
+                                   tex_px, tw, th, tex_hash, fbo_tex_slot)) {
+                    emitted_ok = 0;
+                    break;
+                }
                 n = 0;
             }
         }
-        if (n > 0)
-            ge_emit_chunk(PSP_PRIM_POINTS, pts, n, st, tex_px, tw, th, tex_px != NULL, tex_hash);
-        return;
-    }
-
-    if (prim == PSP_PRIM_LINES || prim == PSP_PRIM_LINE_STRIP) {
+        if (emitted_ok && n > 0) {
+            if (!ge_emit_chunk(PSP_PRIM_POINTS, pts, n, st, slot,
+                               tex_px, tw, th, tex_hash, fbo_tex_slot))
+                emitted_ok = 0;
+        }
+    } else if (prim == PSP_PRIM_LINES || prim == PSP_PRIM_LINE_STRIP) {
         psp_vertex lines[GE_MAX_VERTS];
         int n = 0;
         const int step = (prim == PSP_PRIM_LINES) ? 2 : 1;
@@ -418,50 +848,182 @@ static void ge_draw(int prim, const psp_vertex *v, int count,
                 va.spec = vb.spec;
             }
             if (n + 2 > GE_MAX_VERTS) {
-                if (!ge_emit_chunk(PSP_PRIM_LINES, lines, n, st,
-                                   tex_px, tw, th, tex_px != NULL, tex_hash))
-                    return;
+                if (!ge_emit_chunk(PSP_PRIM_LINES, lines, n, st, slot,
+                                   tex_px, tw, th, tex_hash, fbo_tex_slot)) {
+                    emitted_ok = 0;
+                    break;
+                }
                 n = 0;
             }
             lines[n++] = va;
             lines[n++] = vb;
         }
-        if (n > 0)
-            ge_emit_chunk(PSP_PRIM_LINES, lines, n, st, tex_px, tw, th, tex_px != NULL, tex_hash);
+        if (emitted_ok && n > 0) {
+            if (!ge_emit_chunk(PSP_PRIM_LINES, lines, n, st, slot,
+                               tex_px, tw, th, tex_hash, fbo_tex_slot))
+                emitted_ok = 0;
+        }
+    } else {
+        ge_tri_batch b;
+        b.n = 0;
+        b.st = st;
+        b.fbo_slot = slot;
+        b.tex_px = tex_px;
+        b.tw = tw;
+        b.th = th;
+        b.hash = tex_hash;
+        b.fbo_tex_slot = fbo_tex_slot;
+        b.failed = 0;
+        if (prim == PSP_PRIM_TRIANGLES) {
+            for (int i = 0; i + 2 < count; i += 3)
+                ge_batch_push_tri(&b, &v[i], &v[i + 1], &v[i + 2]);
+        } else if (prim == PSP_PRIM_TRIANGLE_STRIP) {
+            for (int i = 0; i + 2 < count; i++) {
+                if (i & 1) ge_batch_push_tri(&b, &v[i + 1], &v[i], &v[i + 2]);
+                else       ge_batch_push_tri(&b, &v[i], &v[i + 1], &v[i + 2]);
+            }
+        } else if (prim == PSP_PRIM_TRIANGLE_FAN) {
+            for (int i = 1; i + 1 < count; i++)
+                ge_batch_push_tri(&b, &v[0], &v[i], &v[i + 1]);
+        }
+        ge_batch_flush(&b);
+        if (b.failed) emitted_ok = 0;
+    }
+
+    if (!emitted_ok) {
+        if (!oracle) ge_sw_fallback_draw(prim, v, count, st, slot, draw_h);
         return;
     }
 
-    ge_tri_batch b;
-    b.n = 0;
-    b.st = st;
-    b.tex_px = tex_px;
-    b.tw = tw;
-    b.th = th;
-    b.hash = tex_hash;
-    b.failed = 0;
-    if (prim == PSP_PRIM_TRIANGLES) {
-        for (int i = 0; i + 2 < count; i += 3)
-            ge_batch_push_tri(&b, &v[i], &v[i + 1], &v[i + 2]);
-    } else if (prim == PSP_PRIM_TRIANGLE_STRIP) {
-        for (int i = 0; i + 2 < count; i++) {
-            if (i & 1) ge_batch_push_tri(&b, &v[i + 1], &v[i], &v[i + 2]);
-            else       ge_batch_push_tri(&b, &v[i], &v[i + 1], &v[i + 2]);
+    ge_prod_fbo *f = &g_prod_fbos[slot];
+    const int safe_h = ge_fbo_safe_rows(slot);
+    int uh = draw_h;
+    if (uh > safe_h) uh = safe_h;
+    if (uh > f->used_h) f->used_h = uh;
+    f->dirty = 1;
+    f->lru = ++g_fbo_lru;
+
+    if ((st->clear && st->clear_depth) || (!st->clear && st->ztest && st->zwrite)) {
+        const uint32_t za = ge_vram_addr(st->zaddr);
+        if (za >= PSP_VRAM_BASE && za < PSP_VRAM_BASE + PSP_VRAM_SIZE && st->zbw > 0) {
+            f->zaddr = za;
+            f->zbw = st->zbw;
+            f->z_dirty = 1;
         }
-    } else if (prim == PSP_PRIM_TRIANGLE_FAN) {
-        for (int i = 1; i + 1 < count; i++)
-            ge_batch_push_tri(&b, &v[0], &v[i], &v[i + 1]);
     }
-    ge_batch_flush(&b);
+    if (!st->clear && st->stencil)
+        f->stencil_written = 1;
+
+    ge_invalidate_tex_range(f->addr,
+                            (uint32_t)f->used_h * f->stride * ge_fmt_bpp(f->fmt));
 }
 
 static void ge_finish(void) {
     if (psp_render_software.finish) psp_render_software.finish();
 }
 
+static int ge_transfer(uint32_t src, int src_bw, int sx, int sy,
+                       uint32_t dst, int dst_bw, int dx, int dy,
+                       int w, int h, int bpp) {
+    if (!seto_ge_gpu_draw_mode() || !seto_gl_present_active())
+        return 0;
+
+    src = ge_vram_addr(src);
+    dst = ge_vram_addr(dst);
+    const int src_slot = ge_find_fbo_exact(src);
+    const int dst_slot = ge_find_fbo_exact(dst);
+    const int oracle = ge_sw_oracle();
+
+    if (src_slot >= 0 && dst_slot >= 0) {
+        ge_prod_fbo *sf = &g_prod_fbos[src_slot];
+        ge_prod_fbo *df = &g_prod_fbos[dst_slot];
+        if ((int)sf->stride == src_bw && (int)df->stride == dst_bw &&
+            sf->fmt == df->fmt && (int)ge_fmt_bpp(sf->fmt) == bpp &&
+            sx >= 0 && sy >= 0 && dx >= 0 && dy >= 0 &&
+            sx + w <= sf->w && sy + h <= sf->h &&
+            dx + w <= df->w && dy + h <= df->h) {
+            if (oracle) {
+                psp_render_software_transfer(src, src_bw, sx, sy,
+                                             dst, dst_bw, dx, dy, w, h, bpp);
+            }
+            if (seto_ge_gpu_enqueue_blit(src_slot, sx, sy, dst_slot, dx, dy, w, h)) {
+                if (dy + h > df->used_h) {
+                    const int safe = ge_fbo_safe_rows(dst_slot);
+                    df->used_h = (dy + h) < safe ? (dy + h) : safe;
+                }
+                df->dirty = 1;
+                ge_invalidate_tex_range(df->addr,
+                                        (uint32_t)df->used_h * df->stride * ge_fmt_bpp(df->fmt));
+                return 1;
+            }
+        }
+    }
+
+    const uint32_t s_end_row = (uint32_t)(sy + h);
+    const uint32_t d_end_row = (uint32_t)(dy + h);
+    if (!oracle) {
+        if (src_slot >= 0) ge_sync_fbo_to_vram(src_slot);
+        else ge_sync_overlapping_fbos(src, s_end_row * (uint32_t)src_bw * (uint32_t)bpp);
+
+        if (dst_slot >= 0) {
+            const ge_prod_fbo *df = &g_prod_fbos[dst_slot];
+            const int full_overwrite = (dx == 0 && dy == 0 && w >= df->w && h >= df->used_h);
+            if (!full_overwrite) ge_sync_fbo_to_vram(dst_slot);
+        } else {
+            ge_sync_overlapping_fbos(dst, d_end_row * (uint32_t)dst_bw * (uint32_t)bpp);
+        }
+    }
+
+    psp_render_software_transfer(src, src_bw, sx, sy, dst, dst_bw, dx, dy, w, h, bpp);
+
+    if (dst_slot >= 0) {
+        ge_prod_fbo *df = &g_prod_fbos[dst_slot];
+        int up_h = (int)d_end_row > df->used_h ? (int)d_end_row : df->used_h;
+        const int safe = ge_fbo_safe_rows(dst_slot);
+        if (up_h > safe) up_h = safe;
+        if (ge_upload_vram_to_fbo(dst_slot, up_h))
+            df->dirty = 0;
+    } else {
+        ge_invalidate_tex_range(dst, d_end_row * (uint32_t)dst_bw * (uint32_t)bpp);
+    }
+    return 1;
+}
+
+static void ge_sync(void) {
+    if (!seto_ge_gpu_draw_mode() || !seto_gl_present_active() || ge_sw_oracle())
+        return;
+    for (int i = 0; i < GE_MAX_FBOS; i++) {
+        if (g_prod_fbos[i].used && g_prod_fbos[i].dirty)
+            ge_sync_fbo_to_vram(i);
+    }
+}
+
+static uint32_t *ge_capture_ram_frame_bottom_up(void) {
+    uint32_t top_down[480 * 272];
+    if (psp_display_read(top_down) != 0) return NULL;
+    uint32_t *out = (uint32_t *)malloc(sizeof top_down);
+    if (!out) return NULL;
+    for (int y = 0; y < 272; y++)
+        memcpy(out + (size_t)(271 - y) * 480u, top_down + (size_t)y * 480u, 480u * 4u);
+    return out;
+}
+
 static void ge_present(void) {
     static uint32_t g_present_seq;
     if (psp_render_software.present) psp_render_software.present();
-    if (!seto_ge_gpu_draw_mode()) return;
+    if (!seto_ge_gpu_draw_mode() || !seto_gl_present_active()) return;
+
+    uint32_t disp_addr = 0, disp_stride = 0;
+    int disp_fmt = 3;
+    psp_display_get_framebuf(&disp_addr, &disp_stride, &disp_fmt);
+    (void)disp_stride;
+    (void)disp_fmt;
+    disp_addr = ge_vram_addr(disp_addr);
+
+    int disp_slot = ge_find_fbo_exact(disp_addr);
+    const int oracle = ge_sw_oracle();
+    if (disp_slot >= 0 && !oracle && g_prod_fbos[disp_slot].dirty)
+        ge_sync_fbo_to_vram(disp_slot);
 
     const uint32_t seq = ++g_present_seq;
     uint32_t cap = 0;
@@ -477,9 +1039,14 @@ static void ge_present(void) {
             cap = seq;
         }
     }
-    seto_ge_gpu_present(cap);
+
+    uint32_t *ram_frame = NULL;
+    if (disp_slot < 0)
+        ram_frame = ge_capture_ram_frame_bottom_up();
+    seto_ge_gpu_present(disp_slot, ram_frame, cap);
 }
 
 const psp_render_backend seto_ge_backend = {
-    "gl", ge_init, ge_shutdown, ge_set_target, ge_draw, ge_finish, ge_present
+    "gl", ge_init, ge_shutdown, ge_set_target, ge_draw, ge_finish, ge_present,
+    ge_transfer, ge_sync
 };

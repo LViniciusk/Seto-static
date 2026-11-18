@@ -11,6 +11,7 @@
  * guest pointers. */
 #define GE_MAX_VERTS 512
 #define GE_TEX_CACHE_SLOTS 64
+#define GE_MAX_FBOS 16
 
 typedef struct {
     uint32_t type;
@@ -20,11 +21,25 @@ typedef struct {
     uint32_t addr;
     uint32_t stride;
     uint32_t fmt;
+    int32_t  fbo_slot;
+    int32_t  src_slot;
     int32_t  tex_slot;
-    /* GE_CMD_DRAW: optional decoded RGBA8888 (tex_w * tex_h) upload payload for
-     * `tex_slot`, allocated by the guest thread and freed by the GPU thread.
-     * When `tex == NULL` and `tex_slot >= 0`, reuse the slot's cached GL tex. */
+    int32_t  fbo_tex_slot;
+    int32_t  w;
+    int32_t  h;
+    int32_t  sx;
+    int32_t  sy;
+    int32_t  dx;
+    int32_t  dy;
+    /* Heap payload owned by the queue / GPU thread and freed after use (or on
+     * ge_queue_destroy): decoded RGBA8888 texture on GE_CMD_DRAW, bottom-up
+     * RGBA8888 target upload on GE_CMD_UPLOAD_TARGET, or bottom-up 480x272
+     * RAM frame on GE_CMD_PRESENT when fbo_slot < 0. */
     uint32_t *tex;
+    /* Caller-owned synchronous output buffers for GE_CMD_READBACK (NOT freed
+     * by the GPU thread or ge_queue_destroy). */
+    uint32_t *rb_rgba;
+    uint32_t *rb_ds;
     psp_draw_state state;
     psp_vertex verts[GE_MAX_VERTS];
 } ge_cmd;
@@ -34,7 +49,10 @@ enum {
     GE_CMD_TARGET = 2,
     GE_CMD_DRAW = 3,
     GE_CMD_PRESENT = 4,
-    GE_CMD_QUIT = 5
+    GE_CMD_QUIT = 5,
+    GE_CMD_UPLOAD_TARGET = 6,
+    GE_CMD_BLIT = 7,
+    GE_CMD_READBACK = 8
 };
 
 typedef struct {

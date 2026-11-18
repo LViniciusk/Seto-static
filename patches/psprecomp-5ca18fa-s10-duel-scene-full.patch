@@ -29,7 +29,7 @@ index 331a13f..ee29f49 100644
   * calls are C calls, so it is one of three things:
   *  - a return, when `ra` is the current call's return site (or the call was
 diff --git a/include/psprecomp/hle.h b/include/psprecomp/hle.h
-index 59cb28d..995b619 100644
+index 59cb28d..b36cc74 100644
 --- a/include/psprecomp/hle.h
 +++ b/include/psprecomp/hle.h
 @@ -76,6 +76,12 @@ void psp_hle_dump_recent(FILE *out);
@@ -45,7 +45,7 @@ index 59cb28d..995b619 100644
  /* ---- o32 argument access ------------------------------------------------- */
  
  /* Arguments 0-3 arrive in $a0-$a3; 4 and beyond are on the stack, at $sp+16
-@@ -139,10 +145,15 @@ void psp_display_init(void);
+@@ -139,11 +145,17 @@ void psp_display_init(void);
  void psp_display_register(void);
  void psp_display_reset(void);
  int      psp_display_capture(const char *path);
@@ -60,9 +60,11 @@ index 59cb28d..995b619 100644
  uint64_t psp_display_vblanks(void);
 +uint64_t psp_display_frames(void);
  uint32_t psp_display_framebuffer(void);
++void     psp_display_get_framebuf(uint32_t *addr, uint32_t *stride, int *fmt);
  
  void psp_ge_init(void);
-@@ -159,17 +170,30 @@ void psp_sas_reset(void);
+ void psp_ge_register(void);
+@@ -159,17 +171,30 @@ void psp_sas_reset(void);
  uint64_t psp_sas_frames(void);
  uint64_t psp_sas_nonzero(void);
  
@@ -93,7 +95,7 @@ index 59cb28d..995b619 100644
  uint64_t psp_audio_blocks(void);
  
  void psp_threadman_init(void);
-@@ -193,7 +217,7 @@ void psp_threadman_yield(void);
+@@ -193,7 +218,7 @@ void psp_threadman_yield(void);
  /* Park for `us` of virtual time, as sceKernelDelayThread does. For HLE calls
   * that block on hardware for a known time, such as blocking audio output. */
  void psp_threadman_delay(uint64_t us);
@@ -102,7 +104,7 @@ index 59cb28d..995b619 100644
  
  /* Interrupt masking is per thread, and the cookie is the previous state --
   * which is why resuming a nested suspend does not enable interrupts. */
-@@ -224,6 +248,7 @@ void     psp_threadman_dump(FILE *out);
+@@ -224,6 +249,7 @@ void     psp_threadman_dump(FILE *out);
  /* Whether an id names a callback the guest has actually created. A subsystem
   * that records a callback id (scePower's slots) has to ask first. */
  int psp_callback_valid(uint32_t uid);
@@ -181,7 +183,7 @@ index 132306f..e5ab735 100644
   * hot path in any recompiled game; correctness first. */
  static inline float psp_fsqrt(float v) {
 diff --git a/include/psprecomp/render.h b/include/psprecomp/render.h
-index 81ee925..cb79725 100644
+index 81ee925..1de5d95 100644
 --- a/include/psprecomp/render.h
 +++ b/include/psprecomp/render.h
 @@ -24,6 +24,8 @@ typedef struct {
@@ -233,7 +235,23 @@ index 81ee925..cb79725 100644
  } psp_draw_state;
  
  typedef struct {
-@@ -116,6 +144,17 @@ int psp_render_select(const char *name);
+@@ -107,6 +135,15 @@ typedef struct {
+ 
+     /* sceDisplaySetFrameBuf -- show what has accumulated. */
+     void (*present)(void);
++
++    /* GE_TRXKICK -- copy w x h pixels of size bpp (2 or 4) from src to dst.
++     * Return non-zero if handled by backend, zero to run software copy. */
++    int  (*transfer)(uint32_t src, int src_bw, int sx, int sy,
++                     uint32_t dst, int dst_bw, int dx, int dy,
++                     int w, int h, int bpp);
++
++    /* Flush GPU-rendered targets back to guest VRAM. Optional (may be NULL). */
++    void (*sync)(void);
+ } psp_render_backend;
+ 
+ /* Select a backend by name ("software", "null", ...). Returns 0 on success,
+@@ -116,6 +153,17 @@ int psp_render_select(const char *name);
  /* The active backend. Never NULL -- defaults to software. */
  const psp_render_backend *psp_render_current(void);
  
@@ -251,6 +269,18 @@ index 81ee925..cb79725 100644
  /* Backends provided by the runtime. */
  extern const psp_render_backend psp_render_software;
  extern const psp_render_backend psp_render_null;
+@@ -127,6 +175,11 @@ void     psp_render_reset_pixels(void);
+ /* One pixel in format 0-3 (565, 5551, 4444, 8888) as 0xAABBGGRR. The 16-bit
+  * formats replicate their high bits into the low ones. */
+ uint32_t psp_color_expand(uint32_t px, int fmt);
++uint32_t psp_color_pack(uint32_t c, int fmt);
++
++void psp_render_software_transfer(uint32_t src, int src_bw, int sx, int sy,
++                                  uint32_t dst, int dst_bw, int dx, int dy,
++                                  int w, int h, int bpp);
+ 
+ /* The texel at integer coordinates (x, y), wrapped or clamped, as 0xAABBGGRR.
+  * Anything undecodable returns opaque magenta and is counted. */
 diff --git a/include/psprecomp/vfpu.h b/include/psprecomp/vfpu.h
 index f419054..27be919 100644
 --- a/include/psprecomp/vfpu.h
@@ -668,7 +698,7 @@ index 0000000..2d76123
 +    psp_hle_register(0x6A8C3CD5, "sceAtrac3plus", "sceAtracDecodeData",         hle_AtracDecodeData);
 +}
 diff --git a/src/hle/display.c b/src/hle/display.c
-index 73f6653..e2d1ef3 100644
+index 73f6653..fa42363 100644
 --- a/src/hle/display.c
 +++ b/src/hle/display.c
 @@ -12,6 +12,7 @@
@@ -709,7 +739,7 @@ index 73f6653..e2d1ef3 100644
      g_fb_addr = 0;
      g_fb_width = 512;
      g_fb_format = PSP_DISPLAY_PIXEL_FORMAT_8888;
-@@ -39,11 +61,18 @@ void psp_display_reset(void) {
+@@ -39,13 +61,26 @@ void psp_display_reset(void) {
      g_mode_w = PSP_SCREEN_W;
      g_mode_h = PSP_SCREEN_H;
      g_vblank_count = 0;
@@ -727,8 +757,16 @@ index 73f6653..e2d1ef3 100644
 +uint64_t psp_display_frames(void) { return g_frame_count; }
  uint32_t psp_display_framebuffer(void) { return g_fb_addr; }
  
++void psp_display_get_framebuf(uint32_t *addr, uint32_t *stride, int *fmt) {
++    if (addr) *addr = g_fb_addr;
++    if (stride) *stride = (uint32_t)g_fb_width;
++    if (fmt) *fmt = (int)g_fb_format;
++}
++
  /* Write the current framebuffer as a binary PPM. Returns 0 on success, -1 if
-@@ -65,6 +94,26 @@ int psp_display_capture(const char *path) {
+  * no framebuffer has been set yet (which is itself worth knowing during
+  * bring-up: the game never got as far as showing anything). */
+@@ -65,6 +100,26 @@ int psp_display_capture(const char *path) {
      return 0;
  }
  
@@ -755,7 +793,7 @@ index 73f6653..e2d1ef3 100644
  /* The front buffer, converted, for a window or a capture. Read while the game
   * runs: a frame being drawn into the *back* buffer is never seen, which is the
   * point of the game double-buffering. */
-@@ -73,6 +122,13 @@ int psp_display_read(uint32_t *out) {
+@@ -73,6 +128,13 @@ int psp_display_read(uint32_t *out) {
      if (!addr) return -1;
      const int bpp = (fmt == PSP_DISPLAY_PIXEL_FORMAT_8888) ? 4 : 2;
      for (int y = 0; y < PSP_SCREEN_H; y++) {
@@ -769,7 +807,7 @@ index 73f6653..e2d1ef3 100644
          for (int x = 0; x < PSP_SCREEN_W; x++) {
              uint32_t at = addr + (uint32_t)(y * (int)stride + x) * (uint32_t)bpp;
              uint32_t px = (bpp == 4) ? psp_read32(at) : psp_read16(at);
-@@ -82,6 +138,18 @@ int psp_display_read(uint32_t *out) {
+@@ -82,6 +144,18 @@ int psp_display_read(uint32_t *out) {
      return 0;
  }
  
@@ -788,11 +826,13 @@ index 73f6653..e2d1ef3 100644
  /* ---- the calls ----------------------------------------------------------- */
  
  static void hle_SetMode(void) {
-@@ -97,6 +165,20 @@ static void hle_SetFrameBuf(void) {
+@@ -97,6 +171,20 @@ static void hle_SetFrameBuf(void) {
      g_fb_width  = psp_arg(1);
      g_fb_format = psp_arg(2);
      if (!g_fb_width) g_fb_width = 512;
 +    g_frame_count++;
++    if (g_fb_addr && psp_render_current()->present)
++        psp_render_current()->present();
 +#if PSPRECOMP_REAL_THREADS
 +    if (g_fb_addr) {
 +        present_lock_ensure();
@@ -804,12 +844,10 @@ index 73f6653..e2d1ef3 100644
 +        host_mutex_unlock(&g_present_lock);
 +    }
 +#endif
-+    if (g_fb_addr && psp_render_current()->present)
-+        psp_render_current()->present();
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -115,9 +197,21 @@ static void hle_WaitVblank(void) {
+@@ -115,9 +203,21 @@ static void hle_WaitVblank(void) {
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
@@ -832,7 +870,7 @@ index 73f6653..e2d1ef3 100644
 +                     hle_GetAccumulatedHcount);
  }
 diff --git a/src/hle/ge.c b/src/hle/ge.c
-index 69cf226..9fb563a 100644
+index 69cf226..68e1361 100644
 --- a/src/hle/ge.c
 +++ b/src/hle/ge.c
 @@ -25,9 +25,11 @@
@@ -1369,7 +1407,7 @@ index 69cf226..9fb563a 100644
  }
  
  /* The framebuffer is always in eDRAM. Games send FBP relative to it, so a high
-@@ -583,6 +823,41 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -583,6 +823,40 @@ static void draw_prim(uint32_t type, uint32_t count) {
   * Taken literally, 0x88000 is main RAM: for a vaddr-0 module, its own code. */
  static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZE - 1)); }
  
@@ -1396,22 +1434,21 @@ index 69cf226..9fb563a 100644
 +    const uint32_t dst = g_trx.dst_bp < PSP_VRAM_SIZE ? (PSP_VRAM_BASE | g_trx.dst_bp) : g_trx.dst_bp;
 +    const int w = g_trx.w > 0 ? g_trx.w : 1;
 +    const int h = g_trx.h > 0 ? g_trx.h : 1;
-+    const uint32_t bpp = bpp32 ? 4u : 2u;
-+    for (int y = 0; y < h; y++) {
-+        const uint32_t sr = src + (uint32_t)((g_trx.sy + y) * g_trx.src_bw + g_trx.sx) * bpp;
-+        const uint32_t dr = dst + (uint32_t)((g_trx.dy + y) * g_trx.dst_bw + g_trx.dx) * bpp;
-+        if (bpp32) {
-+            for (int x = 0; x < w; x++) psp_write32(dr + (uint32_t)x * 4u, psp_read32(sr + (uint32_t)x * 4u));
-+        } else {
-+            for (int x = 0; x < w; x++) psp_write16(dr + (uint32_t)x * 2u, psp_read16(sr + (uint32_t)x * 2u));
-+        }
-+    }
++    const int bpp = bpp32 ? 4 : 2;
++    if (psp_render_current()->transfer &&
++        psp_render_current()->transfer(src, g_trx.src_bw, g_trx.sx, g_trx.sy,
++                                       dst, g_trx.dst_bw, g_trx.dx, g_trx.dy,
++                                       w, h, bpp))
++        return;
++    psp_render_software_transfer(src, g_trx.src_bw, g_trx.sx, g_trx.sy,
++                                 dst, g_trx.dst_bw, g_trx.dx, g_trx.dy,
++                                 w, h, bpp);
 +}
 +
  /* Walk a list until END/FINISH, the stall address, or a step budget.
   *
   * The budget is not paranoia: a list whose JUMP forms a cycle is a normal
-@@ -607,6 +882,7 @@ static void run_list(ge_queue *q) {
+@@ -607,6 +881,7 @@ static void run_list(ge_queue *q) {
  
          switch (cmd) {
          case GE_NOP:
@@ -1419,7 +1456,7 @@ index 69cf226..9fb563a 100644
              break;
  
          case GE_PRIM: {
-@@ -625,11 +901,11 @@ static void run_list(ge_queue *q) {
+@@ -625,11 +900,11 @@ static void run_list(ge_queue *q) {
              break;
  
          case GE_JUMP:
@@ -1433,7 +1470,7 @@ index 69cf226..9fb563a 100644
              break;
          case GE_RET:
              if (sp > 0) q->list = stack[--sp];
-@@ -642,23 +918,29 @@ static void run_list(ge_queue *q) {
+@@ -642,23 +917,30 @@ static void run_list(ge_queue *q) {
              break;
  
          case GE_END:
@@ -1446,6 +1483,7 @@ index 69cf226..9fb563a 100644
          case GE_FINISH:
 -            if (cmd == GE_FINISH) g_ge.finishes++;
 +            g_ge.finishes++;
++            if (psp_render_current()->finish) psp_render_current()->finish();
              /* A finished list gives its slot back. Keeping it used meant the
               * ninth enqueue failed, and WTF then dropped 3,870 of 3,885
               * frames while running at full speed. */
@@ -1633,7 +1671,7 @@ index 69cf226..9fb563a 100644
  }
  
  static void hle_ListEnQueue(void)     { enqueue(0); }
-@@ -847,7 +1224,10 @@ static void hle_ListUpdateStallAddr(void) {
+@@ -847,35 +1224,83 @@ static void hle_ListUpdateStallAddr(void) {
          return;
      }
      q->stall = psp_arg(1) & ~3u;
@@ -1645,7 +1683,27 @@ index 69cf226..9fb563a 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -859,23 +1239,54 @@ static void hle_DrawSync(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+ /* Lists are complete by the time they are enqueued, so every sync succeeds
+  * immediately. */
+-static void hle_ListSync(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+-static void hle_DrawSync(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
++static int ge_sync_on_drawsync(void) {
++    const char *v = getenv("SETO_GE_SYNC_ON_DRAWSYNC");
++    return v && v[0] && v[0] != '0';
++}
++
++static void hle_ListSync(void) {
++    if ((int)psp_arg(1) == 0 && ge_sync_on_drawsync() && psp_render_current()->sync)
++        psp_render_current()->sync();
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++
++static void hle_DrawSync(void) {
++    if ((int)psp_arg(0) == 0 && ge_sync_on_drawsync() && psp_render_current()->sync)
++        psp_render_current()->sync();
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
+ 
  static void hle_Break(void)    { psp_ret(SCE_KERNEL_ERROR_OK); }
  static void hle_Continue(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
  
@@ -1666,14 +1724,14 @@ index 69cf226..9fb563a 100644
 +    }
 +    psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
 +}
- 
--/* eDRAM is the GPU-visible VRAM window: 2 MB at 0x04000000. */
++
 +static void hle_UnsetCallback(void) {
 +    uint32_t id = psp_arg(0);
 +    if (id < MAX_GE_CALLBACKS) g_cb[id].used = 0;
 +    psp_ret(SCE_KERNEL_ERROR_OK);
 +}
-+
+ 
+-/* eDRAM is the GPU-visible VRAM window: 2 MB at 0x04000000. */
 +/* eDRAM is the GPU-visible VRAM window at 0x04000000 (PSP_VRAM_SIZE = 4 MB). */
  static void hle_EdramGetAddr(void) { psp_ret(PSP_VRAM_BASE); }
  static void hle_EdramGetSize(void) { psp_ret(PSP_VRAM_SIZE); }
@@ -4538,7 +4596,7 @@ index 7e4aff8..5092b53 100644
      free(b);
  
 diff --git a/src/render.c b/src/render.c
-index 6a20fb4..2a6cfff 100644
+index 6a20fb4..435825e 100644
 --- a/src/render.c
 +++ b/src/render.c
 @@ -9,14 +9,18 @@
@@ -4646,7 +4704,7 @@ index 6a20fb4..2a6cfff 100644
          return rgba((int)((r << 4) | r), (int)((g << 4) | g), (int)((b << 4) | b),
                      (int)((a << 4) | a));
      default:  /* 8888 */
-@@ -73,9 +116,9 @@ uint32_t psp_color_expand(uint32_t px, int fmt) {
+@@ -73,30 +116,82 @@ uint32_t psp_color_expand(uint32_t px, int fmt) {
  /* The inverse, for writing 16-bit framebuffers. */
  static uint32_t color_pack(uint32_t c, int fmt) {
      switch (fmt) {
@@ -4659,7 +4717,29 @@ index 6a20fb4..2a6cfff 100644
      default: return c;
      }
  }
-@@ -84,19 +127,50 @@ static uint32_t color_pack(uint32_t c, int fmt) {
+ 
++uint32_t psp_color_pack(uint32_t c, int fmt) {
++    return color_pack(c, fmt);
++}
++
++void psp_render_software_transfer(uint32_t src, int src_bw, int sx, int sy,
++                                  uint32_t dst, int dst_bw, int dx, int dy,
++                                  int w, int h, int bpp) {
++    if (src_bw <= 0 || dst_bw <= 0 || w <= 0 || h <= 0) return;
++    for (int y = 0; y < h; y++) {
++        const uint32_t sr = src + (uint32_t)((sy + y) * src_bw + sx) * (uint32_t)bpp;
++        const uint32_t dr = dst + (uint32_t)((dy + y) * dst_bw + dx) * (uint32_t)bpp;
++        if (bpp == 4) {
++            for (int x = 0; x < w; x++)
++                psp_write32(dr + (uint32_t)x * 4u, psp_read32(sr + (uint32_t)x * 4u));
++        } else {
++            for (int x = 0; x < w; x++)
++                psp_write16(dr + (uint32_t)x * 2u, psp_read16(sr + (uint32_t)x * 2u));
++        }
++    }
++}
++
+ /* ---- textures ------------------------------------------------------------ */
  
  static const int TEX_BPP[11] = { 16, 16, 16, 32, 4, 8, 16, 32, 4, 8, 8 };
  
@@ -4716,7 +4796,7 @@ index 6a20fb4..2a6cfff 100644
      if (!st->clut) return 0;
      if (st->clut_fmt == 3) {
          if (e >= 256) return 0;                 /* the CLUT cache is 1 KB */
-@@ -108,11 +182,62 @@ static uint32_t clut_entry(const psp_draw_state *st, uint32_t idx) {
+@@ -108,11 +203,62 @@ static uint32_t clut_entry(const psp_draw_state *st, uint32_t idx) {
      return psp_color_expand((uint32_t)p[0] | ((uint32_t)p[1] << 8), st->clut_fmt);
  }
  
@@ -4780,7 +4860,7 @@ index 6a20fb4..2a6cfff 100644
  /* DXT1/3/5. The PSP lays a block out with its colour indices first -- one
   * byte per row, two bits per texel -- then the two 565 endpoint colours, the
   * reverse of the desktop order. DXT3 and DXT5 follow the colour half with
-@@ -122,72 +247,98 @@ static int wrap(int c, int size, int clamp) {
+@@ -122,72 +268,98 @@ static int wrap(int c, int size, int clamp) {
  static uint32_t dxt_texel(const psp_draw_state *st, uint32_t x, uint32_t y) {
      const uint32_t size = st->tex_fmt == PSP_TPSM_DXT1 ? 8u : 16u;
      const uint32_t blk = st->tex_addr + ((y >> 2) * ((uint32_t)st->tex_bw / 4) + (x >> 2)) * size;
@@ -4820,7 +4900,7 @@ index 6a20fb4..2a6cfff 100644
 +        pal[2] = rgba(((int)R(a) + (int)R(b)) / 2, ((int)G(a) + (int)G(b)) / 2,
 +                      ((int)B(a) + (int)B(b)) / 2, 255);
 +        pal[3] = 0;                             /* DXT1 three-colour mode: transparent */
-     }
++    }
 +    const uint32_t cbits = span_read32(&g_tex_span, blk);
 +
 +    if (!slot) {
@@ -4842,7 +4922,7 @@ index 6a20fb4..2a6cfff 100644
 +            out = (out & 0x00FFFFFFu) | ((uint32_t)al << 24);
 +        }
 +        return out;
-+    }
+     }
 +
 +    for (uint32_t i = 0; i < 16; i++)
 +        slot->px[i] = pal[(cbits >> (2 * i)) & 3];
@@ -4928,7 +5008,7 @@ index 6a20fb4..2a6cfff 100644
      int r, g, b, a;
      const int ta = st->tex_alpha;
      switch (st->tex_func) {
-@@ -224,7 +375,7 @@ static uint32_t tex_combine(const psp_draw_state *st, uint32_t t, uint32_t c) {
+@@ -224,7 +396,7 @@ static uint32_t tex_combine(const psp_draw_state *st, uint32_t t, uint32_t c) {
      return rgba(r, g, b, a);
  }
  
@@ -4937,7 +5017,7 @@ index 6a20fb4..2a6cfff 100644
      int a = (int)A(c) & st->atest_mask, ref = st->atest_ref & st->atest_mask;
      switch (st->atest_func) {
      case 0:  return 0;
-@@ -258,7 +409,13 @@ static int factor(int code, int is_src, int ch, uint32_t s, uint32_t d, uint32_t
+@@ -258,7 +430,13 @@ static int factor(int code, int is_src, int ch, uint32_t s, uint32_t d, uint32_t
      }
  }
  
@@ -4952,7 +5032,7 @@ index 6a20fb4..2a6cfff 100644
      int out[3];
      for (int ch = 0; ch < 3; ch++) {
          int sc = (int)((s >> (ch * 8)) & 0xFF), dc = (int)((d >> (ch * 8)) & 0xFF);
-@@ -273,15 +430,25 @@ static uint32_t blend(const psp_draw_state *st, uint32_t s, uint32_t d) {
+@@ -273,15 +451,25 @@ static uint32_t blend(const psp_draw_state *st, uint32_t s, uint32_t d) {
          default: out[ch] = sc > dc ? sc - dc : dc - sc; break;
          }
      }
@@ -4981,7 +5061,7 @@ index 6a20fb4..2a6cfff 100644
  
  static void sw_target(uint32_t addr, uint32_t stride, int fmt) {
      g_fb_addr = addr;
-@@ -290,10 +457,37 @@ static void sw_target(uint32_t addr, uint32_t stride, int fmt) {
+@@ -290,10 +478,37 @@ static void sw_target(uint32_t addr, uint32_t stride, int fmt) {
  }
  
  static uint32_t fb_read(uint32_t at) {
@@ -5002,9 +5082,8 @@ index 6a20fb4..2a6cfff 100644
 +        else span_write16(&g_fb_span, at, (uint16_t)((p & ~mask) | (span_read16(&g_fb_span, at) & mask)));
 +    }
 +    g_pixels++;
- }
- 
--static int depth_pass(int func, int z, int d) {
++}
++
 +static int stencil_op(int op, int old, int ref) {
 +    const int step = g_fb_fmt == 1 ? 255 : g_fb_fmt == 2 ? 17 : 1;
 +    switch (op) {
@@ -5015,13 +5094,14 @@ index 6a20fb4..2a6cfff 100644
 +    case 5: return old < step ? 0 : old - step;
 +    default: return old;
 +    }
-+}
-+
+ }
+ 
+-static int depth_pass(int func, int z, int d) {
 +static inline int depth_pass(int func, int z, int d) {
      switch (func) {
      case 0:  return 0;
      case 1:  return 1;
-@@ -308,11 +502,741 @@ static int depth_pass(int func, int z, int d) {
+@@ -308,11 +523,741 @@ static int depth_pass(int func, int z, int d) {
  
  /* One fragment through the pipeline. `c` is the interpolated vertex colour,
   * `zf` its depth. */
@@ -5307,7 +5387,7 @@ index 6a20fb4..2a6cfff 100644
 +    }
 +    return bilinear_mix(c00, c10, c01, c11, fx, fy);
 +}
- 
++
 +static inline uint32_t tex_sample(const psp_draw_state *st, float u, float v) {
 +    const int fmt_ok = g_tex_in_draw ? g_tex_fmt_ok
 +        : (st->tex_fmt >= 0 && st->tex_fmt <= PSP_TPSM_DXT5 && st->tex_w > 0 && st->tex_h > 0 && st->tex_bw > 0);
@@ -5735,7 +5815,7 @@ index 6a20fb4..2a6cfff 100644
 +    *h = st->tex_h;
 +    return 1;
 +}
-+
+ 
 +static uint32_t apply_logic_op(int op, uint32_t s, uint32_t d) {
 +    uint32_t r;
 +    s &= 0x00FFFFFFu;
@@ -5767,7 +5847,7 @@ index 6a20fb4..2a6cfff 100644
      const uint32_t bytes = g_fb_fmt == 3 ? 4u : 2u;
      const uint32_t at = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * bytes;
      /* Rounded: coplanar layers (WTF draws LED text on its panel at the same
-@@ -324,123 +1248,2971 @@ static void fragment(const psp_draw_state *st, int x, int y, uint32_t c, float u
+@@ -324,108 +1269,2951 @@ static void fragment(const psp_draw_state *st, int x, int y, uint32_t c, float u
      if (st->clear) {
          /* Clear mode writes only the buffers its flags name. A depth-only
           * clear leaves the colour alone. */
@@ -6009,14 +6089,8 @@ index 6a20fb4..2a6cfff 100644
 +    const float z0 = a->z < b->z ? (a->z < c->z ? a->z : c->z) : (b->z < c->z ? b->z : c->z);
 +    const float z1 = a->z > b->z ? (a->z > c->z ? a->z : c->z) : (b->z > c->z ? b->z : c->z);
 +    return !(z0 >= (float)st->zmin && z1 <= (float)st->zmax);
- }
- 
--static void sw_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
--    switch (prim) {
--    case PSP_PRIM_SPRITES:
--        for (int i = 0; i + 1 < count; i += 2) sw_sprite(&v[i], &v[i + 1], st);
--        break;
--    case PSP_PRIM_TRIANGLES:
++}
++
 +static inline int uv_fp_eligible(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c) {
 +    const float lim = 1e6f;
 +    return a->u > -lim && a->u < lim && b->u > -lim && b->u < lim && c->u > -lim && c->u < lim &&
@@ -8781,15 +8855,15 @@ index 6a20fb4..2a6cfff 100644
 +        if (e2 > -dy) { err -= dy; x += sx; }
 +        if (e2 < dx)  { err += dx; y += sy; }
 +    }
-+}
-+
-+static void sw_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
+ }
+ 
+ static void sw_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
 +    if (!g_fb_addr || !g_fb_stride) return;
 +    const unsigned bytes = g_fb_fmt == 3 ? 4u : 2u;
 +    map_span(&g_fb_span, g_fb_addr, ((uint64_t)g_fb_stride * 271 + 480) * bytes);
 +    map_span(&g_z_span, st->zaddr, st->zbw > 0 ? ((uint64_t)st->zbw * 271 + 480) * 2 : 0);
 +    sw_tex_begin(st);
-+    switch (prim) {
+     switch (prim) {
 +    case PSP_PRIM_POINTS:
 +        for (int i = 0; i < count; i++) sw_point(&v[i], st);
 +        break;
@@ -8799,10 +8873,10 @@ index 6a20fb4..2a6cfff 100644
 +    case PSP_PRIM_LINE_STRIP:
 +        for (int i = 0; i + 1 < count; i++) sw_line(&v[i], &v[i + 1], st);
 +        break;
-+    case PSP_PRIM_SPRITES:
-+        for (int i = 0; i + 1 < count; i += 2) sw_sprite(&v[i], &v[i + 1], st);
-+        break;
-+    case PSP_PRIM_TRIANGLES:
+     case PSP_PRIM_SPRITES:
+         for (int i = 0; i + 1 < count; i += 2) sw_sprite(&v[i], &v[i + 1], st);
+         break;
+@@ -433,20 +4221,26 @@ static void sw_draw(int prim, const psp_vertex *v, int count, const psp_draw_sta
          for (int i = 0; i + 2 < count; i += 3) sw_tri(&v[i], &v[i + 1], &v[i + 2], st);
          break;
      case PSP_PRIM_TRIANGLE_STRIP:
@@ -8824,7 +8898,25 @@ index 6a20fb4..2a6cfff 100644
  }
  
  static void sw_noop(void) { }
-@@ -472,6 +4244,10 @@ static const psp_render_backend *g_backend = &psp_render_software;
+ 
+ const psp_render_backend psp_render_software = {
+-    "software", sw_init, sw_shutdown, sw_target, sw_draw, sw_noop, sw_noop
++    "software", sw_init, sw_shutdown, sw_target, sw_draw, sw_noop, sw_noop,
++    NULL, NULL
+ };
+ 
+ /* ---- null backend -------------------------------------------------------- */
+@@ -463,7 +4257,8 @@ static void null_draw(int p, const psp_vertex *v, int n, const psp_draw_state *s
+ static void null_noop(void) { }
+ 
+ const psp_render_backend psp_render_null = {
+-    "null", null_init, null_noop, null_target, null_draw, null_noop, null_noop
++    "null", null_init, null_noop, null_target, null_draw, null_noop, null_noop,
++    NULL, NULL
+ };
+ 
+ /* ---- selection ----------------------------------------------------------- */
+@@ -472,6 +4267,10 @@ static const psp_render_backend *g_backend = &psp_render_software;
  
  const psp_render_backend *psp_render_current(void) { return g_backend; }
  
@@ -9938,10 +10030,18 @@ index b41d6ef..30e595d 100644
      psp_mem_free();
  
 diff --git a/tests/test_raster.c b/tests/test_raster.c
-index 0f821b5..6867a83 100644
+index 0f821b5..9462662 100644
 --- a/tests/test_raster.c
 +++ b/tests/test_raster.c
-@@ -109,7 +109,7 @@ static void test_sprite(void) {
+@@ -16,6 +16,7 @@
+ #include "psprecomp/cpu.h"
+ 
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ 
+ static int failures;
+@@ -109,7 +110,7 @@ static void test_sprite(void) {
  
      CHECK(psp_ge_pixels() == 100 * 100, "sprite pixel count: %llu (want 10000)",
            (unsigned long long)psp_ge_pixels());
@@ -9950,7 +10050,7 @@ index 0f821b5..6867a83 100644
      CHECK(pixel(99, 100) == 0, "left of sprite should be untouched: 0x%08X", pixel(99, 100));
      CHECK(pixel(150, 49) == 0, "above sprite should be untouched: 0x%08X", pixel(150, 49));
      /* Half-open on the far edge, so adjacent sprites tile without overlapping. */
-@@ -128,11 +128,44 @@ static void test_triangle(void) {
+@@ -128,11 +129,44 @@ static void test_triangle(void) {
  
      CHECK(psp_ge_pixels() > 4000, "triangle should cover ~5000 px, got %llu",
            (unsigned long long)psp_ge_pixels());
@@ -9996,7 +10096,7 @@ index 0f821b5..6867a83 100644
  /* Winding must not matter while back-face culling is unimplemented, or half of
   * any real model silently disappears. */
  static void test_winding(void) {
-@@ -144,7 +177,7 @@ static void test_winding(void) {
+@@ -144,7 +178,7 @@ static void test_winding(void) {
      vertex(2, 110, 10, 0xFFFFFFFFu);
      cmd(0x04, (3u << 16) | 3);
      end_list();
@@ -10005,7 +10105,7 @@ index 0f821b5..6867a83 100644
            pixel(20, 20));
  }
  
-@@ -161,7 +194,7 @@ static void test_clipping(void) {
+@@ -161,7 +195,7 @@ static void test_clipping(void) {
  
      CHECK(psp_ge_pixels() == 50 * 50, "clipped sprite: %llu (want 2500)",
            (unsigned long long)psp_ge_pixels());
@@ -10014,7 +10114,7 @@ index 0f821b5..6867a83 100644
      CHECK(pixel(479, 271) == 0, "far corner untouched: 0x%08X", pixel(479, 271));
  }
  
-@@ -218,11 +251,15 @@ static void test_transformed_quad(void) {
+@@ -218,11 +252,15 @@ static void test_transformed_quad(void) {
      fvertex(2, -0.5f, -0.5f, 0, 1);
      fvertex(3,  0.5f, -0.5f, 1, 1);
      cmd(0x04, (4u << 16) | 4);                      /* triangle strip */
@@ -10033,7 +10133,7 @@ index 0f821b5..6867a83 100644
      CHECK(pixel(175, 136) == 0, "world translation moved the left edge past x=175: 0x%08X", pixel(175, 136));
      CHECK(pixel(425, 136) == 0, "right edge stops before x=425: 0x%08X", pixel(425, 136));
      CHECK(pixel(300, 64) == 0, "top edge is at y=68: 0x%08X", pixel(300, 64));
-@@ -240,8 +277,8 @@ static void test_triangle_strip(void) {
+@@ -240,8 +278,8 @@ static void test_triangle_strip(void) {
      end_list();
  
      /* Two triangles sharing an edge tile the square without a seam. */
@@ -10044,7 +10144,7 @@ index 0f821b5..6867a83 100644
  }
  
  /* The backend interface itself. The software path is the reference every other
-@@ -332,7 +369,7 @@ static void test_textured_sprite(void) {
+@@ -332,7 +370,7 @@ static void test_textured_sprite(void) {
      int bad = 0;
      for (int y = 0; y < 4; y++)
          for (int x = 0; x < 4; x++)
@@ -10053,7 +10153,7 @@ index 0f821b5..6867a83 100644
      CHECK(bad == 0, "1:1 textured sprite: %d of 16 texels wrong (0,0)=0x%08X (3,2)=0x%08X",
            bad, pixel(10, 20), pixel(13, 22));
  
-@@ -344,7 +381,7 @@ static void test_textured_sprite(void) {
+@@ -344,7 +382,7 @@ static void test_textured_sprite(void) {
      tvertex(1, 8, 8, 4, 4, 0xFFFFFFFFu);
      cmd(0x04, (6u << 16) | 2);
      end_list();
@@ -10062,7 +10162,7 @@ index 0f821b5..6867a83 100644
  
      /* Modulate: a half-grey vertex colour halves each channel. */
      psp_ge_reset();
-@@ -355,7 +392,7 @@ static void test_textured_sprite(void) {
+@@ -355,7 +393,7 @@ static void test_textured_sprite(void) {
      tvertex(1, 1, 1, 1, 1, 0xFF808080u);
      cmd(0x04, (6u << 16) | 2);
      end_list();
@@ -10071,7 +10171,7 @@ index 0f821b5..6867a83 100644
  }
  
  /* Swizzle by moving blocks in storage order, independent of the renderer's
-@@ -395,7 +432,7 @@ static void test_clut4_swizzled(void) {
+@@ -395,7 +433,7 @@ static void test_clut4_swizzled(void) {
      int bad = 0, fx = -1, fy = -1;
      for (int y = 0; y < 16; y++)
          for (int x = 0; x < 64; x++) {
@@ -10080,7 +10180,7 @@ index 0f821b5..6867a83 100644
              if (pixel(x, y) != want) { if (!bad) { fx = x; fy = y; } bad++; }
          }
      CHECK(bad == 0, "swizzled CLUT4: %d of 1024 wrong, first at (%d,%d) = 0x%08X", bad, fx, fy,
-@@ -415,7 +452,7 @@ static void test_clut4_swizzled(void) {
+@@ -415,7 +453,7 @@ static void test_clut4_swizzled(void) {
      g_pc = 0;
      cmd(0x04, (6u << 16) | 2);
      end_list();
@@ -10089,7 +10189,7 @@ index 0f821b5..6867a83 100644
  }
  
  static void test_alpha_test_and_blend(void) {
-@@ -433,7 +470,7 @@ static void test_alpha_test_and_blend(void) {
+@@ -433,7 +471,7 @@ static void test_alpha_test_and_blend(void) {
      cmd(0x04, (6u << 16) | 2);
      end_list();
      CHECK(pixel(0, 0) == 0xFFFF0000u, "alpha test drops alpha-0 texel: 0x%08X", pixel(0, 0));
@@ -10098,7 +10198,7 @@ index 0f821b5..6867a83 100644
  
      /* SRC_ALPHA, ONE_MINUS_SRC_ALPHA, ADD: half red over blue. */
      psp_ge_reset();
-@@ -511,7 +548,7 @@ static void test_framebuffer_is_vram_relative(void) {
+@@ -511,7 +549,7 @@ static void test_framebuffer_is_vram_relative(void) {
      end_list();
  
      uint32_t got = psp_read32(PSP_VRAM_BASE + ram_probe);
@@ -10107,7 +10207,7 @@ index 0f821b5..6867a83 100644
            PSP_VRAM_BASE + ram_probe, got);
      if (ram_ok)
          CHECK(psp_read32(ram_probe) == 0x12345678u,
-@@ -526,8 +563,8 @@ static void test_framebuffer_is_vram_relative(void) {
+@@ -526,8 +564,8 @@ static void test_framebuffer_is_vram_relative(void) {
   * indices 2 and 3 are the 2/3 and 1/3 blends. */
  static void test_dxt1(void) {
      psp_write32(TEX, 0xE4E4E4E4u);                 /* every row: 0, 1, 2, 3 */
@@ -10118,7 +10218,7 @@ index 0f821b5..6867a83 100644
      psp_ge_reset();
      clear_fb();
      begin_tex_list(8, 2, 2, 0);                    /* DXT1, 4x4 */
-@@ -535,10 +572,10 @@ static void test_dxt1(void) {
+@@ -535,10 +573,10 @@ static void test_dxt1(void) {
      tvertex(1, 4, 4, 4, 4, 0xFFFFFFFFu);
      cmd(0x04, (6u << 16) | 2);
      end_list();
@@ -10133,7 +10233,7 @@ index 0f821b5..6867a83 100644
      CHECK(psp_render_unsupported_texels() == 0, "no texel was undecodable");
  }
  
-@@ -569,10 +606,10 @@ static void test_depth(void) {
+@@ -569,10 +607,10 @@ static void test_depth(void) {
      zsprite(4, 0, 4, 4, 8, 100, 0xFFFF0000u);      /* equal: drawn */
      cmd(0x04, (6u << 16) | 6);
      end_list();
@@ -10148,7 +10248,7 @@ index 0f821b5..6867a83 100644
  }
  
  /* Attributes are sampled at pixel centres. This is WTF's LED panel: a quad
-@@ -598,10 +635,80 @@ static void test_samples_at_pixel_centres(void) {
+@@ -598,10 +636,80 @@ static void test_samples_at_pixel_centres(void) {
      int bad = 0, first = -1;
      for (int y = 0; y < 16; y++)
          for (int x = 120; x < 360; x += 7)
@@ -10230,7 +10330,7 @@ index 0f821b5..6867a83 100644
  /* A PRIM leaves the vertex pointer after what it used, so a second PRIM with
   * no VADDR continues from there; with an index type, vertices come through
   * the index list instead and IADDR advances. */
-@@ -625,8 +732,8 @@ static void test_vertex_flow(void) {
+@@ -625,8 +733,8 @@ static void test_vertex_flow(void) {
      cmd(0x04, (6u << 16) | 2);                     /* corners 3, 2: still the green box */
      cmd(0x04, (6u << 16) | 2);                     /* IADDR moved on: 0, 1, the red box */
      end_list();
@@ -10241,7 +10341,7 @@ index 0f821b5..6867a83 100644
      CHECK(psp_ge_pixels() == 4 * 16, "indexed sprites drew the same boxes again: %llu pixels",
            (unsigned long long)psp_ge_pixels());
  }
-@@ -666,9 +773,543 @@ static void lit_quad(float lx, float lz) {
+@@ -666,9 +774,683 @@ static void lit_quad(float lx, float lz) {
  
  static void test_lighting(void) {
      lit_quad(0, 1);
@@ -10784,10 +10884,150 @@ index 0f821b5..6867a83 100644
 +            }
 +        }
 +    }
++}
++
++static struct {
++    int finishes;
++    int presents;
++    int transfers;
++    int syncs;
++    int transfer_ret;
++    int last_bpp;
++} g_m3_mock;
++
++static int mock_m3_init(int w, int h) { (void)w; (void)h; return 0; }
++static void mock_m3_shutdown(void) {}
++static void mock_m3_target(uint32_t a, uint32_t s, int f) { (void)a; (void)s; (void)f; }
++static void mock_m3_draw(int p, const psp_vertex *v, int c, const psp_draw_state *s) {
++    (void)p; (void)v; (void)c; (void)s;
++}
++static void mock_m3_finish(void) { g_m3_mock.finishes++; }
++static void mock_m3_present(void) {
++    g_m3_mock.presents++;
++    psp_write32(FB, 0xFF112233u);
++}
++static int mock_m3_transfer(uint32_t src, int sbw, int sx, int sy,
++                            uint32_t dst, int dbw, int dx, int dy,
++                            int w, int h, int bpp) {
++    (void)src; (void)sbw; (void)sx; (void)sy;
++    (void)dst; (void)dbw; (void)dx; (void)dy;
++    (void)w; (void)h;
++    g_m3_mock.transfers++;
++    g_m3_mock.last_bpp = bpp;
++    return g_m3_mock.transfer_ret;
++}
++static void mock_m3_sync(void) { g_m3_mock.syncs++; }
++
++static void set_env_var(const char *k, const char *v) {
++#ifdef _WIN32
++    char buf[128];
++    snprintf(buf, sizeof buf, "%s=%s", k, v ? v : "");
++    _putenv(buf);
++#else
++    if (v) setenv(k, v, 1); else unsetenv(k);
++#endif
++}
++
++static void test_m3_backend_hooks(void) {
++    /* 1. psp_color_pack / psp_color_expand round-trip across formats 0..3. */
++    const uint32_t sample = 0x80F8C418u;
++    for (int fmt = 0; fmt <= 3; fmt++) {
++        uint32_t packed = psp_color_pack(sample, fmt);
++        uint32_t expanded = psp_color_expand(packed, fmt);
++        uint32_t repacked = psp_color_pack(expanded, fmt);
++        CHECK(packed == repacked, "color_pack fmt %d lossless repack: 0x%08X != 0x%08X",
++              fmt, packed, repacked);
++    }
++
++    /* 2. psp_render_software_transfer 16-bit and 32-bit with offsets/strides. */
++    const uint32_t src = 0x08850000u, dst = 0x08860000u;
++    for (int y = 0; y < 8; y++) {
++        for (int x = 0; x < 16; x++) {
++            psp_write32(src + (uint32_t)(y * 16 + x) * 4u, (uint32_t)(0xA0000000u | (y << 8) | x));
++            psp_write32(dst + (uint32_t)(y * 32 + x) * 4u, 0u);
++        }
++    }
++    psp_render_software_transfer(src, 16, 2, 1, dst, 32, 3, 2, 4, 2, 4);
++    CHECK(psp_read32(dst + (uint32_t)(2 * 32 + 3) * 4u) == 0xA0000102u, "sw_transfer 32bpp origin");
++    CHECK(psp_read32(dst + (uint32_t)(3 * 32 + 6) * 4u) == 0xA0000205u, "sw_transfer 32bpp corner");
++    CHECK(psp_read32(dst + (uint32_t)(2 * 32 + 7) * 4u) == 0u, "sw_transfer 32bpp bounds");
++
++    for (int y = 0; y < 8; y++) {
++        for (int x = 0; x < 16; x++) {
++            psp_write16(src + (uint32_t)(y * 16 + x) * 2u, (uint16_t)(0x5000u | (y << 4) | x));
++            psp_write16(dst + (uint32_t)(y * 32 + x) * 2u, 0u);
++        }
++    }
++    psp_render_software_transfer(src, 16, 1, 2, dst, 32, 4, 1, 3, 2, 2);
++    CHECK(psp_read16(dst + (uint32_t)(1 * 32 + 4) * 2u) == 0x5021u, "sw_transfer 16bpp origin");
++    CHECK(psp_read16(dst + (uint32_t)(2 * 32 + 6) * 2u) == 0x5033u, "sw_transfer 16bpp corner");
++
++    /* 3. Backend hooks: finish, transfer, sync, display framebuf & present order. */
++    static const psp_render_backend mock_be = {
++        "m3-mock", mock_m3_init, mock_m3_shutdown, mock_m3_target,
++        mock_m3_draw, mock_m3_finish, mock_m3_present, mock_m3_transfer, mock_m3_sync
++    };
++    memset(&g_m3_mock, 0, sizeof g_m3_mock);
++    psp_render_set_backend(&mock_be);
++    psp_ge_reset();
++
++    /* Mock transfer returns 1 -> skips software copy. */
++    g_m3_mock.transfer_ret = 1;
++    psp_write32(src, 0x12345678u);
++    psp_write32(dst, 0xCAFEBABEu);
++    begin_list();
++    cmd(0xB2, src & 0xFFFFFFu);
++    cmd(0xB3, ((src >> 8) & 0xFF0000u) | 16u);
++    cmd(0xB4, dst & 0xFFFFFFu);
++    cmd(0xB5, ((dst >> 8) & 0xFF0000u) | 16u);
++    cmd(0xEB, 0u);
++    cmd(0xEC, 0u);
++    cmd(0xEE, 0u);
++    cmd(0xEA, 1u);
++    end_list();
++    CHECK(g_m3_mock.finishes == 1, "GE_FINISH invokes backend->finish");
++    CHECK(g_m3_mock.transfers == 1 && g_m3_mock.last_bpp == 4, "GE_TRXKICK invokes backend->transfer");
++    CHECK(psp_read32(dst) == 0xCAFEBABEu, "handled transfer skips software overwrite");
++
++    /* Mock transfer returns 0 -> falls back to software copy. */
++    g_m3_mock.transfer_ret = 0;
++    begin_list();
++    cmd(0xB2, src & 0xFFFFFFu);
++    cmd(0xB3, ((src >> 8) & 0xFF0000u) | 16u);
++    cmd(0xB4, dst & 0xFFFFFFu);
++    cmd(0xB5, ((dst >> 8) & 0xFF0000u) | 16u);
++    cmd(0xEB, 0u);
++    cmd(0xEC, 0u);
++    cmd(0xEE, 0u);
++    cmd(0xEA, 1u);
++    end_list();
++    CHECK(g_m3_mock.transfers == 2 && psp_read32(dst) == 0x12345678u, "unhandled transfer falls back to sw");
++
++    /* Sync hook on sceGeDrawSync(0) / sceGeListSync(_, 0) gated by SETO_GE_SYNC_ON_DRAWSYNC. */
++    set_env_var("SETO_GE_SYNC_ON_DRAWSYNC", "0");
++    call(0xB287BD61u, 0, 0, 0, 0);
++    CHECK(g_m3_mock.syncs == 0, "DrawSync(0) does not sync when env unset");
++    set_env_var("SETO_GE_SYNC_ON_DRAWSYNC", "1");
++    call(0xB287BD61u, 1, 0, 0, 0);
++    CHECK(g_m3_mock.syncs == 0, "DrawSync(1) peek does not block-sync");
++    call(0xB287BD61u, 0, 0, 0, 0);
++    call(0x03444EB4u, 0, 0, 0, 0);
++    CHECK(g_m3_mock.syncs == 2, "DrawSync(0) & ListSync(_, 0) sync when env enabled");
++    set_env_var("SETO_GE_SYNC_ON_DRAWSYNC", NULL);
++
++    /* psp_display_get_framebuf and present-before-snapshot ordering. */
++    psp_write32(FB, 0x00000000u);
++    call(0x289D82FEu, FB, 512, 3, 0);
++    uint32_t fb_addr = 0, fb_stride = 0; int fb_fmt = -1;
++    psp_display_get_framebuf(&fb_addr, &fb_stride, &fb_fmt);
++    CHECK(fb_addr == FB && fb_stride == 512 && fb_fmt == 3, "psp_display_get_framebuf matches");
++    CHECK(g_m3_mock.presents == 1 && psp_read32(FB) == 0xFF112233u, "present runs on SetFrameBuf");
++
++    psp_render_set_backend(&psp_render_software);
  }
  
  int main(void) {
-@@ -690,10 +1331,71 @@ int main(void) {
+@@ -690,10 +1472,73 @@ int main(void) {
      test_clear_mode_and_scissor();
      test_dxt1();
      test_depth();
@@ -10856,6 +11096,8 @@ index 0f821b5..6867a83 100644
 +                if (rgba[y * tw + x] != psp_tex_fetch(&st, x, y)) bad++;
 +        CHECK(bad == 0, "snapshot 4444 matches psp_tex_fetch: %d", bad);
 +    }
++
++    test_m3_backend_hooks();
  
      psp_mem_free();
      printf(failures ? "raster: %d failure(s)\n" : "raster: all tests passed\n", failures);

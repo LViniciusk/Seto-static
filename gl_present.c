@@ -55,6 +55,18 @@
 #ifndef GL_DEPTH_CLAMP
 #define GL_DEPTH_CLAMP 0x864F
 #endif
+#ifndef GL_READ_FRAMEBUFFER
+#define GL_READ_FRAMEBUFFER 0x8CA8
+#endif
+#ifndef GL_DRAW_FRAMEBUFFER
+#define GL_DRAW_FRAMEBUFFER 0x8CA9
+#endif
+#ifndef GL_DEPTH_STENCIL
+#define GL_DEPTH_STENCIL 0x84F9
+#endif
+#ifndef GL_UNSIGNED_INT_24_8
+#define GL_UNSIGNED_INT_24_8 0x84FA
+#endif
 
 static HWND g_hwnd;
 static HDC g_dc;
@@ -107,19 +119,41 @@ static PFNGLDELETERENDERBUFFERSPROC p_glDeleteRenderbuffers;
 static PFNGLBLENDEQUATIONPROC p_glBlendEquation;
 static PFNGLBLENDFUNCSEPARATEPROC p_glBlendFuncSeparate;
 static PFNGLBLENDCOLORPROC p_glBlendColor;
+static PFNGLUNIFORM2IPROC p_glUniform2i;
+static PFNGLBLITFRAMEBUFFERPROC p_glBlitFramebuffer;
 
-/* M1-M2: GPU thread + SPSC queue + shared FBO. */
+/* M1-M3: GPU thread + SPSC queue + multi-target FBO manager. */
+typedef struct {
+    int      used;
+    uint32_t addr;
+    uint32_t stride;
+    int      fmt;
+    int      w;
+    int      h;
+    int      stencil_alpha_dirty;
+    GLuint   fbo;
+    GLuint   color_tex;
+    GLuint   depth_rb;
+} ge_gpu_fbo;
+
 static HGLRC g_ge_ctx;
 static HANDLE g_ge_thread;
 static HANDLE g_ge_ready;
 static HANDLE g_ge_wake;
+static HANDLE g_ge_rb_done;
 static volatile LONG g_ge_quit;
 static CRITICAL_SECTION g_ge_lock;
+static CRITICAL_SECTION g_ge_rb_lock;
 static int g_ge_lock_ready;
+static int g_ge_rb_lock_ready;
 static int g_ge_active;
 static int g_ge_ok;
 static int g_ge_draw_mode;
 static GLuint g_ge_prog, g_ge_vao, g_ge_vbo, g_ge_tex, g_ge_front_tex, g_ge_fbo, g_ge_depth;
+static GLuint g_ge_self_tex, g_ge_blit_fbo;
+static int g_ge_self_w, g_ge_self_h;
+static ge_gpu_fbo g_ge_fbos[GE_MAX_FBOS];
+static int g_ge_cur_fbo_slot = -1;
 static GLuint g_ge_tex_cache[GE_TEX_CACHE_SLOTS];
 static GLint g_ge_color_loc;
 static int g_ge_w, g_ge_h;
@@ -135,7 +169,8 @@ static GLint g_ge_geo_atest, g_ge_geo_afunc, g_ge_geo_aref, g_ge_geo_amask;
 static GLint g_ge_geo_ctest, g_ge_geo_cfunc, g_ge_geo_cref, g_ge_geo_cmask;
 static GLint g_ge_geo_tex_on, g_ge_geo_tex_func, g_ge_geo_tex_alpha;
 static GLint g_ge_geo_tex_double, g_ge_geo_tex_env, g_ge_geo_tex_size;
-static GLint g_ge_geo_tex_sampler;
+static GLint g_ge_geo_tex_sampler, g_ge_geo_tex_is_fbo, g_ge_geo_fbo_tex_size;
+static GLint g_ge_geo_tex_clamp, g_ge_geo_tex_filter;
 static GLint g_ge_geo_zrange, g_ge_geo_zmin, g_ge_geo_zmax;
 static GLint g_ge_geo_fog_on, g_ge_geo_fog_color, g_ge_geo_lmode;
 static GLint g_ge_geo_zclamp_vert;
@@ -245,6 +280,8 @@ static int load_gl(void) {
     SETO_GL_LOAD(PFNGLBLENDEQUATIONPROC, glBlendEquation);
     SETO_GL_LOAD(PFNGLBLENDFUNCSEPARATEPROC, glBlendFuncSeparate);
     SETO_GL_LOAD(PFNGLBLENDCOLORPROC, glBlendColor);
+    SETO_GL_LOAD(PFNGLUNIFORM2IPROC, glUniform2i);
+    SETO_GL_LOAD(PFNGLBLITFRAMEBUFFERPROC, glBlitFramebuffer);
     return 1;
 }
 
@@ -351,6 +388,11 @@ static const char *ge_geo_fs =
     "uniform int u_clear;\n"
     "uniform sampler2D u_tex;\n"
     "uniform int u_tex_on;\n"
+    "uniform vec2 u_tex_size;\n"
+    "uniform int u_tex_is_fbo;\n"
+    "uniform ivec2 u_fbo_tex_size;\n"
+    "uniform ivec2 u_tex_clamp;\n"
+    "uniform int u_tex_filter;\n"
     "uniform int u_tex_func;\n"
     "uniform int u_tex_alpha;\n"
     "uniform int u_tex_double;\n"
@@ -372,6 +414,19 @@ static const char *ge_geo_fs =
     "uniform int u_src_premul;\n"
     "uniform vec3 u_sfix_rgb;\n"
     "uniform int u_alpha_2x;\n"
+    "int wrap_tex_i(int c, int sz, int do_clamp) {\n"
+    "  if (do_clamp != 0) return clamp(c, 0, sz - 1);\n"
+    "  int r = c % sz;\n"
+    "  if (r < 0) r += sz;\n"
+    "  return clamp(r, 0, sz - 1);\n"
+    "}\n"
+    "vec4 fetch_fbo_texel(int ix, int iy, int tw, int th) {\n"
+    "  int wx = wrap_tex_i(ix, tw, u_tex_clamp.x);\n"
+    "  int wy = wrap_tex_i(iy, th, u_tex_clamp.y);\n"
+    "  int fx = clamp(wx, 0, u_fbo_tex_size.x - 1);\n"
+    "  int fy = clamp(u_fbo_tex_size.y - 1 - wy, 0, u_fbo_tex_size.y - 1);\n"
+    "  return texelFetch(u_tex, ivec2(fx, fy), 0);\n"
+    "}\n"
     "void main() {\n"
     "  vec4 c = v_color;\n"
     "  if (u_clear != 0) {\n"
@@ -383,7 +438,26 @@ static const char *ge_geo_fs =
     "    if (iz < u_zmin || iz > u_zmax) discard;\n"
     "  }\n"
     "  if (u_tex_on != 0) {\n"
-    "    vec4 t = texture(u_tex, v_uv);\n"
+    "    vec4 t;\n"
+    "    if (u_tex_is_fbo != 0) {\n"
+    "      int tw = max(1, int(u_tex_size.x + 0.5));\n"
+    "      int th = max(1, int(u_tex_size.y + 0.5));\n"
+    "      vec2 puv = v_uv * u_tex_size;\n"
+    "      if (u_tex_filter == 0) {\n"
+    "        t = fetch_fbo_texel(int(floor(puv.x)), int(floor(puv.y)), tw, th);\n"
+    "      } else {\n"
+    "        vec2 tc = puv - vec2(0.5);\n"
+    "        int x0 = int(floor(tc.x)), y0 = int(floor(tc.y));\n"
+    "        vec2 f = tc - vec2(float(x0), float(y0));\n"
+    "        vec4 t00 = fetch_fbo_texel(x0,     y0,     tw, th);\n"
+    "        vec4 t10 = fetch_fbo_texel(x0 + 1, y0,     tw, th);\n"
+    "        vec4 t01 = fetch_fbo_texel(x0,     y0 + 1, tw, th);\n"
+    "        vec4 t11 = fetch_fbo_texel(x0 + 1, y0 + 1, tw, th);\n"
+    "        t = mix(mix(t00, t10, f.x), mix(t01, t11, f.x), f.y);\n"
+    "      }\n"
+    "    } else {\n"
+    "      t = texture(u_tex, v_uv);\n"
+    "    }\n"
     "    vec3 rgb;\n"
     "    float a;\n"
     "    if (u_tex_func == 0) {\n"
@@ -534,6 +608,10 @@ static int ge_make_geo_program(void) {
     g_ge_geo_tex_env = p_glGetUniformLocation(g_ge_geo_prog, "u_tex_env");
     g_ge_geo_tex_size = p_glGetUniformLocation(g_ge_geo_prog, "u_tex_size");
     g_ge_geo_tex_sampler = p_glGetUniformLocation(g_ge_geo_prog, "u_tex");
+    g_ge_geo_tex_is_fbo = p_glGetUniformLocation(g_ge_geo_prog, "u_tex_is_fbo");
+    g_ge_geo_fbo_tex_size = p_glGetUniformLocation(g_ge_geo_prog, "u_fbo_tex_size");
+    g_ge_geo_tex_clamp = p_glGetUniformLocation(g_ge_geo_prog, "u_tex_clamp");
+    g_ge_geo_tex_filter = p_glGetUniformLocation(g_ge_geo_prog, "u_tex_filter");
     g_ge_geo_zrange = p_glGetUniformLocation(g_ge_geo_prog, "u_zrange");
     g_ge_geo_zmin = p_glGetUniformLocation(g_ge_geo_prog, "u_zmin");
     g_ge_geo_zmax = p_glGetUniformLocation(g_ge_geo_prog, "u_zmax");
@@ -696,7 +774,8 @@ static void ge_plan_blend(const psp_draw_state *st, GLenum *sfactor, GLenum *dfa
     *dfactor = ge_blend_factor(dc, 0, df, inv_df);
 }
 
-static void ge_apply_state(const psp_draw_state *st, uint32_t clear_rgba) {
+static void ge_apply_state(const psp_draw_state *st, uint32_t clear_rgba,
+                           int fb_w, int fb_h) {
     glEnable(GL_DEPTH_CLAMP);
     int x0 = st->sc_x0, y0 = st->sc_y0, x1 = st->sc_x1, y1 = st->sc_y1;
     if (st->reg_enable) {
@@ -707,13 +786,13 @@ static void ge_apply_state(const psp_draw_state *st, uint32_t clear_rgba) {
     }
     if (x0 < 0) x0 = 0;
     if (y0 < 0) y0 = 0;
-    if (x1 >= 480) x1 = 479;
-    if (y1 >= 272) y1 = 271;
+    if (x1 >= fb_w) x1 = fb_w - 1;
+    if (y1 >= fb_h) y1 = fb_h - 1;
     glEnable(GL_SCISSOR_TEST);
     if (x1 < x0 || y1 < y0) {
         glScissor(0, 0, 0, 0);
     } else {
-        glScissor(x0, 272 - (y1 + 1), x1 - x0 + 1, y1 - y0 + 1);
+        glScissor(x0, fb_h - (y1 + 1), x1 - x0 + 1, y1 - y0 + 1);
     }
 
     const GLboolean rm = (st->write_mask & 0x000000FFu) == 0u ? GL_TRUE : GL_FALSE;
@@ -801,6 +880,58 @@ static void ge_apply_state(const psp_draw_state *st, uint32_t clear_rgba) {
     }
 }
 
+static void ge_sync_stencil_to_alpha(ge_gpu_fbo *tf) {
+    if (!tf || !tf->used || !tf->stencil_alpha_dirty || tf->fmt == 0) return;
+    p_glBindFramebuffer(GL_FRAMEBUFFER, tf->fbo);
+    glViewport(0, 0, tf->w, tf->h);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_CULL_FACE);
+
+    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glEnable(GL_STENCIL_TEST);
+    glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+    glStencilMask(0u);
+    glEnable(GL_BLEND);
+    p_glBlendEquation(GL_FUNC_ADD);
+    p_glBlendFuncSeparate(GL_ZERO, GL_ONE, GL_ONE, GL_ONE);
+
+    p_glUseProgram(g_ge_geo_prog);
+    p_glUniform2f(g_ge_geo_size, (GLfloat)tf->w, (GLfloat)tf->h);
+    p_glUniform1f(g_ge_geo_half_px, 0.0f);
+    p_glUniform1i(g_ge_geo_clear, 1);
+    p_glUniform1i(g_ge_geo_zclamp_vert, 1);
+    p_glBindBuffer(GL_ARRAY_BUFFER, g_ge_geo_vbo);
+    p_glBindVertexArray(g_ge_geo_vao);
+
+    psp_vertex q[6];
+    memset(q, 0, sizeof q);
+    q[1].x = tf->w; q[2].y = tf->h;
+    q[3].x = tf->w; q[4].y = tf->h;
+    q[5].x = tf->w; q[5].y = tf->h;
+
+    const int start_bit = tf->fmt == 1 ? 7 : (tf->fmt == 2 ? 4 : 0);
+    for (int bit = start_bit; bit <= 7; bit++) {
+        const GLuint m = 1u << (unsigned)bit;
+        const GLuint a = tf->fmt == 1 ? 0xFFu : (tf->fmt == 2 ? (m | (m >> 4)) : m);
+        const uint32_t col = (uint32_t)(a << 24);
+        for (int k = 0; k < 6; k++) q[k].rgba = col;
+        glStencilFunc(GL_EQUAL, (GLint)m, m);
+        p_glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof q, q, GL_STREAM_DRAW);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+    }
+
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    tf->stencil_alpha_dirty = 0;
+    g_ge_cur_fbo_slot = -1;
+}
+
 static void ge_process_draw(const ge_cmd *c) {
     GLenum mode;
     GLfloat half_px = 0.0f;
@@ -808,6 +939,23 @@ static void ge_process_draw(const ge_cmd *c) {
         if (c && c->tex) free(c->tex);
         return;
     }
+    if (c->fbo_slot < 0 || c->fbo_slot >= GE_MAX_FBOS ||
+        !g_ge_fbos[c->fbo_slot].used) {
+        free(c->tex);
+        return;
+    }
+    if (c->state.tex_enable && !c->state.clear &&
+        c->fbo_tex_slot >= 0 && c->fbo_tex_slot < GE_MAX_FBOS &&
+        g_ge_fbos[c->fbo_tex_slot].used &&
+        g_ge_fbos[c->fbo_tex_slot].stencil_alpha_dirty) {
+        ge_sync_stencil_to_alpha(&g_ge_fbos[c->fbo_tex_slot]);
+    }
+    ge_gpu_fbo *target = &g_ge_fbos[c->fbo_slot];
+    if (g_ge_cur_fbo_slot != c->fbo_slot) {
+        p_glBindFramebuffer(GL_FRAMEBUFFER, target->fbo);
+        g_ge_cur_fbo_slot = c->fbo_slot;
+    }
+    glViewport(0, 0, target->w, target->h);
 
     switch (c->prim) {
     case PSP_PRIM_POINTS:         mode = GL_POINTS;         half_px = 0.5f; break;
@@ -819,45 +967,75 @@ static void ge_process_draw(const ge_cmd *c) {
     default: free(c->tex); return;
     }
 
-    ge_apply_state(&c->state, c->verts[0].rgba);
+    ge_apply_state(&c->state, c->verts[0].rgba, target->w, target->h);
     if (getenv("SETO_GE_DEBUG_DRAW")) {
         static int nlogged;
         if (nlogged < 6) {
             nlogged++;
-            fprintf(stderr, "gpu: draw prim=%u n=%u clear=%d cc=%d ca=%d cd=%d "
-                    "sc=%d,%d-%d,%d reg=%d/%d v0=%d,%d z=%.0f col=%08X slot=%d err=%u\n",
-                    c->prim, c->count, c->state.clear, c->state.clear_color,
-                    c->state.clear_alpha, c->state.clear_depth,
+            fprintf(stderr, "gpu: draw fbo=%d(%dx%d) prim=%u n=%u clear=%d cc=%d ca=%d cd=%d "
+                    "sc=%d,%d-%d,%d reg=%d/%d v0=%d,%d z=%.0f col=%08X slot=%d fbo_tex=%d err=%u\n",
+                    c->fbo_slot, target->w, target->h, c->prim, c->count, c->state.clear,
+                    c->state.clear_color, c->state.clear_alpha, c->state.clear_depth,
                     c->state.sc_x0, c->state.sc_y0, c->state.sc_x1, c->state.sc_y1,
                     c->state.reg_enable, c->state.reg_enable ? c->state.reg_x1 : 0,
                     c->verts[0].x, c->verts[0].y, c->verts[0].z,
-                    c->verts[0].rgba, c->tex_slot, glGetError());
+                    c->verts[0].rgba, c->tex_slot, c->fbo_tex_slot, glGetError());
         }
     }
     p_glUseProgram(g_ge_geo_prog);
-    p_glUniform2f(g_ge_geo_size, 480.0f, 272.0f);
+    p_glUniform2f(g_ge_geo_size, (GLfloat)target->w, (GLfloat)target->h);
     p_glUniform1f(g_ge_geo_half_px, half_px);
     p_glUniform1i(g_ge_geo_clear, c->state.clear ? 1 : 0);
 
     GLuint tex = 0;
-    if (c->tex_slot >= 0 && c->tex_slot < GE_TEX_CACHE_SLOTS &&
-        c->state.tex_enable && !c->state.clear &&
+    int tex_is_fbo = 0;
+    int fbo_tw = 1, fbo_th = 1;
+    if (c->state.tex_enable && !c->state.clear &&
         c->state.tex_w > 0 && c->state.tex_h > 0) {
-        if (!g_ge_tex_cache[c->tex_slot]) glGenTextures(1, &g_ge_tex_cache[c->tex_slot]);
-        tex = g_ge_tex_cache[c->tex_slot];
-        glBindTexture(GL_TEXTURE_2D, tex);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
-                        (c->state.tex_filter & 0x101) ? GL_LINEAR : GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
-                        (c->state.tex_filter & 0x101) ? GL_LINEAR : GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
-                        c->state.tex_clamp_u ? GL_CLAMP_TO_EDGE : GL_REPEAT);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
-                        c->state.tex_clamp_v ? GL_CLAMP_TO_EDGE : GL_REPEAT);
-        if (c->tex) {
-            glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, c->state.tex_w, c->state.tex_h,
-                         0, GL_RGBA, GL_UNSIGNED_BYTE, c->tex);
+        if (c->fbo_tex_slot >= 0 && c->fbo_tex_slot < GE_MAX_FBOS &&
+            g_ge_fbos[c->fbo_tex_slot].used) {
+            const ge_gpu_fbo *tf = &g_ge_fbos[c->fbo_tex_slot];
+            tex_is_fbo = 1;
+            fbo_tw = tf->w;
+            fbo_th = tf->h;
+            if (c->fbo_tex_slot == c->fbo_slot) {
+                if (!g_ge_self_tex) glGenTextures(1, &g_ge_self_tex);
+                glBindTexture(GL_TEXTURE_2D, g_ge_self_tex);
+                if (g_ge_self_w != tf->w || g_ge_self_h != tf->h) {
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, tf->w, tf->h,
+                                 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+                    g_ge_self_w = tf->w;
+                    g_ge_self_h = tf->h;
+                }
+                p_glBindFramebuffer(GL_READ_FRAMEBUFFER, tf->fbo);
+                glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, tf->w, tf->h);
+                p_glBindFramebuffer(GL_FRAMEBUFFER, target->fbo);
+                tex = g_ge_self_tex;
+            } else {
+                tex = tf->color_tex;
+                glBindTexture(GL_TEXTURE_2D, tex);
+            }
+        } else if (c->tex_slot >= 0 && c->tex_slot < GE_TEX_CACHE_SLOTS) {
+            if (!g_ge_tex_cache[c->tex_slot]) glGenTextures(1, &g_ge_tex_cache[c->tex_slot]);
+            tex = g_ge_tex_cache[c->tex_slot];
+            glBindTexture(GL_TEXTURE_2D, tex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                            (c->state.tex_filter & 0x101) ? GL_LINEAR : GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+                            (c->state.tex_filter & 0x101) ? GL_LINEAR : GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                            c->state.tex_clamp_u ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                            c->state.tex_clamp_v ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+            if (c->tex) {
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, c->state.tex_w, c->state.tex_h,
+                             0, GL_RGBA, GL_UNSIGNED_BYTE, c->tex);
+            }
         }
     }
     free(c->tex);
@@ -866,6 +1044,12 @@ static void ge_process_draw(const ge_cmd *c) {
                   tex ? (GLfloat)c->state.tex_h : 1.0f);
     p_glUniform1i(g_ge_geo_tex_on, tex ? 1 : 0);
     p_glUniform1i(g_ge_geo_tex_sampler, 0);
+    p_glUniform1i(g_ge_geo_tex_is_fbo, tex_is_fbo);
+    p_glUniform2i(g_ge_geo_fbo_tex_size, fbo_tw, fbo_th);
+    p_glUniform2i(g_ge_geo_tex_clamp,
+                  c->state.tex_clamp_u ? 1 : 0,
+                  c->state.tex_clamp_v ? 1 : 0);
+    p_glUniform1i(g_ge_geo_tex_filter, (c->state.tex_filter & 0x101) ? 1 : 0);
     if (tex) {
         p_glUniform1i(g_ge_geo_tex_func, c->state.tex_func);
         p_glUniform1i(g_ge_geo_tex_alpha, c->state.tex_alpha ? 1 : 0);
@@ -926,17 +1110,96 @@ static void ge_process_draw(const ge_cmd *c) {
                    c->verts, GL_STREAM_DRAW);
     p_glBindVertexArray(g_ge_geo_vao);
     glDrawArrays(mode, 0, c->count);
+    if (target->fmt != 0) {
+        const uint32_t amask = (c->state.write_mask >> 24) & 0xFFu;
+        if ((!c->state.clear && c->state.stencil && amask != 0xFFu) ||
+            (c->state.clear && c->state.clear_alpha && amask != 0u && amask != 0xFFu))
+            target->stencil_alpha_dirty = 1;
+    }
     if (getenv("SETO_GE_DEBUG_DRAW") && c->count > 0) {
         static int npost;
         if (npost < 4) {
             unsigned char px[4] = {0, 0, 0, 0};
             npost++;
-            glReadPixels(240, 136, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            glReadPixels(target->w / 2, target->h / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
             fprintf(stderr, "gpu: post draw prim=%u n=%u tex=%dx%d center=%02X%02X%02X%02X\n",
                     c->prim, c->count, c->state.tex_w, c->state.tex_h,
                     px[0], px[1], px[2], px[3]);
         }
     }
+}
+
+static void ge_destroy_fbo(ge_gpu_fbo *f) {
+    if (!f) return;
+    if (f->fbo && p_glDeleteFramebuffers) p_glDeleteFramebuffers(1, &f->fbo);
+    if (f->depth_rb && p_glDeleteRenderbuffers) p_glDeleteRenderbuffers(1, &f->depth_rb);
+    if (f->color_tex) glDeleteTextures(1, &f->color_tex);
+    memset(f, 0, sizeof *f);
+}
+
+static int ge_alloc_fbo(int w, int h, int fmt, GLuint *out_fbo, GLuint *out_tex, GLuint *out_depth) {
+    GLuint tex = 0, fbo = 0, depth = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+
+    p_glGenFramebuffers(1, &fbo);
+    p_glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+
+    p_glGenRenderbuffers(1, &depth);
+    p_glBindRenderbuffer(GL_RENDERBUFFER, depth);
+    p_glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
+    p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
+                                GL_RENDERBUFFER, depth);
+    if (p_glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        fprintf(stderr, "gl: GE FBO incomplete (%dx%d)\n", w, h);
+        p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        p_glDeleteFramebuffers(1, &fbo);
+        glDeleteTextures(1, &tex);
+        p_glDeleteRenderbuffers(1, &depth);
+        return 0;
+    }
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_TRUE);
+    glStencilMask(0xFFu);
+    glClearColor(0.0f, 0.0f, 0.0f, fmt == 0 ? 1.0f : 0.0f);
+    glClearDepth(1.0);
+    glClearStencil(0);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    *out_fbo = fbo;
+    *out_tex = tex;
+    *out_depth = depth;
+    return 1;
+}
+
+static int ge_make_front_target(int w, int h) {
+    static uint32_t zero_px[GL_SCREEN_W * GL_SCREEN_H];
+    if (g_ge_front_tex) {
+        glDeleteTextures(1, &g_ge_front_tex);
+        g_ge_front_tex = 0;
+    }
+    memset(zero_px, 0, sizeof zero_px);
+    for (int i = 0; i < w * h; i++) zero_px[i] = 0xFF000000u;
+    glGenTextures(1, &g_ge_front_tex);
+    glBindTexture(GL_TEXTURE_2D, g_ge_front_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, zero_px);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    g_ge_w = w;
+    g_ge_h = h;
+    return 1;
 }
 
 static int ge_make_target(int w, int h) {
@@ -948,75 +1211,26 @@ static int ge_make_target(int w, int h) {
         glDeleteTextures(1, &g_ge_tex);
         g_ge_tex = 0;
     }
-    if (g_ge_front_tex) {
-        glDeleteTextures(1, &g_ge_front_tex);
-        g_ge_front_tex = 0;
-    }
-    glGenTextures(1, &g_ge_tex);
-    glBindTexture(GL_TEXTURE_2D, g_ge_tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0,
-                 GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-
-    if (g_ge_draw_mode) {
-        glGenTextures(1, &g_ge_front_tex);
-        glBindTexture(GL_TEXTURE_2D, g_ge_front_tex);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0,
-                     GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-    }
-
-    p_glGenFramebuffers(1, &g_ge_fbo);
-    p_glBindFramebuffer(GL_FRAMEBUFFER, g_ge_fbo);
-    p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                             GL_TEXTURE_2D, g_ge_tex, 0);
     if (g_ge_depth) {
         p_glDeleteRenderbuffers(1, &g_ge_depth);
         g_ge_depth = 0;
     }
-    p_glGenRenderbuffers(1, &g_ge_depth);
-    p_glBindRenderbuffer(GL_RENDERBUFFER, g_ge_depth);
-    p_glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
-    p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
-                                GL_RENDERBUFFER, g_ge_depth);
-    if (p_glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-        fprintf(stderr, "gl: GE FBO incomplete (%dx%d)\n", w, h);
-        p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        p_glDeleteFramebuffers(1, &g_ge_fbo);
-        g_ge_fbo = 0;
-        glDeleteTextures(1, &g_ge_tex);
-        g_ge_tex = 0;
-        if (g_ge_front_tex) {
-            glDeleteTextures(1, &g_ge_front_tex);
-            g_ge_front_tex = 0;
-        }
-        p_glDeleteRenderbuffers(1, &g_ge_depth);
-        g_ge_depth = 0;
+    if (!ge_alloc_fbo(w, h, 0, &g_ge_fbo, &g_ge_tex, &g_ge_depth))
         return 0;
-    }
-    /* Guest depth starts zeroed, which is the GE's far plane. */
-    glDisable(GL_SCISSOR_TEST);
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    glDepthMask(GL_TRUE);
-    glStencilMask(0xFFu);
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    glClearDepth(1.0);
-    glClearStencil(0);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     glViewport(0, 0, w, h);
-    p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
     g_ge_w = w;
     g_ge_h = h;
     return 1;
 }
 
 static void ge_free_gl(void) {
+    for (int i = 0; i < GE_MAX_FBOS; i++)
+        ge_destroy_fbo(&g_ge_fbos[i]);
+    g_ge_cur_fbo_slot = -1;
+    if (g_ge_blit_fbo && p_glDeleteFramebuffers) p_glDeleteFramebuffers(1, &g_ge_blit_fbo);
+    if (g_ge_self_tex) glDeleteTextures(1, &g_ge_self_tex);
+    g_ge_blit_fbo = g_ge_self_tex = 0;
+    g_ge_self_w = g_ge_self_h = 0;
     if (g_ge_fbo && p_glDeleteFramebuffers) p_glDeleteFramebuffers(1, &g_ge_fbo);
     if (g_ge_depth && p_glDeleteRenderbuffers) p_glDeleteRenderbuffers(1, &g_ge_depth);
     if (g_ge_tex) glDeleteTextures(1, &g_ge_tex);
@@ -1036,19 +1250,22 @@ static void ge_free_gl(void) {
     g_ge_passthrough_sw = 0;
 }
 
-static void ge_capture_fbo_ppm(uint32_t capture_id) {
-    static uint8_t px[480 * 272 * 4];
-    static uint8_t rgb[480 * 272 * 3];
+static void ge_write_ppm_rgba(uint32_t capture_id, const uint32_t *rgba_bottom_up,
+                              int w, int h) {
+    static uint8_t rgb[GL_SCREEN_W * GL_SCREEN_H * 3];
     const char *dir = getenv("SETO_GL_SHOT_DIR");
-    if (!dir || !dir[0] || !capture_id) return;
-    glReadPixels(0, 0, 480, 272, GL_RGBA, GL_UNSIGNED_BYTE, px);
-    for (int y = 0; y < 272; y++) {
-        const uint8_t *src = px + (271 - y) * 480 * 4;
-        uint8_t *dst = rgb + y * 480 * 3;
-        for (int x = 0; x < 480; x++) {
-            dst[x * 3 + 0] = src[x * 4 + 0];
-            dst[x * 3 + 1] = src[x * 4 + 1];
-            dst[x * 3 + 2] = src[x * 4 + 2];
+    if (!dir || !dir[0] || !capture_id || !rgba_bottom_up) return;
+    memset(rgb, 0, sizeof rgb);
+    const int cw = w < GL_SCREEN_W ? w : GL_SCREEN_W;
+    const int ch = h < GL_SCREEN_H ? h : GL_SCREEN_H;
+    for (int y = 0; y < ch; y++) {
+        const uint32_t *src = rgba_bottom_up + (size_t)(ch - 1 - y) * (size_t)w;
+        uint8_t *dst = rgb + (size_t)y * GL_SCREEN_W * 3u;
+        for (int x = 0; x < cw; x++) {
+            const uint32_t c = src[x];
+            dst[x * 3 + 0] = (uint8_t)(c & 0xFFu);
+            dst[x * 3 + 1] = (uint8_t)((c >> 8) & 0xFFu);
+            dst[x * 3 + 2] = (uint8_t)((c >> 16) & 0xFFu);
         }
     }
     char path[260];
@@ -1061,16 +1278,181 @@ static void ge_capture_fbo_ppm(uint32_t capture_id) {
     }
 }
 
-static void ge_publish_front(void) {
-    if (!g_ge_fbo || !g_ge_front_tex) return;
-    p_glBindFramebuffer(GL_FRAMEBUFFER, g_ge_fbo);
+static void ge_capture_rect_ppm(uint32_t capture_id, int y0, int cw, int ch) {
+    static uint32_t px[GL_SCREEN_W * GL_SCREEN_H];
+    const char *dir = getenv("SETO_GL_SHOT_DIR");
+    if (!dir || !dir[0] || !capture_id || cw <= 0 || ch <= 0) return;
+    const int rw = cw < GL_SCREEN_W ? cw : GL_SCREEN_W;
+    const int rh = ch < GL_SCREEN_H ? ch : GL_SCREEN_H;
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glReadPixels(0, y0, rw, rh, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    ge_write_ppm_rgba(capture_id, px, rw, rh);
+}
+
+static void ge_publish_fbo_slot(int slot) {
+    if (slot < 0 || slot >= GE_MAX_FBOS || !g_ge_fbos[slot].used || !g_ge_front_tex)
+        return;
+    const ge_gpu_fbo *df = &g_ge_fbos[slot];
+    const int cw = df->w < GL_SCREEN_W ? df->w : GL_SCREEN_W;
+    const int ch = df->h < GL_SCREEN_H ? df->h : GL_SCREEN_H;
+    const int y0 = df->h - ch;
+    p_glBindFramebuffer(GL_FRAMEBUFFER, df->fbo);
     EnterCriticalSection(&g_ge_lock);
     glBindTexture(GL_TEXTURE_2D, g_ge_front_tex);
-    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, 480, 272);
+    if (cw < GL_SCREEN_W || ch < GL_SCREEN_H) {
+        static uint32_t blank[GL_SCREEN_W * GL_SCREEN_H];
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, GL_SCREEN_W, GL_SCREEN_H,
+                        GL_RGBA, GL_UNSIGNED_BYTE, blank);
+    }
+    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, GL_SCREEN_H - ch, 0, y0, cw, ch);
     glFinish();
     g_ge_have_front = 1;
     g_ge_passthrough_sw = 0;
     LeaveCriticalSection(&g_ge_lock);
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+static void ge_bind_or_create_fbo(const ge_cmd *c) {
+    if (!c || c->fbo_slot < 0 || c->fbo_slot >= GE_MAX_FBOS ||
+        c->w <= 0 || c->h <= 0)
+        return;
+    ge_gpu_fbo *f = &g_ge_fbos[c->fbo_slot];
+    if (f->used && f->addr == c->addr && f->stride == c->stride &&
+        f->fmt == (int)c->fmt && f->w == c->w) {
+        if (c->h > f->h) {
+            GLuint nfbo = 0, ntex = 0, ndepth = 0;
+            if (ge_alloc_fbo(f->w, c->h, f->fmt, &nfbo, &ntex, &ndepth)) {
+                p_glBindFramebuffer(GL_READ_FRAMEBUFFER, f->fbo);
+                p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, nfbo);
+                glDisable(GL_SCISSOR_TEST);
+                p_glBlitFramebuffer(0, 0, f->w, f->h,
+                                    0, c->h - f->h, f->w, c->h,
+                                    GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT |
+                                    GL_STENCIL_BUFFER_BIT, GL_NEAREST);
+                p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                p_glDeleteFramebuffers(1, &f->fbo);
+                glDeleteTextures(1, &f->color_tex);
+                p_glDeleteRenderbuffers(1, &f->depth_rb);
+                f->fbo = nfbo;
+                f->color_tex = ntex;
+                f->depth_rb = ndepth;
+                f->h = c->h;
+            }
+        }
+        p_glBindFramebuffer(GL_FRAMEBUFFER, f->fbo);
+        g_ge_cur_fbo_slot = c->fbo_slot;
+        return;
+    }
+
+    ge_destroy_fbo(f);
+    GLuint nfbo = 0, ntex = 0, ndepth = 0;
+    if (!ge_alloc_fbo(c->w, c->h, (int)c->fmt, &nfbo, &ntex, &ndepth)) return;
+    f->used = 1;
+    f->addr = c->addr;
+    f->stride = c->stride;
+    f->fmt = (int)c->fmt;
+    f->w = c->w;
+    f->h = c->h;
+    f->stencil_alpha_dirty = 0;
+    f->fbo = nfbo;
+    f->color_tex = ntex;
+    f->depth_rb = ndepth;
+    p_glBindFramebuffer(GL_FRAMEBUFFER, f->fbo);
+    g_ge_cur_fbo_slot = c->fbo_slot;
+}
+
+static void ge_upload_target_cmd(const ge_cmd *c) {
+    if (!c) return;
+    if (c->tex && c->fbo_slot >= 0 && c->fbo_slot < GE_MAX_FBOS &&
+        g_ge_fbos[c->fbo_slot].used && c->w > 0 && c->h > 0) {
+        ge_gpu_fbo *f = &g_ge_fbos[c->fbo_slot];
+        const int uw = c->w < f->w ? c->w : f->w;
+        const int uh = c->h < f->h ? c->h : f->h;
+        if (uw == c->w && uh > 0) {
+            glBindTexture(GL_TEXTURE_2D, f->color_tex);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, f->h - uh, uw, uh,
+                            GL_RGBA, GL_UNSIGNED_BYTE,
+                            c->tex + (size_t)(c->h - uh) * (size_t)c->w);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            f->stencil_alpha_dirty = 0;
+        }
+    }
+    free(c->tex);
+}
+
+static void ge_blit_cmd(const ge_cmd *c) {
+    if (!c || c->w <= 0 || c->h <= 0) return;
+    if (c->src_slot < 0 || c->src_slot >= GE_MAX_FBOS ||
+        c->fbo_slot < 0 || c->fbo_slot >= GE_MAX_FBOS)
+        return;
+    ge_gpu_fbo *src = &g_ge_fbos[c->src_slot];
+    ge_gpu_fbo *dst = &g_ge_fbos[c->fbo_slot];
+    if (!src->used || !dst->used) return;
+    if (src->stencil_alpha_dirty) ge_sync_stencil_to_alpha(src);
+    const int sy0 = src->h - (c->sy + c->h);
+    const int dy0 = dst->h - (c->dy + c->h);
+    glDisable(GL_SCISSOR_TEST);
+    if (c->src_slot == c->fbo_slot) {
+        if (!g_ge_self_tex) glGenTextures(1, &g_ge_self_tex);
+        glBindTexture(GL_TEXTURE_2D, g_ge_self_tex);
+        if (g_ge_self_w != src->w || g_ge_self_h != src->h) {
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, src->w, src->h,
+                         0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+            g_ge_self_w = src->w;
+            g_ge_self_h = src->h;
+        }
+        p_glBindFramebuffer(GL_READ_FRAMEBUFFER, src->fbo);
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, c->sx, sy0, c->w, c->h);
+        if (!g_ge_blit_fbo) p_glGenFramebuffers(1, &g_ge_blit_fbo);
+        p_glBindFramebuffer(GL_READ_FRAMEBUFFER, g_ge_blit_fbo);
+        p_glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                 GL_TEXTURE_2D, g_ge_self_tex, 0);
+        p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst->fbo);
+        p_glBlitFramebuffer(0, 0, c->w, c->h,
+                            c->dx, dy0, c->dx + c->w, dy0 + c->h,
+                            GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    } else {
+        p_glBindFramebuffer(GL_READ_FRAMEBUFFER, src->fbo);
+        p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst->fbo);
+        p_glBlitFramebuffer(c->sx, sy0, c->sx + c->w, sy0 + c->h,
+                            c->dx, dy0, c->dx + c->w, dy0 + c->h,
+                            GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    }
+    dst->stencil_alpha_dirty = 0;
+    p_glBindFramebuffer(GL_FRAMEBUFFER,
+                        (g_ge_cur_fbo_slot >= 0 && g_ge_fbos[g_ge_cur_fbo_slot].used)
+                            ? g_ge_fbos[g_ge_cur_fbo_slot].fbo : 0);
+}
+
+static void ge_readback_cmd(const ge_cmd *c) {
+    if (c && c->fbo_slot >= 0 && c->fbo_slot < GE_MAX_FBOS &&
+        g_ge_fbos[c->fbo_slot].used && c->w > 0 && c->h > 0) {
+        ge_gpu_fbo *f = &g_ge_fbos[c->fbo_slot];
+        if (c->rb_rgba && !c->rb_ds && f->stencil_alpha_dirty)
+            ge_sync_stencil_to_alpha(f);
+        const int rw = c->w < f->w ? c->w : f->w;
+        const int rh = c->h < f->h ? c->h : f->h;
+        if (rw > 0 && rh > 0) {
+            p_glBindFramebuffer(GL_FRAMEBUFFER, f->fbo);
+            glPixelStorei(GL_PACK_ALIGNMENT, 4);
+            if (c->rb_rgba)
+                glReadPixels(0, f->h - rh, rw, rh, GL_RGBA, GL_UNSIGNED_BYTE, c->rb_rgba);
+            if (c->rb_ds)
+                glReadPixels(0, f->h - rh, rw, rh, GL_DEPTH_STENCIL,
+                             GL_UNSIGNED_INT_24_8, c->rb_ds);
+            glFinish();
+            if (g_ge_cur_fbo_slot >= 0 && g_ge_fbos[g_ge_cur_fbo_slot].used)
+                p_glBindFramebuffer(GL_FRAMEBUFFER, g_ge_fbos[g_ge_cur_fbo_slot].fbo);
+        }
+    }
+    if (g_ge_rb_done) SetEvent(g_ge_rb_done);
 }
 
 static DWORD WINAPI ge_thread(LPVOID unused) {
@@ -1085,7 +1467,8 @@ static DWORD WINAPI ge_thread(LPVOID unused) {
     }
 
     if (g_ge_draw_mode) {
-        if (!ge_make_geo_program() || !ge_make_geo_vao() || !ge_make_target(480, 272)) {
+        if (!ge_make_geo_program() || !ge_make_geo_vao() ||
+            !ge_make_front_target(GL_SCREEN_W, GL_SCREEN_H)) {
             ge_free_gl();
             wglMakeCurrent(NULL, NULL);
             SetEvent(g_ge_ready);
@@ -1111,61 +1494,76 @@ static DWORD WINAPI ge_thread(LPVOID unused) {
     while (!g_ge_quit) {
         ge_cmd cmd;
         if (g_ge_draw_mode) {
-            if (g_ge_fbo) {
-                p_glBindFramebuffer(GL_FRAMEBUFFER, g_ge_fbo);
-                glViewport(0, 0, 480, 272);
-            }
             int popped = 0;
             while (ge_queue_pop(&g_ge_q, &cmd)) {
                 if (popped < 4 && getenv("SETO_GE_DEBUG_FBO")) {
-                    fprintf(stderr, "gl: pop type=%u prim=%u count=%u v0=%d,%d "
-                            "col=%08X slot=%d tex=%p\n", cmd.type, cmd.prim, cmd.count,
+                    fprintf(stderr, "gl: pop type=%u fbo=%d prim=%u count=%u v0=%d,%d "
+                            "col=%08X slot=%d fbo_tex=%d tex=%p\n",
+                            cmd.type, cmd.fbo_slot, cmd.prim, cmd.count,
                             cmd.verts[0].x, cmd.verts[0].y, cmd.verts[0].rgba,
-                            cmd.tex_slot, (void *)cmd.tex);
+                            cmd.tex_slot, cmd.fbo_tex_slot, (void *)cmd.tex);
                 }
                 popped++;
-                if (cmd.type == GE_CMD_DRAW) {
+                if (cmd.type == GE_CMD_TARGET) {
+                    ge_bind_or_create_fbo(&cmd);
+                } else if (cmd.type == GE_CMD_DRAW) {
                     ge_process_draw(&cmd);
                     draws_since_present++;
+                } else if (cmd.type == GE_CMD_UPLOAD_TARGET) {
+                    ge_upload_target_cmd(&cmd);
+                    draws_since_present++;
+                } else if (cmd.type == GE_CMD_BLIT) {
+                    ge_blit_cmd(&cmd);
+                    draws_since_present++;
+                } else if (cmd.type == GE_CMD_READBACK) {
+                    ge_readback_cmd(&cmd);
                 } else if (cmd.type == GE_CMD_PRESENT) {
-                    if (cmd.color) ge_capture_fbo_ppm(cmd.color);
-                    if (draws_since_present > 0) {
-                        ge_publish_front();
-                        draws_since_present = 0;
-                        last_pub = GetTickCount();
+                    if (cmd.fbo_slot >= 0 && cmd.fbo_slot < GE_MAX_FBOS &&
+                        g_ge_fbos[cmd.fbo_slot].used) {
+                        const ge_gpu_fbo *df = &g_ge_fbos[cmd.fbo_slot];
+                        const int cw = df->w < GL_SCREEN_W ? df->w : GL_SCREEN_W;
+                        const int ch = df->h < GL_SCREEN_H ? df->h : GL_SCREEN_H;
+                        p_glBindFramebuffer(GL_FRAMEBUFFER, df->fbo);
+                        if (cmd.color) ge_capture_rect_ppm(cmd.color, df->h - ch, cw, ch);
+                        ge_publish_fbo_slot(cmd.fbo_slot);
+                        if (g_ge_cur_fbo_slot >= 0 && g_ge_fbos[g_ge_cur_fbo_slot].used)
+                            p_glBindFramebuffer(GL_FRAMEBUFFER,
+                                                g_ge_fbos[g_ge_cur_fbo_slot].fbo);
+                        free(cmd.tex);
+                    } else if (cmd.tex) {
+                        EnterCriticalSection(&g_ge_lock);
+                        glBindTexture(GL_TEXTURE_2D, g_ge_front_tex);
+                        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+                        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, GL_SCREEN_W, GL_SCREEN_H,
+                                        GL_RGBA, GL_UNSIGNED_BYTE, cmd.tex);
+                        glFinish();
+                        g_ge_have_front = 1;
+                        g_ge_passthrough_sw = 0;
+                        LeaveCriticalSection(&g_ge_lock);
+                        glBindTexture(GL_TEXTURE_2D, 0);
+                        if (cmd.color)
+                            ge_write_ppm_rgba(cmd.color, cmd.tex, GL_SCREEN_W, GL_SCREEN_H);
+                        free(cmd.tex);
                     } else {
                         EnterCriticalSection(&g_ge_lock);
                         g_ge_passthrough_sw = 1;
                         LeaveCriticalSection(&g_ge_lock);
                     }
+                    draws_since_present = 0;
+                    last_pub = GetTickCount();
                 } else if (cmd.type == GE_CMD_TEST_COLOR) {
                     g_ge_rgb = cmd.color;
+                } else if (cmd.type == GE_CMD_QUIT) {
+                    free(cmd.tex);
+                    break;
                 }
             }
-            if (draws_since_present > 0 && GetTickCount() - last_pub >= 100u) {
-                ge_publish_front();
+            if (draws_since_present > 0 && !g_ge_have_front &&
+                g_ge_cur_fbo_slot >= 0 && g_ge_fbos[g_ge_cur_fbo_slot].used &&
+                GetTickCount() - last_pub >= 250u) {
+                ge_publish_fbo_slot(g_ge_cur_fbo_slot);
                 draws_since_present = 0;
                 last_pub = GetTickCount();
-            }
-            if (getenv("SETO_GE_DEBUG_FBO")) {
-                static int fbo_log;
-                static unsigned char px[480 * 272 * 4];
-                if ((fbo_log++ % 60) == 0) {
-                    int nz = 0, maxv = 0;
-                    glReadPixels(0, 0, 480, 272, GL_RGBA, GL_UNSIGNED_BYTE, px);
-                    for (int i = 0; i < 480 * 272 * 4; i++) {
-                        if (px[i]) { nz++; if (px[i] > maxv) maxv = px[i]; }
-                    }
-                    fprintf(stderr, "gl: FBO=%u tex=%u status=%u popped=%d err=%u "
-                            "nonzero=%d max=%02X center=%02X%02X%02X%02X\n",
-                            g_ge_fbo, g_ge_tex,
-                            p_glCheckFramebufferStatus(GL_FRAMEBUFFER), popped,
-                            glGetError(), nz, maxv,
-                            px[(136 * 480 + 240) * 4 + 0],
-                            px[(136 * 480 + 240) * 4 + 1],
-                            px[(136 * 480 + 240) * 4 + 2],
-                            px[(136 * 480 + 240) * 4 + 3]);
-                }
             }
             if (g_ge_wake) WaitForSingleObject(g_ge_wake, 4);
             else Sleep(4);
@@ -1201,6 +1599,7 @@ static DWORD WINAPI ge_thread(LPVOID unused) {
         Sleep(16);
     }
 
+    if (g_ge_rb_done) SetEvent(g_ge_rb_done);
     ge_free_gl();
     wglMakeCurrent(NULL, NULL);
     return 0;
@@ -1214,6 +1613,10 @@ static void ge_stop(void) {
         CloseHandle(g_ge_thread);
         g_ge_thread = NULL;
     }
+    if (g_ge_rb_done) {
+        CloseHandle(g_ge_rb_done);
+        g_ge_rb_done = NULL;
+    }
     if (g_ge_wake) {
         CloseHandle(g_ge_wake);
         g_ge_wake = NULL;
@@ -1221,6 +1624,10 @@ static void ge_stop(void) {
     if (g_ge_ready) {
         CloseHandle(g_ge_ready);
         g_ge_ready = NULL;
+    }
+    if (g_ge_rb_lock_ready) {
+        DeleteCriticalSection(&g_ge_rb_lock);
+        g_ge_rb_lock_ready = 0;
     }
     if (g_ge_lock_ready) {
         DeleteCriticalSection(&g_ge_lock);
@@ -1253,6 +1660,8 @@ static int ge_start(PFNWGLCREATECONTEXTATTRIBSARBPROC create_ctx) {
     }
     InitializeCriticalSection(&g_ge_lock);
     g_ge_lock_ready = 1;
+    InitializeCriticalSection(&g_ge_rb_lock);
+    g_ge_rb_lock_ready = 1;
     if (ge_queue_init(&g_ge_q, 512) != 0) {
         fprintf(stderr, "gl: GE queue init failed\n");
         ge_stop();
@@ -1262,6 +1671,12 @@ static int ge_start(PFNWGLCREATECONTEXTATTRIBSARBPROC create_ctx) {
     g_ge_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
     if (!g_ge_wake) {
         fprintf(stderr, "gl: GE wake event failed\n");
+        ge_stop();
+        return 0;
+    }
+    g_ge_rb_done = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!g_ge_rb_done) {
+        fprintf(stderr, "gl: GE readback event failed\n");
         ge_stop();
         return 0;
     }
@@ -1543,16 +1958,10 @@ void seto_gl_present_frame(HWND hwnd, const uint32_t *rgba) {
 
 int seto_ge_gpu_draw_mode(void) { return g_ge_draw_mode; }
 
-int seto_ge_gpu_enqueue_target(uint32_t addr, uint32_t stride, int fmt) {
-    ge_cmd c;
+static int ge_enqueue_wait(ge_cmd c, int max_ms) {
     if (!g_ge_active || !g_ge_draw_mode || !g_ge_queue_ready) return 0;
-    memset(&c, 0, sizeof c);
-    c.type = GE_CMD_TARGET;
-    c.addr = addr;
-    c.stride = stride;
-    c.fmt = (uint32_t)fmt;
-    c.tex_slot = -1;
-    for (int i = 0; i < 100; i++) {
+    for (int i = 0; i < max_ms; i++) {
+        if (g_ge_quit) return 0;
         if (ge_queue_push(&g_ge_q, c)) {
             if (g_ge_wake) SetEvent(g_ge_wake);
             return 1;
@@ -1562,46 +1971,113 @@ int seto_ge_gpu_enqueue_target(uint32_t addr, uint32_t stride, int fmt) {
     return 0;
 }
 
-int seto_ge_gpu_enqueue_draw(int prim, const psp_vertex *v, int count,
-                             const psp_draw_state *st, uint32_t *tex,
-                             int tex_slot) {
+int seto_ge_gpu_enqueue_target(int fbo_slot, uint32_t addr, uint32_t stride,
+                               int fmt, int w, int h) {
     ge_cmd c;
-    if (!g_ge_active || !g_ge_draw_mode || !g_ge_queue_ready) return 0;
+    if (fbo_slot < 0 || fbo_slot >= GE_MAX_FBOS || w <= 0 || h <= 0) return 0;
+    memset(&c, 0, sizeof c);
+    c.type = GE_CMD_TARGET;
+    c.fbo_slot = fbo_slot;
+    c.addr = addr;
+    c.stride = stride;
+    c.fmt = (uint32_t)fmt;
+    c.w = w;
+    c.h = h;
+    c.tex_slot = -1;
+    c.fbo_tex_slot = -1;
+    return ge_enqueue_wait(c, 250);
+}
+
+int seto_ge_gpu_enqueue_draw(int prim, const psp_vertex *v, int count,
+                             const psp_draw_state *st, int fbo_slot,
+                             uint32_t *tex, int tex_slot, int fbo_tex_slot) {
+    ge_cmd c;
     if (!v || !st || count <= 0 || count > GE_MAX_VERTS) return 0;
+    if (fbo_slot < 0 || fbo_slot >= GE_MAX_FBOS) return 0;
     memset(&c, 0, sizeof c);
     c.type = GE_CMD_DRAW;
     c.prim = (uint32_t)prim;
     c.count = (uint32_t)count;
+    c.fbo_slot = fbo_slot;
     c.tex = tex;
     c.tex_slot = tex_slot;
+    c.fbo_tex_slot = fbo_tex_slot;
     c.state = *st;
     memcpy(c.verts, v, (size_t)count * sizeof *v);
-    /* Backpressure: the GPU thread is the only consumer, and dropping a draw
-     * loses UI text at the end of a frame. Wait up to 250 ms for space. */
-    for (int i = 0; i < 250; i++) {
-        if (ge_queue_push(&g_ge_q, c)) {
-            if (g_ge_wake) SetEvent(g_ge_wake);
-            return 1;
-        }
-        Sleep(1);
-    }
-    return 0;
+    return ge_enqueue_wait(c, 250);
 }
 
-void seto_ge_gpu_present(uint32_t capture_id) {
+int seto_ge_gpu_enqueue_upload(int fbo_slot, int w, int h, uint32_t *rgba) {
     ge_cmd c;
-    if (!g_ge_active || !g_ge_draw_mode || !g_ge_queue_ready) return;
+    if (!rgba || fbo_slot < 0 || fbo_slot >= GE_MAX_FBOS || w <= 0 || h <= 0)
+        return 0;
+    memset(&c, 0, sizeof c);
+    c.type = GE_CMD_UPLOAD_TARGET;
+    c.fbo_slot = fbo_slot;
+    c.w = w;
+    c.h = h;
+    c.tex = rgba;
+    c.tex_slot = -1;
+    c.fbo_tex_slot = -1;
+    return ge_enqueue_wait(c, 250);
+}
+
+int seto_ge_gpu_enqueue_blit(int src_slot, int sx, int sy,
+                             int dst_slot, int dx, int dy, int w, int h) {
+    ge_cmd c;
+    if (src_slot < 0 || src_slot >= GE_MAX_FBOS ||
+        dst_slot < 0 || dst_slot >= GE_MAX_FBOS || w <= 0 || h <= 0)
+        return 0;
+    memset(&c, 0, sizeof c);
+    c.type = GE_CMD_BLIT;
+    c.src_slot = src_slot;
+    c.fbo_slot = dst_slot;
+    c.sx = sx;
+    c.sy = sy;
+    c.dx = dx;
+    c.dy = dy;
+    c.w = w;
+    c.h = h;
+    c.tex_slot = -1;
+    c.fbo_tex_slot = -1;
+    return ge_enqueue_wait(c, 250);
+}
+
+int seto_ge_gpu_readback(int fbo_slot, int w, int h,
+                         uint32_t *rgba, uint32_t *ds) {
+    ge_cmd c;
+    if (!g_ge_active || !g_ge_draw_mode || !g_ge_queue_ready || !g_ge_rb_lock_ready)
+        return -1;
+    if (fbo_slot < 0 || fbo_slot >= GE_MAX_FBOS || w <= 0 || h <= 0)
+        return -1;
+    EnterCriticalSection(&g_ge_rb_lock);
+    ResetEvent(g_ge_rb_done);
+    memset(&c, 0, sizeof c);
+    c.type = GE_CMD_READBACK;
+    c.fbo_slot = fbo_slot;
+    c.w = w;
+    c.h = h;
+    c.rb_rgba = rgba;
+    c.rb_ds = ds;
+    c.tex_slot = -1;
+    c.fbo_tex_slot = -1;
+    int pushed = ge_enqueue_wait(c, 250);
+    DWORD wr = pushed ? WaitForSingleObject(g_ge_rb_done, 2000) : WAIT_FAILED;
+    LeaveCriticalSection(&g_ge_rb_lock);
+    return (pushed && wr == WAIT_OBJECT_0 && !g_ge_quit) ? 0 : -1;
+}
+
+void seto_ge_gpu_present(int disp_slot, uint32_t *ram_rgba, uint32_t capture_id) {
+    ge_cmd c;
     memset(&c, 0, sizeof c);
     c.type = GE_CMD_PRESENT;
+    c.fbo_slot = disp_slot;
+    c.tex = ram_rgba;
     c.color = capture_id;
     c.tex_slot = -1;
-    for (int i = 0; i < 250; i++) {
-        if (ge_queue_push(&g_ge_q, c)) {
-            if (g_ge_wake) SetEvent(g_ge_wake);
-            return;
-        }
-        Sleep(1);
-    }
+    c.fbo_tex_slot = -1;
+    if (!ge_enqueue_wait(c, 250))
+        free(ram_rgba);
 }
 
 void seto_gl_present_shutdown(HWND hwnd) {
