@@ -166,6 +166,14 @@ int main(int argc, char **argv) {
     for (uint32_t i = 0; i < 31u; i++) peer_nick[i] = (char)psp_read8(scratch + 0x500u + i);
     CHECK(strcmp(peer_nick, is_host ? "Kaiba" : "Jaden") == 0);
 
+    /* Verify PeerInfo.last_recv matches sceKernelGetSystemTimeWide clock domain */
+    CHECK(call_hle(0x8DB83FDCu, peer_mac_addr, 152u, scratch + 0x520u, 0, 0, 0, 0, 0, 0) == 0);
+    uint64_t peer_ts = (uint64_t)psp_read32(scratch + 0x520u + 144u) |
+                       ((uint64_t)psp_read32(scratch + 0x520u + 148u) << 32);
+    psp_hle_call(0x82BC5777u);
+    uint64_t sys_ts = (uint64_t)psp_cpu.r[PSP_REG_V0] | ((uint64_t)psp_cpu.r[PSP_REG_V1] << 32);
+    CHECK(sys_ts >= peer_ts && (sys_ts - peer_ts) < 1000000ULL);
+
     /* Joiner challenges Host -> Host accepts -> Both reach COMPLETE (7) */
     if (!is_host) {
         CHECK(call_hle(0x5E3D4B79u, mid, peer_mac_addr, 0, 0, 0, 0, 0, 0, 0) == 0);
