@@ -121,7 +121,6 @@ static int sock_wait(seto_sock_t s, int want_write, int timeout_ms) {
 #define NET_MAX_PTP_BACKLOG   8
 #define NET_MAX_CB_EVENTS     256
 
-#define PSP_ADHOC_ERROR_NOT_ENOUGH_SPACE 0x8041070Au
 #define PSP_UTILITY_STATUS_NONE          0
 #define PSP_UTILITY_STATUS_INIT          1
 #define PSP_UTILITY_STATUS_RUNNING       2
@@ -170,6 +169,7 @@ typedef struct {
     uint8_t   mac[SETO_MAC_LEN];
     uint16_t  port;
     uint32_t  bufsize;
+    uint32_t  alert_flags;
     pdp_pkt_t q[NET_MAX_PDP_QUEUE];
     int       q_head;
     int       q_count;
@@ -198,6 +198,7 @@ typedef struct {
     int      connected;
     int      peer_closed;
     uint32_t close_reason;
+    uint32_t alert_flags;
 
     /* For PTP_KIND_LISTENER */
     ptp_pending_inc_t inc[NET_MAX_PTP_BACKLOG];
@@ -1438,6 +1439,18 @@ static void hle_adhocctl_get_scan_info(void) {
     psp_ret(0u);
 }
 
+static uint64_t guest_sys_time_us(void) {
+    /* Query sceKernelGetSystemTimeWide (0x82BC5777) so PeerInfo.last_recv
+     * uses the exact same epoch+vtime clock domain as the game. */
+    uint32_t saved_v0 = psp_cpu.r[PSP_REG_V0];
+    uint32_t saved_v1 = psp_cpu.r[PSP_REG_V1];
+    psp_hle_call(0x82BC5777u);
+    uint64_t ts = (uint64_t)psp_cpu.r[PSP_REG_V0] | ((uint64_t)psp_cpu.r[PSP_REG_V1] << 32);
+    psp_cpu.r[PSP_REG_V0] = saved_v0;
+    psp_cpu.r[PSP_REG_V1] = saved_v1;
+    return ts ? ts : psp_threadman_vtime_us();
+}
+
 static void write_peer_info_guest(uint32_t dst, uint32_t max_sz,
                                   uint32_t next_ptr,
                                   const uint8_t mac[SETO_MAC_LEN],
@@ -1458,7 +1471,7 @@ static void write_peer_info_guest(uint32_t dst, uint32_t max_sz,
     memcpy(raw + 132u, mac, SETO_MAC_LEN);
     uint32_t flags = 0x0400u;
     memcpy(raw + 140u, &flags, 4u);
-    uint64_t ts = psp_threadman_vtime_us();
+    uint64_t ts = guest_sys_time_us();
     memcpy(raw + 144u, &ts, 8u);
 
     uint32_t n = max_sz < 152u ? max_sz : 152u;
@@ -1500,11 +1513,16 @@ static void hle_adhocctl_get_peer_list(void) {
 }
 
 static void hle_adhocctl_get_peer_info(void) {
+    seto_net_pump_callbacks();
     uint32_t mac_ptr  = psp_arg(0);
     uint32_t size     = psp_arg(1);
     uint32_t info_ptr = psp_arg(2);
     if (!mac_ptr || !info_ptr || size == 0) {
-        psp_ret(PSP_ADHOC_ERROR_INVALID_ARG);
+        psp_ret(PSP_ADHOCCTL_ERROR_INVALID_ARG);
+        return;
+    }
+    if (size < 152u) {
+        psp_ret(PSP_ADHOC_ERROR_INVALID_BUFLEN);
         return;
     }
     uint8_t mac[SETO_MAC_LEN];
@@ -1526,7 +1544,68 @@ static void hle_adhocctl_get_peer_info(void) {
         }
     }
     mtx_unlock(&g_state_lock);
-    psp_ret(found ? 0u : PSP_ADHOC_ERROR_INVALID_ARG);
+    if (trace_enabled()) {
+        fprintf(stderr, "seto_net: GetPeerInfo(%02x:%02x:%02x:%02x:%02x:%02x, size=%u) -> %s\n",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], size,
+                found ? "OK" : "NO_ENTRY");
+    }
+    psp_ret(found ? 0u : PSP_ADHOC_ERROR_NO_ENTRY);
+}
+
+static void hle_adhocctl_get_addr_by_name(void) {
+    seto_net_pump_callbacks();
+    uint32_t nick_ptr = psp_arg(0);
+    uint32_t len_ptr  = psp_arg(1);
+    uint32_t buf_ptr  = psp_arg(2);
+    if (!nick_ptr || !len_ptr) {
+        psp_ret(PSP_ADHOCCTL_ERROR_INVALID_ARG);
+        return;
+    }
+    char target[SETO_NICKNAME_LEN + 1] = { 0 };
+    for (uint32_t i = 0; i < SETO_NICKNAME_LEN; i++) {
+        char c = (char)psp_read8(nick_ptr + i);
+        if (!c) break;
+        target[i] = c;
+    }
+    const uint32_t entry_sz = 152u;
+    mtx_lock(&g_state_lock);
+    int matches = 0;
+    for (int i = 0; i < g_peer_count; i++) {
+        if (seto_mac_equal(g_peers[i].mac, g_local_mac)) continue;
+        if (strncmp(g_peers[i].nickname, target, SETO_NICKNAME_LEN) == 0)
+            matches++;
+    }
+    if (!buf_ptr) {
+        psp_write32(len_ptr, (uint32_t)matches * entry_sz);
+        mtx_unlock(&g_state_lock);
+        psp_ret(0u);
+        return;
+    }
+    uint32_t cap = psp_read32(len_ptr) / entry_sz;
+    uint32_t written = 0;
+    for (int i = 0; i < g_peer_count && written < cap; i++) {
+        if (seto_mac_equal(g_peers[i].mac, g_local_mac)) continue;
+        if (strncmp(g_peers[i].nickname, target, SETO_NICKNAME_LEN) != 0) continue;
+        uint32_t p = buf_ptr + written * entry_sz;
+        uint32_t next = ((int)(written + 1u) < matches && (written + 1u) < cap) ? (p + entry_sz) : 0u;
+        write_peer_info_guest(p, entry_sz, next, g_peers[i].mac, g_peers[i].nickname);
+        written++;
+    }
+    psp_write32(len_ptr, written * entry_sz);
+    mtx_unlock(&g_state_lock);
+    psp_ret(0u);
+}
+
+static void hle_adhocctl_get_adhoc_id(void) {
+    uint32_t out = psp_arg(0);
+    if (!out) {
+        psp_ret(PSP_ADHOCCTL_ERROR_INVALID_ARG);
+        return;
+    }
+    for (uint32_t i = 0; i < 16u; i++) psp_write8(out + i, 0);
+    for (uint32_t i = 0; i < 9u && g_product[i]; i++)
+        psp_write8(out + 4u + i, (uint8_t)g_product[i]);
+    psp_ret(0u);
 }
 
 static void hle_adhocctl_get_name_by_addr(void) {
@@ -1602,6 +1681,13 @@ static pdp_sock_t *find_pdp_locked(int id) {
     return NULL;
 }
 
+static ptp_sock_t *find_ptp_locked(int id) {
+    for (int i = 0; i < NET_MAX_PTP_SOCKS; i++) {
+        if (g_ptp[i].kind != PTP_KIND_UNUSED && g_ptp[i].id == id) return &g_ptp[i];
+    }
+    return NULL;
+}
+
 static void hle_adhoc_pdp_create(void) {
     ensure_locks();
     uint32_t mac_ptr = psp_arg(0);
@@ -1637,6 +1723,10 @@ static void hle_adhoc_pdp_create(void) {
         seto_pdp_port_t req = { .client_pdp_id = (uint32_t)id, .port = port, .reserved = 0 };
         (void)net_send(SETO_OP_PDP_BIND, &req, sizeof(req));
     }
+    if (trace_enabled()) {
+        fprintf(stderr, "seto_net: PdpCreate(port=%u, bufsize=%u) -> id=%d\n",
+                port, bufsize, id);
+    }
     psp_ret((uint32_t)id);
 }
 
@@ -1659,6 +1749,9 @@ static void hle_adhoc_pdp_delete(void) {
         seto_pdp_port_t req = { .client_pdp_id = (uint32_t)id, .port = port, .reserved = 0 };
         (void)net_send(SETO_OP_PDP_UNBIND, &req, sizeof(req));
     }
+    if (trace_enabled()) {
+        fprintf(stderr, "seto_net: PdpDelete(id=%d, port=%u)\n", id, port);
+    }
     psp_ret(0u);
 }
 
@@ -1670,6 +1763,10 @@ static void hle_adhoc_pdp_send(void) {
     uint32_t len      = psp_arg(4);
 
     if (!dmac_ptr || dport == 0 || len > SETO_MAX_PDP_LEN || (len > 0 && !data_ptr)) {
+        if (trace_enabled()) {
+            fprintf(stderr, "seto_net: PdpSend(id=%d, dmac=0x%08X, dport=%u, data=0x%08X, len=%u) -> INVALID_ARG\n",
+                    id, dmac_ptr, dport, data_ptr, len);
+        }
         psp_ret(PSP_ADHOC_ERROR_INVALID_ARG);
         return;
     }
@@ -1680,12 +1777,20 @@ static void hle_adhoc_pdp_send(void) {
     if (s) sport = s->port;
     mtx_unlock(&g_state_lock);
     if (!sport) {
-        psp_ret(PSP_ADHOC_ERROR_INVALID_ARG);
+        if (trace_enabled()) {
+            fprintf(stderr, "seto_net: PdpSend(id=%d) -> INVALID_SOCKET_ID\n", id);
+        }
+        psp_ret(PSP_ADHOC_ERROR_INVALID_SOCKET_ID);
         return;
     }
 
     uint8_t dmac[SETO_MAC_LEN];
     for (uint32_t i = 0; i < SETO_MAC_LEN; i++) dmac[i] = psp_read8(dmac_ptr + i);
+
+    if (trace_enabled()) {
+        fprintf(stderr, "seto_net: PdpSend(id=%d, %u -> %02x:%02x:%02x:%02x:%02x:%02x:%u, len=%u)\n",
+                id, sport, dmac[0], dmac[1], dmac[2], dmac[3], dmac[4], dmac[5], dport, len);
+    }
 
     uint8_t *buf = len ? (uint8_t *)malloc(len) : NULL;
     if (len && !buf) {
@@ -1754,7 +1859,7 @@ static void hle_adhoc_pdp_recv(void) {
         pdp_sock_t *s = find_pdp_locked(id);
         if (!s) {
             mtx_unlock(&g_state_lock);
-            psp_ret(PSP_ADHOC_ERROR_INVALID_ARG);
+            psp_ret(PSP_ADHOC_ERROR_INVALID_SOCKET_ID);
             return;
         }
         if (s->q_count > 0) {
@@ -1775,6 +1880,14 @@ static void hle_adhoc_pdp_recv(void) {
             for (uint16_t b = 0; b < pkt->len; b++)
                 psp_write8(data_ptr + b, pkt->data[b]);
             psp_write32(len_ptr, pkt->len);
+
+            if (trace_enabled()) {
+                fprintf(stderr, "seto_net: PdpRecv(id=%d) <- %02x:%02x:%02x:%02x:%02x:%02x:%u len=%u\n",
+                        id,
+                        pkt->src_mac[0], pkt->src_mac[1], pkt->src_mac[2],
+                        pkt->src_mac[3], pkt->src_mac[4], pkt->src_mac[5],
+                        pkt->src_port, pkt->len);
+            }
 
             free(pkt->data);
             memset(pkt, 0, sizeof(*pkt));
@@ -1802,14 +1915,227 @@ static void hle_adhoc_pdp_recv(void) {
     }
 }
 
-/* ---- PTP (Reliable Stream) ----------------------------------------------- */
-
-static ptp_sock_t *find_ptp_locked(int id) {
-    for (int i = 0; i < NET_MAX_PTP_SOCKS; i++) {
-        if (g_ptp[i].kind != PTP_KIND_UNUSED && g_ptp[i].id == id) return &g_ptp[i];
+static uint32_t pdp_queued_bytes_locked(const pdp_sock_t *s) {
+    uint32_t total = 0;
+    for (int i = 0; i < s->q_count; i++) {
+        int idx = (s->q_head + i) % NET_MAX_PDP_QUEUE;
+        total += s->q[idx].len;
     }
-    return NULL;
+    return total;
 }
+
+static void hle_adhoc_get_pdp_stat(void) {
+    seto_net_pump_callbacks();
+    uint32_t len_ptr = psp_arg(0);
+    uint32_t buf_ptr = psp_arg(1);
+    if (!len_ptr) {
+        psp_ret(PSP_ADHOC_ERROR_INVALID_ARG);
+        return;
+    }
+    /* SceNetAdhocPdpStat (20 bytes):
+     * +0: next(4), +4: id(4), +8: laddr(6), +14: lport(2), +16: rcv_sb_cc(4) */
+    const uint32_t entry_sz = 20u;
+    mtx_lock(&g_state_lock);
+    int total = 0;
+    for (int i = 0; i < NET_MAX_PDP_SOCKS; i++) {
+        if (g_pdp[i].used) total++;
+    }
+    if (!buf_ptr) {
+        psp_write32(len_ptr, (uint32_t)total * entry_sz);
+        mtx_unlock(&g_state_lock);
+        psp_ret(0u);
+        return;
+    }
+    uint32_t cap = psp_read32(len_ptr) / entry_sz;
+    uint32_t written = 0;
+    for (int i = 0; i < NET_MAX_PDP_SOCKS && written < cap; i++) {
+        const pdp_sock_t *s = &g_pdp[i];
+        if (!s->used) continue;
+        uint32_t p = buf_ptr + written * entry_sz;
+        uint32_t next = ((int)(written + 1u) < total && (written + 1u) < cap) ? (p + entry_sz) : 0u;
+        psp_write32(p + 0u, next);
+        psp_write32(p + 4u, (uint32_t)s->id);
+        for (uint32_t b = 0; b < SETO_MAC_LEN; b++)
+            psp_write8(p + 8u + b, s->mac[b]);
+        psp_write16(p + 14u, s->port);
+        psp_write32(p + 16u, pdp_queued_bytes_locked(s));
+        written++;
+    }
+    psp_write32(len_ptr, written * entry_sz);
+    mtx_unlock(&g_state_lock);
+    psp_ret(0u);
+}
+
+static void hle_adhoc_get_ptp_stat(void) {
+    seto_net_pump_callbacks();
+    uint32_t len_ptr = psp_arg(0);
+    uint32_t buf_ptr = psp_arg(1);
+    if (!len_ptr) {
+        psp_ret(PSP_ADHOC_ERROR_INVALID_ARG);
+        return;
+    }
+    /* SceNetAdhocPtpStat (36 bytes):
+     * +0: next(4), +4: id(4), +8: laddr(6), +14: paddr(6),
+     * +20: lport(2), +22: pport(2), +24: snd_sb_cc(4), +28: rcv_sb_cc(4), +32: state(4) */
+    const uint32_t entry_sz = 36u;
+    mtx_lock(&g_state_lock);
+    int total = 0;
+    for (int i = 0; i < NET_MAX_PTP_SOCKS; i++) {
+        if (g_ptp[i].kind != PTP_KIND_UNUSED) total++;
+    }
+    if (!buf_ptr) {
+        psp_write32(len_ptr, (uint32_t)total * entry_sz);
+        mtx_unlock(&g_state_lock);
+        psp_ret(0u);
+        return;
+    }
+    uint32_t cap = psp_read32(len_ptr) / entry_sz;
+    uint32_t written = 0;
+    for (int i = 0; i < NET_MAX_PTP_SOCKS && written < cap; i++) {
+        const ptp_sock_t *s = &g_ptp[i];
+        if (s->kind == PTP_KIND_UNUSED) continue;
+        uint32_t p = buf_ptr + written * entry_sz;
+        uint32_t next = ((int)(written + 1u) < total && (written + 1u) < cap) ? (p + entry_sz) : 0u;
+        for (uint32_t b = 0; b < entry_sz; b++) psp_write8(p + b, 0);
+        psp_write32(p + 0u, next);
+        psp_write32(p + 4u, (uint32_t)s->id);
+        for (uint32_t b = 0; b < SETO_MAC_LEN; b++) {
+            psp_write8(p + 8u + b, g_local_mac[b]);
+            psp_write8(p + 14u + b, s->peer_mac[b]);
+        }
+        psp_write16(p + 20u, s->local_port);
+        psp_write16(p + 22u, s->peer_port);
+        psp_write32(p + 24u, 0u);
+        psp_write32(p + 28u, (uint32_t)s->rx_len);
+        uint32_t st = PSP_ADHOC_PTP_STATE_CLOSED;
+        if (s->kind == PTP_KIND_LISTENER) st = PSP_ADHOC_PTP_STATE_LISTEN;
+        else if (s->connected && !s->peer_closed) st = PSP_ADHOC_PTP_STATE_ESTABLISHED;
+        else if (!s->connected && !s->peer_closed) st = PSP_ADHOC_PTP_STATE_SYN_SENT;
+        psp_write32(p + 32u, st);
+        written++;
+    }
+    psp_write32(len_ptr, written * entry_sz);
+    mtx_unlock(&g_state_lock);
+    psp_ret(0u);
+}
+
+static void hle_adhoc_set_socket_alert(void) {
+    int      id   = (int)psp_arg(0);
+    uint32_t flag = psp_arg(1);
+    int found = 0;
+    mtx_lock(&g_state_lock);
+    pdp_sock_t *pdp = find_pdp_locked(id);
+    if (pdp) {
+        pdp->alert_flags = flag;
+        found = 1;
+    } else {
+        ptp_sock_t *ptp = find_ptp_locked(id);
+        if (ptp) {
+            ptp->alert_flags = flag;
+            found = 1;
+        }
+    }
+    mtx_unlock(&g_state_lock);
+    psp_ret(found ? 0u : PSP_ADHOC_ERROR_INVALID_SOCKET_ID);
+}
+
+static void hle_adhoc_get_socket_alert(void) {
+    int      id      = (int)psp_arg(0);
+    uint32_t out_ptr = psp_arg(1);
+    if (!out_ptr) {
+        psp_ret(PSP_ADHOC_ERROR_INVALID_ARG);
+        return;
+    }
+    int found = 0;
+    uint32_t flag = 0;
+    mtx_lock(&g_state_lock);
+    pdp_sock_t *pdp = find_pdp_locked(id);
+    if (pdp) {
+        flag = pdp->alert_flags;
+        found = 1;
+    } else {
+        ptp_sock_t *ptp = find_ptp_locked(id);
+        if (ptp) {
+            flag = ptp->alert_flags;
+            found = 1;
+        }
+    }
+    mtx_unlock(&g_state_lock);
+    if (!found) {
+        psp_ret(PSP_ADHOC_ERROR_INVALID_SOCKET_ID);
+        return;
+    }
+    psp_write32(out_ptr, flag);
+    psp_ret(0u);
+}
+
+static void hle_adhoc_poll_socket(void) {
+    uint32_t sds_ptr  = psp_arg(0);
+    int      count    = (int)psp_arg(1);
+    uint32_t timeout  = psp_arg(2);
+    int      nonblock = (int)psp_arg(3);
+    if (!sds_ptr || count <= 0 || ((uint32_t)nonblock & ~PSP_ADHOC_F_NONBLOCK) != 0) {
+        psp_ret(PSP_ADHOC_ERROR_INVALID_ARG);
+        return;
+    }
+
+    uint64_t wait_limit_ms = nonblock ? 0ULL : ((timeout == 0) ? 5000ULL : ((uint64_t)timeout + 999ULL) / 1000ULL);
+    uint64_t t0 = host_ms();
+
+    for (;;) {
+        int affected = 0;
+        mtx_lock(&g_state_lock);
+        for (int i = 0; i < count; i++) {
+            uint32_t entry = sds_ptr + (uint32_t)i * 12u;
+            int      id    = (int)psp_read32(entry + 0u);
+            uint32_t ev    = psp_read32(entry + 4u);
+            uint32_t rev   = 0;
+
+            pdp_sock_t *pdp = find_pdp_locked(id);
+            ptp_sock_t *ptp = pdp ? NULL : find_ptp_locked(id);
+            if (!pdp && !ptp) {
+                psp_write32(sds_ptr + 8u, PSP_ADHOC_EV_INVALID);
+                mtx_unlock(&g_state_lock);
+                psp_ret(PSP_ADHOC_ERROR_INVALID_SOCKET_ID);
+                return;
+            }
+            if (pdp) {
+                if (ev & PSP_ADHOC_EV_SEND) rev |= PSP_ADHOC_EV_SEND;
+                if ((ev & PSP_ADHOC_EV_RECV) && pdp->q_count > 0) rev |= PSP_ADHOC_EV_RECV;
+                if (pdp->alert_flags & PSP_ADHOC_F_ALERTPOLL) rev |= PSP_ADHOC_EV_ALERT;
+            } else if (ptp) {
+                if (ptp->kind == PTP_KIND_LISTENER) {
+                    if ((ev & PSP_ADHOC_EV_ACCEPT) && ptp->inc_count > 0)
+                        rev |= PSP_ADHOC_EV_ACCEPT;
+                } else {
+                    if (ptp->connected && !ptp->peer_closed) {
+                        if (ev & PSP_ADHOC_EV_CONNECT) rev |= PSP_ADHOC_EV_CONNECT;
+                        if (ev & PSP_ADHOC_EV_SEND)    rev |= PSP_ADHOC_EV_SEND;
+                        if (ev & PSP_ADHOC_EV_FLUSH)   rev |= PSP_ADHOC_EV_FLUSH;
+                    }
+                    if ((ev & PSP_ADHOC_EV_RECV) && ptp->rx_len > 0)
+                        rev |= PSP_ADHOC_EV_RECV;
+                    if (ptp->peer_closed)
+                        rev |= PSP_ADHOC_EV_DISCONNECT;
+                }
+                if (ptp->alert_flags & PSP_ADHOC_F_ALERTPOLL) rev |= PSP_ADHOC_EV_ALERT;
+            }
+            psp_write32(entry + 8u, rev);
+            if (rev != 0) affected++;
+        }
+        mtx_unlock(&g_state_lock);
+
+        if (affected > 0 || nonblock || (host_ms() - t0) >= wait_limit_ms) {
+            seto_net_pump_callbacks();
+            psp_ret((uint32_t)affected);
+            return;
+        }
+        psp_threadman_host_sleep_ms(2u);
+        seto_net_pump_callbacks();
+    }
+}
+
+/* ---- PTP (Reliable Stream) ----------------------------------------------- */
 
 static void hle_adhoc_ptp_listen(void) {
     ensure_locks();
@@ -2454,6 +2780,65 @@ static void hle_adhoc_matching_send_data(void) {
     match_target_op_common(SETO_OP_MATCH_SEND_DATA, 1);
 }
 
+static void hle_adhoc_matching_get_members(void) {
+    seto_net_pump_callbacks();
+    int      id      = (int)psp_arg(0);
+    uint32_t len_ptr = psp_arg(1);
+    uint32_t buf_ptr = psp_arg(2);
+    if (!len_ptr) {
+        psp_ret(PSP_ADHOC_MATCHING_ERROR_INVALID_ARG);
+        return;
+    }
+    /* SceNetAdhocMatchingMemberInfoEmu (12 bytes):
+     * +0: next(4), +4: mac(6), +10: pad(2) */
+    const uint32_t entry_sz = 12u;
+    mtx_lock(&g_state_lock);
+    match_slot_t *m = find_match_locked(id);
+    if (!m) {
+        mtx_unlock(&g_state_lock);
+        psp_ret(PSP_ADHOC_MATCHING_ERROR_INVALID_ID);
+        return;
+    }
+    int total = g_peer_count > 0 ? g_peer_count : 1;
+    if (!buf_ptr) {
+        psp_write32(len_ptr, (uint32_t)total * entry_sz);
+        mtx_unlock(&g_state_lock);
+        psp_ret(0u);
+        return;
+    }
+    uint32_t cap = psp_read32(len_ptr) / entry_sz;
+    uint32_t written = 0;
+    for (int i = 0; i < total && written < cap; i++) {
+        const uint8_t *mac = (g_peer_count > 0) ? g_peers[i].mac : g_local_mac;
+        uint32_t p = buf_ptr + written * entry_sz;
+        uint32_t next = ((int)(written + 1u) < total && (written + 1u) < cap) ? (p + entry_sz) : 0u;
+        psp_write32(p + 0u, next);
+        for (uint32_t b = 0; b < SETO_MAC_LEN; b++)
+            psp_write8(p + 4u + b, mac[b]);
+        psp_write16(p + 10u, 0u);
+        written++;
+    }
+    psp_write32(len_ptr, written * entry_sz);
+    mtx_unlock(&g_state_lock);
+    psp_ret(0u);
+}
+
+static void hle_adhoc_matching_get_pool_max_alloc(void) {
+    psp_ret(0x00020000u);
+}
+
+static void hle_adhoc_matching_get_pool_stat(void) {
+    uint32_t out = psp_arg(0);
+    if (!out) {
+        psp_ret(PSP_ADHOC_MATCHING_ERROR_INVALID_ARG);
+        return;
+    }
+    psp_write32(out + 0u, 0x00020000u); /* size */
+    psp_write32(out + 4u, 0x00004000u); /* maxsize */
+    psp_write32(out + 8u, 0x0001C000u); /* freesize */
+    psp_ret(0u);
+}
+
 /* --------------------------------------------------------------------------
  * Registration Entry Point
  * -------------------------------------------------------------------------- */
@@ -2488,20 +2873,25 @@ void seto_net_register_hle(void) {
         { 0xF88155F6u, "sceUtility",     "sceUtilityNetconfShutdownStart", hle_netconf_shutdown_start },
 
         /* sceNetAdhoc (PDP & PTP) */
-        { 0xE1D621D7u, "sceNetAdhoc",    "sceNetAdhocInit",         hle_adhoc_init },
-        { 0xA62C6F57u, "sceNetAdhoc",    "sceNetAdhocTerm",         hle_adhoc_term },
-        { 0x6F92741Bu, "sceNetAdhoc",    "sceNetAdhocPdpCreate",    hle_adhoc_pdp_create },
-        { 0x7F27BB5Eu, "sceNetAdhoc",    "sceNetAdhocPdpDelete",    hle_adhoc_pdp_delete },
-        { 0xABED3790u, "sceNetAdhoc",    "sceNetAdhocPdpSend",      hle_adhoc_pdp_send },
-        { 0xDFE53E03u, "sceNetAdhoc",    "sceNetAdhocPdpRecv",      hle_adhoc_pdp_recv },
-        { 0x877F6D66u, "sceNetAdhoc",    "sceNetAdhocPtpOpen",      hle_adhoc_ptp_open },
-        { 0xFC6FC07Bu, "sceNetAdhoc",    "sceNetAdhocPtpConnect",   hle_adhoc_ptp_connect },
-        { 0xE08BDAC1u, "sceNetAdhoc",    "sceNetAdhocPtpListen",    hle_adhoc_ptp_listen },
-        { 0x9DF81198u, "sceNetAdhoc",    "sceNetAdhocPtpAccept",    hle_adhoc_ptp_accept },
-        { 0x4DA4C788u, "sceNetAdhoc",    "sceNetAdhocPtpSend",      hle_adhoc_ptp_send },
-        { 0x8BEA2B3Eu, "sceNetAdhoc",    "sceNetAdhocPtpRecv",      hle_adhoc_ptp_recv },
-        { 0x9AC2EEACu, "sceNetAdhoc",    "sceNetAdhocPtpFlush",     hle_net_ok },
-        { 0x157E6225u, "sceNetAdhoc",    "sceNetAdhocPtpClose",     hle_adhoc_ptp_close },
+        { 0xE1D621D7u, "sceNetAdhoc",    "sceNetAdhocInit",           hle_adhoc_init },
+        { 0xA62C6F57u, "sceNetAdhoc",    "sceNetAdhocTerm",           hle_adhoc_term },
+        { 0x6F92741Bu, "sceNetAdhoc",    "sceNetAdhocPdpCreate",      hle_adhoc_pdp_create },
+        { 0x7F27BB5Eu, "sceNetAdhoc",    "sceNetAdhocPdpDelete",      hle_adhoc_pdp_delete },
+        { 0xABED3790u, "sceNetAdhoc",    "sceNetAdhocPdpSend",        hle_adhoc_pdp_send },
+        { 0xDFE53E03u, "sceNetAdhoc",    "sceNetAdhocPdpRecv",        hle_adhoc_pdp_recv },
+        { 0xC7C1FC57u, "sceNetAdhoc",    "sceNetAdhocGetPdpStat",     hle_adhoc_get_pdp_stat },
+        { 0x877F6D66u, "sceNetAdhoc",    "sceNetAdhocPtpOpen",        hle_adhoc_ptp_open },
+        { 0xFC6FC07Bu, "sceNetAdhoc",    "sceNetAdhocPtpConnect",     hle_adhoc_ptp_connect },
+        { 0xE08BDAC1u, "sceNetAdhoc",    "sceNetAdhocPtpListen",      hle_adhoc_ptp_listen },
+        { 0x9DF81198u, "sceNetAdhoc",    "sceNetAdhocPtpAccept",      hle_adhoc_ptp_accept },
+        { 0x4DA4C788u, "sceNetAdhoc",    "sceNetAdhocPtpSend",        hle_adhoc_ptp_send },
+        { 0x8BEA2B3Eu, "sceNetAdhoc",    "sceNetAdhocPtpRecv",        hle_adhoc_ptp_recv },
+        { 0x9AC2EEACu, "sceNetAdhoc",    "sceNetAdhocPtpFlush",       hle_net_ok },
+        { 0x157E6225u, "sceNetAdhoc",    "sceNetAdhocPtpClose",       hle_adhoc_ptp_close },
+        { 0xB9685118u, "sceNetAdhoc",    "sceNetAdhocGetPtpStat",     hle_adhoc_get_ptp_stat },
+        { 0x73BFD52Du, "sceNetAdhoc",    "sceNetAdhocSetSocketAlert", hle_adhoc_set_socket_alert },
+        { 0x4D2CE199u, "sceNetAdhoc",    "sceNetAdhocGetSocketAlert", hle_adhoc_get_socket_alert },
+        { 0x7A662D6Bu, "sceNetAdhoc",    "sceNetAdhocPollSocket",     hle_adhoc_poll_socket },
 
         /* sceNetAdhocctl */
         { 0xE26F226Eu, "sceNetAdhocctl", "sceNetAdhocctlInit",          hle_adhocctl_init },
@@ -2518,7 +2908,9 @@ void seto_net_register_hle(void) {
         { 0xE162CB14u, "sceNetAdhocctl", "sceNetAdhocctlGetPeerList",   hle_adhocctl_get_peer_list },
         { 0x8DB83FDCu, "sceNetAdhocctl", "sceNetAdhocctlGetPeerInfo",   hle_adhocctl_get_peer_info },
         { 0x8916C003u, "sceNetAdhocctl", "sceNetAdhocctlGetNameByAddr", hle_adhocctl_get_name_by_addr },
+        { 0x99560ABEu, "sceNetAdhocctl", "sceNetAdhocctlGetAddrByName", hle_adhocctl_get_addr_by_name },
         { 0xDED9D28Eu, "sceNetAdhocctl", "sceNetAdhocctlGetParameter",  hle_adhocctl_get_parameter },
+        { 0x362CBE8Fu, "sceNetAdhocctl", "sceNetAdhocctlGetAdhocId",    hle_adhocctl_get_adhoc_id },
 
         /* sceNetAdhocMatching */
         { 0x2A2A1E07u, "sceNetAdhocMatching", "sceNetAdhocMatchingInit",                hle_adhoc_matching_init },
@@ -2533,7 +2925,10 @@ void seto_net_register_hle(void) {
         { 0xF79472D7u, "sceNetAdhocMatching", "sceNetAdhocMatchingSendData",            hle_adhoc_matching_send_data },
         { 0xEC19337Du, "sceNetAdhocMatching", "sceNetAdhocMatchingAbortSendData",       hle_net_ok },
         { 0xB58E61B7u, "sceNetAdhocMatching", "sceNetAdhocMatchingSetHelloOpt",         hle_adhoc_matching_set_hello_opt },
-        { 0xB5D96C2Au, "sceNetAdhocMatching", "sceNetAdhocMatchingGetHelloOpt",         hle_adhoc_matching_get_hello_opt }
+        { 0xB5D96C2Au, "sceNetAdhocMatching", "sceNetAdhocMatchingGetHelloOpt",         hle_adhoc_matching_get_hello_opt },
+        { 0xC58BCD9Eu, "sceNetAdhocMatching", "sceNetAdhocMatchingGetMembers",          hle_adhoc_matching_get_members },
+        { 0x40F8F435u, "sceNetAdhocMatching", "sceNetAdhocMatchingGetPoolMaxAlloc",     hle_adhoc_matching_get_pool_max_alloc },
+        { 0x9C5CFB7Du, "sceNetAdhocMatching", "sceNetAdhocMatchingGetPoolStat",         hle_adhoc_matching_get_pool_stat }
     };
 
     for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
