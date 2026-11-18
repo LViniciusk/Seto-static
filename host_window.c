@@ -485,7 +485,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_SIZE:
-        if (wp != SIZE_MINIMIZED) InvalidateRect(hwnd, NULL, FALSE);
+        if (wp != SIZE_MINIMIZED) {
+            if (seto_gl_present_active())
+                seto_gl_present_resize(LOWORD(lp), HIWORD(lp));
+            else
+                InvalidateRect(hwnd, NULL, FALSE);
+        }
         return 0;
     case WM_ERASEBKGND:
         return 1;                   /* paint() fills the client area */

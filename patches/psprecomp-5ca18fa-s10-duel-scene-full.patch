@@ -183,19 +183,20 @@ index 132306f..e5ab735 100644
   * hot path in any recompiled game; correctness first. */
  static inline float psp_fsqrt(float v) {
 diff --git a/include/psprecomp/render.h b/include/psprecomp/render.h
-index 81ee925..1de5d95 100644
+index 81ee925..9c66c4c 100644
 --- a/include/psprecomp/render.h
 +++ b/include/psprecomp/render.h
-@@ -24,6 +24,8 @@ typedef struct {
+@@ -24,6 +24,9 @@ typedef struct {
      uint32_t rgba;
      float    u, v;
      int      behind;         /* behind the eye: triangles using it are dropped */
 +    uint32_t spec;           /* secondary specular RGB (GE_LMODE=1) */
 +    float    fog;            /* vertex fog blend factor: 1.0 = none, 0.0 = full fog */
++    float    fx, fy, clip_w; /* subpixel screen coords and view-space clip W */
  } psp_vertex;
  
  /* GE primitive types, from the PRIM argument's type field. */
-@@ -80,13 +82,39 @@ typedef struct {
+@@ -80,13 +83,39 @@ typedef struct {
      int      atest;          /* ATE */
      int      atest_func, atest_ref, atest_mask; /* ATST */
  
@@ -235,7 +236,7 @@ index 81ee925..1de5d95 100644
  } psp_draw_state;
  
  typedef struct {
-@@ -107,6 +135,15 @@ typedef struct {
+@@ -107,6 +136,15 @@ typedef struct {
  
      /* sceDisplaySetFrameBuf -- show what has accumulated. */
      void (*present)(void);
@@ -251,7 +252,7 @@ index 81ee925..1de5d95 100644
  } psp_render_backend;
  
  /* Select a backend by name ("software", "null", ...). Returns 0 on success,
-@@ -116,6 +153,17 @@ int psp_render_select(const char *name);
+@@ -116,6 +154,17 @@ int psp_render_select(const char *name);
  /* The active backend. Never NULL -- defaults to software. */
  const psp_render_backend *psp_render_current(void);
  
@@ -269,7 +270,7 @@ index 81ee925..1de5d95 100644
  /* Backends provided by the runtime. */
  extern const psp_render_backend psp_render_software;
  extern const psp_render_backend psp_render_null;
-@@ -127,6 +175,11 @@ void     psp_render_reset_pixels(void);
+@@ -127,6 +176,11 @@ void     psp_render_reset_pixels(void);
  /* One pixel in format 0-3 (565, 5551, 4444, 8888) as 0xAABBGGRR. The 16-bit
   * formats replicate their high bits into the low ones. */
  uint32_t psp_color_expand(uint32_t px, int fmt);
@@ -870,7 +871,7 @@ index 73f6653..fa42363 100644
 +                     hle_GetAccumulatedHcount);
  }
 diff --git a/src/hle/ge.c b/src/hle/ge.c
-index 69cf226..68e1361 100644
+index 69cf226..82b6c34 100644
 --- a/src/hle/ge.c
 +++ b/src/hle/ge.c
 @@ -25,9 +25,11 @@
@@ -1046,19 +1047,20 @@ index 69cf226..68e1361 100644
   * ponytail: no near-plane clipping, so a primitive with any vertex behind the
   * eye is dropped whole; add clipping when 3D scenes lose triangles. */
 -static int transform(const float p[3], float *sx, float *sy, float *sz) {
-+static int transform(const float p[3], float *sx, float *sy, float *sz, float *vz_out) {
++static int transform(const float p[3], float *sx, float *sy, float *sz, float *vz_out, float *cw_out) {
      const float *W = g_xf.world, *V = g_xf.view, *P = g_xf.proj;
      float w[3], v[3], c[4];
      for (int r = 0; r < 3; r++)
-@@ -199,6 +265,7 @@ static int transform(const float p[3], float *sx, float *sy, float *sz) {
+@@ -199,6 +265,8 @@ static int transform(const float p[3], float *sx, float *sy, float *sz) {
          v[r] = V[r] * w[0] + V[3 + r] * w[1] + V[6 + r] * w[2] + V[9 + r];
      for (int r = 0; r < 4; r++)
          c[r] = P[r] * v[0] + P[4 + r] * v[1] + P[8 + r] * v[2] + P[12 + r];
 +    if (vz_out) *vz_out = v[2];
++    if (cw_out) *cw_out = c[3];
      if (c[3] <= 0) return 0;
      *sx = c[0] / c[3] * g_xf.xscale + g_xf.xpos - g_xf.offx;
      *sy = c[1] / c[3] * g_xf.yscale + g_xf.ypos - g_xf.offy;
-@@ -223,7 +290,8 @@ static float norm3(float v[3]) {
+@@ -223,7 +291,8 @@ static float norm3(float v[3]) {
   * light its ambient, its diffuse by N.L, and its specular by (N.H)^SPOW with
   * the viewer along +z, all scaled by distance attenuation and the spot cone.
   * Alpha is the ambient material's. */
@@ -1068,7 +1070,7 @@ index 69cf226..68e1361 100644
      const float *W = g_xf.world;
      float wp[3], wn[3];
      for (int r = 0; r < 3; r++) {
-@@ -233,10 +301,11 @@ static uint32_t light_vertex(const float p[3], const float n[3], uint32_t vcol)
+@@ -233,10 +302,11 @@ static uint32_t light_vertex(const float p[3], const float n[3], uint32_t vcol)
      if (g_lt.rnorm) for (int r = 0; r < 3; r++) wn[r] = -wn[r];
      norm3(wn);
  
@@ -1084,7 +1086,7 @@ index 69cf226..68e1361 100644
      unpack(g_lt.emissive, e);
      unpack(g_lt.ambient, al);
      for (int k = 0; k < 3; k++) out[k] = e[k] + al[k] * ma[k] / 255.0f;
-@@ -274,10 +343,27 @@ static uint32_t light_vertex(const float p[3], const float n[3], uint32_t vcol)
+@@ -274,10 +344,27 @@ static uint32_t light_vertex(const float p[3], const float n[3], uint32_t vcol)
              const float ndh = wn[0] * H[0] + wn[1] * H[1] + wn[2] * H[2];
              if (ndh > 0) spec = powf(ndh, g_lt.spow);
          }
@@ -1115,7 +1117,7 @@ index 69cf226..68e1361 100644
      for (int k = 0; k < 3; k++) {
          const int v = out[k] > 255.0f ? 255 : (int)out[k];
          c |= (uint32_t)v << (8 * k);
-@@ -328,6 +414,7 @@ static struct {
+@@ -328,6 +415,7 @@ static struct {
  
  void psp_ge_reset(void) {
      memset(g_queue, 0, sizeof g_queue);
@@ -1123,7 +1125,7 @@ index 69cf226..68e1361 100644
      memset(&g_ge, 0, sizeof g_ge);
      memset(&g_ds, 0, sizeof g_ds);
      memset(g_clut, 0, sizeof g_clut);
-@@ -338,13 +425,26 @@ void psp_ge_reset(void) {
+@@ -338,13 +426,26 @@ void psp_ge_reset(void) {
      g_ds.clut_mask = 0xFF;
      g_ds.atest_func = 1;
      g_ds.atest_mask = 0xFF;
@@ -1150,7 +1152,7 @@ index 69cf226..68e1361 100644
      xf_reset();
      psp_render_reset_pixels();
      g_unsupported = 0;
-@@ -436,7 +536,9 @@ static int vertex_layout(uint32_t vtype, int *tex_off, int *col_off, int *nrm_of
+@@ -436,7 +537,9 @@ static int vertex_layout(uint32_t vtype, int *tex_off, int *col_off, int *nrm_of
      int n = norm_sz[VT_NORMAL(vtype)] * 3;
      int p = pos_sz[VT_POS(vtype)] * 3;
  
@@ -1161,7 +1163,7 @@ index 69cf226..68e1361 100644
  
      int ts = tex_sz[VT_TEX(vtype)];
      if (ts) { off = (off + ts - 1) & ~(ts - 1); *tex_off = off; off += t; if (ts > align) align = ts; }
-@@ -460,9 +562,11 @@ static void read3(uint32_t a, int fmt, int raw, float v[3]) {
+@@ -460,9 +563,11 @@ static void read3(uint32_t a, int fmt, int raw, float v[3]) {
      for (int i = 0; i < 3; i++) {
          switch (fmt) {
          case 1:  v[i] = (float)(int8_t)psp_read8(a + (uint32_t)i);
@@ -1175,7 +1177,7 @@ index 69cf226..68e1361 100644
          default: v[i] = psp_read_f32(a + (uint32_t)i * 4); break;
          }
      }
-@@ -475,6 +579,7 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
+@@ -475,6 +580,7 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
       * them as fixed point, signed for positions. */
      const int through = (int)VT_THROUGH(vtype);
      out->rgba = g_material;
@@ -1183,7 +1185,7 @@ index 69cf226..68e1361 100644
      if (col_off >= 0) {
          if (VT_COLOR(vtype) == 7)
              out->rgba = psp_read32(addr + (uint32_t)col_off);
-@@ -483,21 +588,26 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
+@@ -483,21 +589,26 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
                                           (int)VT_COLOR(vtype) - 4);
      }
  
@@ -1218,8 +1220,13 @@ index 69cf226..68e1361 100644
          }
      }
  
-@@ -511,34 +621,109 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
+@@ -509,36 +620,117 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
+         out->x = (int)pos[0];
+         out->y = (int)pos[1];
          out->z = VT_POS(vtype) == 2 ? (float)psp_read16(addr + (uint32_t)pos_off + 4) : pos[2];
++        out->fx = pos[0];
++        out->fy = pos[1];
++        out->clip_w = 1.0f;
          return 1;
      }
 -    if (g_lt.enable) {
@@ -1281,11 +1288,14 @@ index 69cf226..68e1361 100644
 -    if (!transform(pos, &sx, &sy, &sz)) { out->behind = 1; g_xf.behind++; return 1; }
 +    if (g_lt.enable)
 +        out->rgba = light_vertex(pos, n, out->rgba, col_off >= 0, &out->spec);
-+    float sx, sy, sz, vz;
-+    if (!transform(pos, &sx, &sy, &sz, &vz)) { out->behind = 1; g_xf.behind++; return 1; }
++    float sx, sy, sz, vz, cw;
++    if (!transform(pos, &sx, &sy, &sz, &vz, &cw)) { out->behind = 1; g_xf.behind++; return 1; }
      out->x = (int)floorf(sx);
      out->y = (int)floorf(sy);
      out->z = sz;
++    out->fx = sx;
++    out->fy = sy;
++    out->clip_w = cw > 1e-6f ? cw : 1.0f;
 +    if (g_ds.fog_enable) {
 +        float f = (vz + g_xf.fog_end) * g_xf.fog_slope;
 +        if (f < 0.0f) f = 0.0f;
@@ -1338,7 +1348,7 @@ index 69cf226..68e1361 100644
      if (!g_ge.vaddr) { g_unsupported += count; return; }
  
      int tex_off = -1, col_off = -1, nrm_off = -1, pos_off = 0;
-@@ -569,13 +754,68 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -569,13 +761,68 @@ static void draw_prim(uint32_t type, uint32_t count) {
      else     g_ge.vaddr += count * (uint32_t)stride;
  
      if (trace_frame()) {
@@ -1407,7 +1417,7 @@ index 69cf226..68e1361 100644
  }
  
  /* The framebuffer is always in eDRAM. Games send FBP relative to it, so a high
-@@ -583,6 +823,40 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -583,6 +830,40 @@ static void draw_prim(uint32_t type, uint32_t count) {
   * Taken literally, 0x88000 is main RAM: for a vaddr-0 module, its own code. */
  static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZE - 1)); }
  
@@ -1448,7 +1458,7 @@ index 69cf226..68e1361 100644
  /* Walk a list until END/FINISH, the stall address, or a step budget.
   *
   * The budget is not paranoia: a list whose JUMP forms a cycle is a normal
-@@ -607,6 +881,7 @@ static void run_list(ge_queue *q) {
+@@ -607,6 +888,7 @@ static void run_list(ge_queue *q) {
  
          switch (cmd) {
          case GE_NOP:
@@ -1456,7 +1466,7 @@ index 69cf226..68e1361 100644
              break;
  
          case GE_PRIM: {
-@@ -625,11 +900,11 @@ static void run_list(ge_queue *q) {
+@@ -625,11 +907,11 @@ static void run_list(ge_queue *q) {
              break;
  
          case GE_JUMP:
@@ -1470,7 +1480,7 @@ index 69cf226..68e1361 100644
              break;
          case GE_RET:
              if (sp > 0) q->list = stack[--sp];
-@@ -642,23 +917,30 @@ static void run_list(ge_queue *q) {
+@@ -642,23 +924,30 @@ static void run_list(ge_queue *q) {
              break;
  
          case GE_END:
@@ -1505,7 +1515,7 @@ index 69cf226..68e1361 100644
  
          case GE_VTYPE: g_ge.vtype = arg; break;
          case GE_FBP:
-@@ -676,12 +958,16 @@ static void run_list(ge_queue *q) {
+@@ -676,12 +965,16 @@ static void run_list(ge_queue *q) {
              psp_render_current()->set_target(fb_vram(), g_ge.fbw, (int)g_psm);
              break;
  
@@ -1522,7 +1532,7 @@ index 69cf226..68e1361 100644
          case GE_XSCALE:  g_xf.xscale = f24(arg); break;
          case GE_YSCALE:  g_xf.yscale = f24(arg); break;
          case GE_XPOS:    g_xf.xpos = f24(arg); break;
-@@ -693,9 +979,42 @@ static void run_list(ge_queue *q) {
+@@ -693,9 +986,42 @@ static void run_list(ge_queue *q) {
          case GE_OFFSETX: g_xf.offx = (float)(arg & 0xFFFF) / 16.0f; break;   /* 12.4 */
          case GE_OFFSETY: g_xf.offy = (float)(arg & 0xFFFF) / 16.0f; break;
  
@@ -1565,7 +1575,7 @@ index 69cf226..68e1361 100644
          case GE_SHADE: g_ds.gouraud = arg & 1; break;
          case GE_AMC:   g_material = (g_material & 0xFF000000u) | arg; break;
          case GE_AMA:   g_material = (g_material & 0x00FFFFFFu) | ((arg & 0xFF) << 24); break;
-@@ -745,7 +1064,49 @@ static void run_list(ge_queue *q) {
+@@ -745,7 +1071,49 @@ static void run_list(ge_queue *q) {
              g_ds.tex_alpha = (arg >> 8) & 1;
              g_ds.tex_double = (arg >> 16) & 1;
              break;
@@ -1616,7 +1626,7 @@ index 69cf226..68e1361 100644
  
          /* The CLUT is copied into the GE when CLOAD runs, so a game may
           * rewrite the memory afterwards. CBPH carries bits 24-27. */
-@@ -772,6 +1133,12 @@ static void run_list(ge_queue *q) {
+@@ -772,6 +1140,12 @@ static void run_list(ge_queue *q) {
              g_ds.sc_x1 = (int)(arg & 0x3FF);
              g_ds.sc_y1 = (int)((arg >> 10) & 0x3FF);
              break;
@@ -1629,7 +1639,7 @@ index 69cf226..68e1361 100644
  
          case GE_ATST:
              g_ds.atest_func = (int)(arg & 7);
-@@ -785,12 +1152,19 @@ static void run_list(ge_queue *q) {
+@@ -785,12 +1159,19 @@ static void run_list(ge_queue *q) {
              break;
          case GE_SFIX:  g_ds.blend_sfix = arg; break;
          case GE_DFIX:  g_ds.blend_dfix = arg; break;
@@ -1651,7 +1661,7 @@ index 69cf226..68e1361 100644
              /* A real state command we do not decode individually. Counted --
               * and, for the first few, named. "240 commands not individually
               * decoded" hides whether the game is configuring a draw or just
-@@ -822,6 +1196,7 @@ static void enqueue(int head) {
+@@ -822,6 +1203,7 @@ static void enqueue(int head) {
      q->id    = g_next_id++;
      q->list  = psp_arg(0) & ~3u;
      q->stall = psp_arg(1) & ~3u;
@@ -1659,7 +1669,7 @@ index 69cf226..68e1361 100644
      q->used  = 1;
      (void)head;
  
-@@ -829,8 +1204,10 @@ static void enqueue(int head) {
+@@ -829,8 +1211,10 @@ static void enqueue(int head) {
       * returning, which is indistinguishable from the game's point of view
       * because every way it can observe progress -- ListSync, DrawSync -- then
       * reports completion. */
@@ -1671,7 +1681,7 @@ index 69cf226..68e1361 100644
  }
  
  static void hle_ListEnQueue(void)     { enqueue(0); }
-@@ -847,35 +1224,83 @@ static void hle_ListUpdateStallAddr(void) {
+@@ -847,35 +1231,83 @@ static void hle_ListUpdateStallAddr(void) {
          return;
      }
      q->stall = psp_arg(1) & ~3u;
@@ -10030,7 +10040,7 @@ index b41d6ef..30e595d 100644
      psp_mem_free();
  
 diff --git a/tests/test_raster.c b/tests/test_raster.c
-index 0f821b5..9462662 100644
+index 0f821b5..bf85e5a 100644
 --- a/tests/test_raster.c
 +++ b/tests/test_raster.c
 @@ -16,6 +16,7 @@
@@ -10341,7 +10351,7 @@ index 0f821b5..9462662 100644
      CHECK(psp_ge_pixels() == 4 * 16, "indexed sprites drew the same boxes again: %llu pixels",
            (unsigned long long)psp_ge_pixels());
  }
-@@ -666,9 +774,683 @@ static void lit_quad(float lx, float lz) {
+@@ -666,9 +774,726 @@ static void lit_quad(float lx, float lz) {
  
  static void test_lighting(void) {
      lit_quad(0, 1);
@@ -10442,7 +10452,7 @@ index 0f821b5..9462662 100644
 +    psp_draw_state st = {0};
 +    st.sc_x1 = 479; st.sc_y1 = 271;
 +    const psp_vertex quad[] = {
-+        {0, 0, 0, 0xFFFFFFFFu, 0, 0, 0, 0, 1.0f}, {1, 1, 0, 0xFFFFFFFFu, 0, 0, 0, 0, 1.0f}
++        {0, 0, 0, 0xFFFFFFFFu, 0, 0, 0, 0, 1.0f, 0.0f, 0.0f, 1.0f}, {1, 1, 0, 0xFFFFFFFFu, 0, 0, 0, 0, 1.0f, 1.0f, 1.0f, 1.0f}
 +    };
 +    psp_write32(last, 0x12000000u);
 +    psp_render_current()->set_target(last, 512, 3);
@@ -11024,10 +11034,53 @@ index 0f821b5..9462662 100644
 +    CHECK(g_m3_mock.presents == 1 && psp_read32(FB) == 0xFF112233u, "present runs on SetFrameBuf");
 +
 +    psp_render_set_backend(&psp_render_software);
++}
++
++static psp_vertex g_m4_captured[16];
++static int g_m4_count;
++
++static void mock_m4_draw(int p, const psp_vertex *v, int c, const psp_draw_state *s) {
++    (void)p; (void)s;
++    for (int i = 0; i < c && i < 16; i++) g_m4_captured[i] = v[i];
++    g_m4_count = c;
++}
++
++static void test_m4_subpixel_vertex(void) {
++    static const psp_render_backend cap_be = {
++        "m4-cap", mock_m3_init, mock_m3_shutdown, mock_m3_target,
++        mock_m4_draw, mock_m3_finish, mock_m3_present, NULL, NULL
++    };
++    g_m4_count = 0;
++    psp_render_set_backend(&cap_be);
++    psp_ge_reset();
++    g_pc = 0;
++    cmd(0x10, (VERTS >> 8) & 0xFF0000u);
++    cmd(0x9C, FB & 0xFFFFFFu);
++    cmd(0x9D, ((FB >> 8) & 0xFF0000u) | 480u);
++    cmd(0x12, 3u << 7); /* transformed float position */
++    cmd(0x01, VERTS & 0xFFFFFFu);
++    fcmd(0x42, 240.0f);  fcmd(0x43, -136.0f);
++    fcmd(0x45, 2048.0f); fcmd(0x46, 2048.0f);
++    cmd(0x4C, (2048 - 240) << 4);
++    cmd(0x4D, (2048 - 136) << 4);
++    const float tri[3][3] = { { 0.001f, 0.002f, -1.0f }, { 0.25f, 0.0f, -1.5f }, { 0.0f, 0.25f, -2.0f } };
++    for (int i = 0; i < 3; i++) {
++        uint32_t a = VERTS + (uint32_t)i * 12u;
++        psp_write32(a + 0, fbits(tri[i][0]));
++        psp_write32(a + 4, fbits(tri[i][1]));
++        psp_write32(a + 8, fbits(tri[i][2]));
++    }
++    cmd(0x04, (3u << 16) | 3u);
++    end_list();
++    CHECK(g_m4_count == 3, "m4 subpixel draw captured 3 vertices");
++    CHECK(g_m4_captured[0].fx > 240.0f && g_m4_captured[0].fx < 241.0f,
++          "m4 subpixel fx keeps fractional part: %g", (double)g_m4_captured[0].fx);
++    CHECK(g_m4_captured[0].clip_w == 1.0f, "m4 clip_w set cleanly: %g", (double)g_m4_captured[0].clip_w);
++    psp_render_set_backend(&psp_render_software);
  }
  
  int main(void) {
-@@ -690,10 +1472,73 @@ int main(void) {
+@@ -690,10 +1515,74 @@ int main(void) {
      test_clear_mode_and_scissor();
      test_dxt1();
      test_depth();
@@ -11098,6 +11151,7 @@ index 0f821b5..9462662 100644
 +    }
 +
 +    test_m3_backend_hooks();
++    test_m4_subpixel_vertex();
  
      psp_mem_free();
      printf(failures ? "raster: %d failure(s)\n" : "raster: all tests passed\n", failures);

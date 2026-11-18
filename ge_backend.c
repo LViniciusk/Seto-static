@@ -42,6 +42,9 @@ typedef struct {
     int      dirty;
     int      z_dirty;
     int      stencil_written;
+    int      drawn_since_present;
+    int      has_vram_sig;
+    uint64_t last_vram_sig;
     uint32_t lru;
 } ge_prod_fbo;
 
@@ -49,6 +52,7 @@ static ge_prod_tex_slot g_prod_tex[GE_TEX_CACHE_SLOTS];
 static uint32_t g_prod_lru;
 
 static ge_prod_fbo g_prod_fbos[GE_MAX_FBOS];
+static uint8_t g_fbo_force_new[GE_MAX_FBOS];
 static uint32_t g_fbo_lru;
 static int g_cur_gpu_slot = -1;
 
@@ -94,6 +98,7 @@ static void ge_prod_cache_reset(void) {
     memset(g_prod_tex, 0, sizeof g_prod_tex);
     g_prod_lru = 0;
     memset(g_prod_fbos, 0, sizeof g_prod_fbos);
+    memset(g_fbo_force_new, 0, sizeof g_fbo_force_new);
     g_fbo_lru = 0;
     g_cur_gpu_slot = -1;
 }
@@ -105,6 +110,26 @@ static void ge_invalidate_tex_range(uint32_t addr, uint32_t bytes) {
         if (!g_prod_tex[i].valid) continue;
         if ((uint64_t)g_prod_tex[i].addr < end && (uint64_t)g_prod_tex[i].end_addr > addr)
             g_prod_tex[i].valid = 0;
+    }
+}
+
+void seto_ge_invalidate_vram(uint32_t addr, uint32_t bytes) {
+    if (bytes == 0u) return;
+    addr = ge_vram_addr(addr);
+    ge_invalidate_tex_range(addr, bytes);
+    if (addr < PSP_VRAM_BASE || addr >= PSP_VRAM_BASE + PSP_VRAM_SIZE)
+        return;
+    const uint64_t end = (uint64_t)addr + (uint64_t)bytes;
+    for (int i = 0; i < GE_MAX_FBOS; i++) {
+        ge_prod_fbo *f = &g_prod_fbos[i];
+        if (!f->used) continue;
+        const uint64_t fend = (uint64_t)f->addr +
+                              (uint64_t)f->h * (uint64_t)f->stride * ge_fmt_bpp(f->fmt);
+        if ((uint64_t)f->addr < end && fend > addr) {
+            f->used = 0;
+            g_fbo_force_new[i] = 1;
+            if (g_cur_gpu_slot == i) g_cur_gpu_slot = -1;
+        }
     }
 }
 
@@ -337,7 +362,7 @@ static int ge_fbo_ensure(uint32_t addr, uint32_t stride, int fmt, int min_h) {
                 }
                 if (new_h > f->h || g_cur_gpu_slot != i) {
                     if (!seto_ge_gpu_enqueue_target(i, f->addr, f->stride,
-                                                    f->fmt, f->w, new_h))
+                                                    f->fmt, f->w, new_h, 0))
                         return -1;
                     f->h = new_h;
                     g_cur_gpu_slot = i;
@@ -366,7 +391,9 @@ static int ge_fbo_ensure(uint32_t addr, uint32_t stride, int fmt, int min_h) {
     f->h = init_h;
     f->lru = ++g_fbo_lru;
 
-    if (!seto_ge_gpu_enqueue_target(slot, addr, stride, fmt, want_w, init_h)) {
+    const int force_new = g_fbo_force_new[slot];
+    g_fbo_force_new[slot] = 0;
+    if (!seto_ge_gpu_enqueue_target(slot, addr, stride, fmt, want_w, init_h, force_new)) {
         f->used = 0;
         return -1;
     }
@@ -539,6 +566,10 @@ static int ge_sprites_to_tris(const psp_vertex *v, int count, psp_vertex *out) {
         tr.x = x1; tr.y = y0;
         bl.x = x0; bl.y = y1;
         br.x = x1; br.y = y1;
+        tl.fx = (float)x0; tl.fy = (float)y0; tl.clip_w = 1.0f;
+        tr.fx = (float)x1; tr.fy = (float)y0; tr.clip_w = 1.0f;
+        bl.fx = (float)x0; bl.fy = (float)y1; bl.clip_w = 1.0f;
+        br.fx = (float)x1; br.fy = (float)y1; br.clip_w = 1.0f;
         if (transposed) {
             const float duy = tdu / sdy, dvx = tdv / sdx;
             tl.u = a->u + (float)(y0 - a->y) * duy;
@@ -689,7 +720,13 @@ static void ge_batch_push_tri(ge_tri_batch *b, const psp_vertex *a,
     if (!b->st->clear) {
         const int64_t area = (int64_t)(bv->x - a->x) * (int64_t)(c->y - a->y) -
                              (int64_t)(bv->y - a->y) * (int64_t)(c->x - a->x);
-        if (area == 0) return;
+        if (area == 0) {
+            if (b->st->through || (a->clip_w <= 0.0f && bv->clip_w <= 0.0f))
+                return;
+            const float farea = (bv->fx - a->fx) * (c->fy - a->fy) -
+                                (bv->fy - a->fy) * (c->fx - a->fx);
+            if (farea > -1e-6f && farea < 1e-6f) return;
+        }
     }
     psp_vertex va = *a, vb = *bv, vc = *c;
     if (!b->st->gouraud && !b->st->clear) {
@@ -723,6 +760,7 @@ static void ge_sw_fallback_draw(int prim, const psp_vertex *v, int count,
         if (up_h > safe_h) up_h = safe_h;
         if (ge_upload_vram_to_fbo(slot, up_h))
             f->dirty = 0;
+        f->drawn_since_present = 1;
     } else {
         ge_invalidate_tex_range(g_target_addr,
                                 (uint32_t)draw_h * g_target_stride * ge_fmt_bpp(g_target_fmt));
@@ -901,6 +939,7 @@ static void ge_draw(int prim, const psp_vertex *v, int count,
     if (uh > safe_h) uh = safe_h;
     if (uh > f->used_h) f->used_h = uh;
     f->dirty = 1;
+    f->drawn_since_present = 1;
     f->lru = ++g_fbo_lru;
 
     if ((st->clear && st->clear_depth) || (!st->clear && st->ztest && st->zwrite)) {
@@ -952,6 +991,7 @@ static int ge_transfer(uint32_t src, int src_bw, int sx, int sy,
                     df->used_h = (dy + h) < safe ? (dy + h) : safe;
                 }
                 df->dirty = 1;
+                df->drawn_since_present = 1;
                 ge_invalidate_tex_range(df->addr,
                                         (uint32_t)df->used_h * df->stride * ge_fmt_bpp(df->fmt));
                 return 1;
@@ -983,6 +1023,7 @@ static int ge_transfer(uint32_t src, int src_bw, int sx, int sy,
         if (up_h > safe) up_h = safe;
         if (ge_upload_vram_to_fbo(dst_slot, up_h))
             df->dirty = 0;
+        df->drawn_since_present = 1;
     } else {
         ge_invalidate_tex_range(dst, d_end_row * (uint32_t)dst_bw * (uint32_t)bpp);
     }
@@ -1008,6 +1049,32 @@ static uint32_t *ge_capture_ram_frame_bottom_up(void) {
     return out;
 }
 
+static uint64_t ge_vram_sample_sig(uint32_t addr, uint32_t stride, int fmt) {
+    if (!ge_is_vram_target(addr, stride, fmt)) return 0u;
+    const uint32_t bpp = ge_fmt_bpp(fmt);
+    const int max_r = ge_max_vram_rows(addr, stride, fmt);
+    const int rows = max_r < 272 ? max_r : 272;
+    const int cols = (int)stride < 480 ? (int)stride : 480;
+    uint64_t h = 14695981039346656037ULL;
+    for (int sy = 4; sy < rows; sy += 17) {
+        const uint32_t raddr = addr + (uint32_t)sy * stride * bpp;
+        const void *vp = psp_mem_unwatched_ptr(raddr, (uint32_t)cols * bpp);
+        for (int sx = 8; sx < cols; sx += 31) {
+            uint32_t v;
+            if (vp) {
+                v = bpp == 4u ? ((const uint32_t *)vp)[sx]
+                              : (uint32_t)((const uint16_t *)vp)[sx];
+            } else {
+                v = bpp == 4u ? psp_read32(raddr + (uint32_t)sx * 4u)
+                              : (uint32_t)psp_read16(raddr + (uint32_t)sx * 2u);
+            }
+            h ^= (uint64_t)v;
+            h *= 1099511628211ULL;
+        }
+    }
+    return h ^ (h >> 32);
+}
+
 static void ge_present(void) {
     static uint32_t g_present_seq;
     if (psp_render_software.present) psp_render_software.present();
@@ -1016,26 +1083,45 @@ static void ge_present(void) {
     uint32_t disp_addr = 0, disp_stride = 0;
     int disp_fmt = 3;
     psp_display_get_framebuf(&disp_addr, &disp_stride, &disp_fmt);
-    (void)disp_stride;
-    (void)disp_fmt;
     disp_addr = ge_vram_addr(disp_addr);
 
     int disp_slot = ge_find_fbo_exact(disp_addr);
     const int oracle = ge_sw_oracle();
-    if (disp_slot >= 0 && !oracle && g_prod_fbos[disp_slot].dirty)
-        ge_sync_fbo_to_vram(disp_slot);
+    if (disp_slot >= 0) {
+        ge_prod_fbo *df = &g_prod_fbos[disp_slot];
+        if (!df->drawn_since_present && df->has_vram_sig) {
+            const uint64_t cur_sig = ge_vram_sample_sig(disp_addr, disp_stride, disp_fmt);
+            if (cur_sig != df->last_vram_sig) {
+                df->used = 0;
+                g_fbo_force_new[disp_slot] = 1;
+                if (g_cur_gpu_slot == disp_slot) g_cur_gpu_slot = -1;
+                disp_slot = -1;
+            }
+        }
+    }
+    if (disp_slot >= 0) {
+        ge_prod_fbo *df = &g_prod_fbos[disp_slot];
+        if (!oracle && df->dirty)
+            ge_sync_fbo_to_vram(disp_slot);
+        df->drawn_since_present = 0;
+        df->last_vram_sig = ge_vram_sample_sig(disp_addr, disp_stride, disp_fmt);
+        df->has_vram_sig = 1;
+    }
 
     const uint32_t seq = ++g_present_seq;
     uint32_t cap = 0;
     const char *dir = getenv("SETO_GL_SHOT_DIR");
-    if (dir && dir[0]) {
+    const char *hdir = getenv("SETO_GL_HIRES_SHOT_DIR");
+    if ((dir && dir[0]) || (hdir && hdir[0])) {
         const char *ev = getenv("SETO_GL_SHOT_EVERY");
         int every = ev ? atoi(ev) : 30;
         if (every <= 0) every = 30;
         if ((seq % (uint32_t)every) == 0u) {
-            char path[260];
-            snprintf(path, sizeof path, "%s/sw-%05u.ppm", dir, seq);
-            psp_display_capture(path);
+            if (dir && dir[0]) {
+                char path[260];
+                snprintf(path, sizeof path, "%s/sw-%05u.ppm", dir, seq);
+                psp_display_capture(path);
+            }
             cap = seq;
         }
     }

@@ -110,6 +110,14 @@ int main(void) {
         c.rb_rgba != rb_px || c.rb_ds != rb_ds)
         return fail("pop readback");
 
+    memset(&c, 0, sizeof c);
+    c.type = GE_CMD_RESIZE;
+    c.w = 4;
+    if (!ge_queue_push(&q, c)) return fail("push resize");
+    memset(&c, 0, sizeof c);
+    if (!ge_queue_pop(&q, &c) || c.type != GE_CMD_RESIZE || c.w != 4)
+        return fail("pop resize");
+
     /* Leave unpopped commands with malloc'd tex so destroy cleans them up. */
     memset(&c, 0, sizeof c);
     c.type = GE_CMD_DRAW;

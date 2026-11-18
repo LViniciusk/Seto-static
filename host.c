@@ -1123,11 +1123,11 @@ static DWORD WINAPI input_thread(LPVOID unused) {
 #ifdef HAVE_TITLE_CORPUS
         if (auto_start) {
             if (!sent) {
-                if (getenv("SETO_SKIP_MOVIE") && !psp_title_menu_ready()) {
+                if (getenv("SETO_SKIP_MOVIE") && !psp_title_menu_ready() &&
+                    psp_display_vblanks() >= 250ull) {
                     static DWORD last_skip = 0;
                     DWORD now = GetTickCount();
-                    if (last_skip == 0) last_skip = now;
-                    else if (now - last_skip > 6000) {
+                    if (last_skip == 0 || now - last_skip > 1200) {
                         last_skip = now;
                         psp_ctrl_set(0x0008u /* START */, 128, 128);
                         Sleep(80);

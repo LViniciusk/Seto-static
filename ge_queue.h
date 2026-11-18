@@ -52,7 +52,8 @@ enum {
     GE_CMD_QUIT = 5,
     GE_CMD_UPLOAD_TARGET = 6,
     GE_CMD_BLIT = 7,
-    GE_CMD_READBACK = 8
+    GE_CMD_READBACK = 8,
+    GE_CMD_RESIZE = 9
 };
 
 typedef struct {

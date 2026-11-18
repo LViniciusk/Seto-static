@@ -18,7 +18,9 @@ int  seto_gl_present_active(void);
  * FBOs, textures, draws, blits, readbacks, and display-buffer presentation. */
 int  seto_ge_gpu_draw_mode(void);
 int  seto_ge_gpu_enqueue_target(int fbo_slot, uint32_t addr, uint32_t stride,
-                                int fmt, int w, int h);
+                                int fmt, int w, int h, int force_new);
+/* Invalidate any cached GE textures or FBOs overlapped by non-GE writes. */
+void seto_ge_invalidate_vram(uint32_t addr, uint32_t bytes);
 /* `tex` is an optional RGBA8888 snapshot (tex_w * tex_h, owned by the GPU
  * thread on success); `tex_slot` is -1 (untextured) or 0..GE_TEX_CACHE_SLOTS-1;
  * `fbo_tex_slot` is -1 (normal texture) or 0..GE_MAX_FBOS-1 (FBO-as-texture).
@@ -39,5 +41,9 @@ int  seto_ge_gpu_readback(int fbo_slot, int w, int h,
 /* Publish `disp_slot` (`>= 0`) or bottom-up 480x272 RAM frame `ram_rgba`
  * (ownership transfers to GPU thread when non-NULL). */
 void seto_ge_gpu_present(int disp_slot, uint32_t *ram_rgba, uint32_t capture_id);
+/* M4 physical scale control (1..10) and live WM_SIZE auto-resize hook. */
+void seto_gl_present_resize(int client_w, int client_h);
+int  seto_ge_gpu_set_scale(int scale);
+int  seto_ge_gpu_current_scale(void);
 
 #endif
