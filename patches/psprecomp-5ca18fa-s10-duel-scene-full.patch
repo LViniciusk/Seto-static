@@ -181,7 +181,7 @@ index 132306f..e5ab735 100644
   * hot path in any recompiled game; correctness first. */
  static inline float psp_fsqrt(float v) {
 diff --git a/include/psprecomp/render.h b/include/psprecomp/render.h
-index 81ee925..207e6cc 100644
+index 81ee925..cb79725 100644
 --- a/include/psprecomp/render.h
 +++ b/include/psprecomp/render.h
 @@ -24,6 +24,8 @@ typedef struct {
@@ -233,13 +233,20 @@ index 81ee925..207e6cc 100644
  } psp_draw_state;
  
  typedef struct {
-@@ -116,6 +144,10 @@ int psp_render_select(const char *name);
+@@ -116,6 +144,17 @@ int psp_render_select(const char *name);
  /* The active backend. Never NULL -- defaults to software. */
  const psp_render_backend *psp_render_current(void);
  
 +/* Install a host-provided backend (the GL frontend). Passing NULL restores
 + * the current selection. */
 +void psp_render_set_backend(const psp_render_backend *backend);
++
++/* Decode the texture selected by `st` into the shared RGBA8888 cache and
++ * return it (w*h, row-major, 0xAABBGGRR). The pointer is valid until the next
++ * draw or snapshot; a host that needs it across calls copies it immediately.
++ * Returns 0 when the format, size or layout is not decodable. */
++int psp_render_texture_rgba(const psp_draw_state *st, const uint32_t **rgba,
++                            int *w, int *h);
 +
  /* Backends provided by the runtime. */
  extern const psp_render_backend psp_render_software;
@@ -661,7 +668,7 @@ index 0000000..2d76123
 +    psp_hle_register(0x6A8C3CD5, "sceAtrac3plus", "sceAtracDecodeData",         hle_AtracDecodeData);
 +}
 diff --git a/src/hle/display.c b/src/hle/display.c
-index 73f6653..137cd49 100644
+index 73f6653..e2d1ef3 100644
 --- a/src/hle/display.c
 +++ b/src/hle/display.c
 @@ -12,6 +12,7 @@
@@ -781,7 +788,7 @@ index 73f6653..137cd49 100644
  /* ---- the calls ----------------------------------------------------------- */
  
  static void hle_SetMode(void) {
-@@ -97,6 +165,18 @@ static void hle_SetFrameBuf(void) {
+@@ -97,6 +165,20 @@ static void hle_SetFrameBuf(void) {
      g_fb_width  = psp_arg(1);
      g_fb_format = psp_arg(2);
      if (!g_fb_width) g_fb_width = 512;
@@ -797,10 +804,12 @@ index 73f6653..137cd49 100644
 +        host_mutex_unlock(&g_present_lock);
 +    }
 +#endif
++    if (g_fb_addr && psp_render_current()->present)
++        psp_render_current()->present();
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -115,9 +195,21 @@ static void hle_WaitVblank(void) {
+@@ -115,9 +197,21 @@ static void hle_WaitVblank(void) {
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
@@ -4529,7 +4538,7 @@ index 7e4aff8..5092b53 100644
      free(b);
  
 diff --git a/src/render.c b/src/render.c
-index 6a20fb4..ca6042f 100644
+index 6a20fb4..2a6cfff 100644
 --- a/src/render.c
 +++ b/src/render.c
 @@ -9,14 +9,18 @@
@@ -4650,7 +4659,7 @@ index 6a20fb4..ca6042f 100644
      default: return c;
      }
  }
-@@ -84,19 +127,48 @@ static uint32_t color_pack(uint32_t c, int fmt) {
+@@ -84,19 +127,50 @@ static uint32_t color_pack(uint32_t c, int fmt) {
  
  static const int TEX_BPP[11] = { 16, 16, 16, 32, 4, 8, 16, 32, 4, 8, 8 };
  
@@ -4683,6 +4692,8 @@ index 6a20fb4..ca6042f 100644
 +static uint64_t       g_tex_raw_size;
 +static const uint32_t *g_tex_lin;
 +static int            g_tex_lin_tried;
++static uint32_t      *g_tex_snap_buf;
++static size_t         g_tex_snap_cap;
 +
  /* Byte offset of texel byte column `xb` in row `y`. A swizzled texture is
   * stored as 16-byte x 8-row blocks, left to right, then top to bottom; that is
@@ -4705,7 +4716,7 @@ index 6a20fb4..ca6042f 100644
      if (!st->clut) return 0;
      if (st->clut_fmt == 3) {
          if (e >= 256) return 0;                 /* the CLUT cache is 1 KB */
-@@ -108,11 +180,62 @@ static uint32_t clut_entry(const psp_draw_state *st, uint32_t idx) {
+@@ -108,11 +182,62 @@ static uint32_t clut_entry(const psp_draw_state *st, uint32_t idx) {
      return psp_color_expand((uint32_t)p[0] | ((uint32_t)p[1] << 8), st->clut_fmt);
  }
  
@@ -4769,7 +4780,7 @@ index 6a20fb4..ca6042f 100644
  /* DXT1/3/5. The PSP lays a block out with its colour indices first -- one
   * byte per row, two bits per texel -- then the two 565 endpoint colours, the
   * reverse of the desktop order. DXT3 and DXT5 follow the colour half with
-@@ -122,72 +245,98 @@ static int wrap(int c, int size, int clamp) {
+@@ -122,72 +247,98 @@ static int wrap(int c, int size, int clamp) {
  static uint32_t dxt_texel(const psp_draw_state *st, uint32_t x, uint32_t y) {
      const uint32_t size = st->tex_fmt == PSP_TPSM_DXT1 ? 8u : 16u;
      const uint32_t blk = st->tex_addr + ((y >> 2) * ((uint32_t)st->tex_bw / 4) + (x >> 2)) * size;
@@ -4917,7 +4928,7 @@ index 6a20fb4..ca6042f 100644
      int r, g, b, a;
      const int ta = st->tex_alpha;
      switch (st->tex_func) {
-@@ -224,7 +373,7 @@ static uint32_t tex_combine(const psp_draw_state *st, uint32_t t, uint32_t c) {
+@@ -224,7 +375,7 @@ static uint32_t tex_combine(const psp_draw_state *st, uint32_t t, uint32_t c) {
      return rgba(r, g, b, a);
  }
  
@@ -4926,7 +4937,7 @@ index 6a20fb4..ca6042f 100644
      int a = (int)A(c) & st->atest_mask, ref = st->atest_ref & st->atest_mask;
      switch (st->atest_func) {
      case 0:  return 0;
-@@ -258,7 +407,13 @@ static int factor(int code, int is_src, int ch, uint32_t s, uint32_t d, uint32_t
+@@ -258,7 +409,13 @@ static int factor(int code, int is_src, int ch, uint32_t s, uint32_t d, uint32_t
      }
  }
  
@@ -4941,7 +4952,7 @@ index 6a20fb4..ca6042f 100644
      int out[3];
      for (int ch = 0; ch < 3; ch++) {
          int sc = (int)((s >> (ch * 8)) & 0xFF), dc = (int)((d >> (ch * 8)) & 0xFF);
-@@ -273,15 +428,22 @@ static uint32_t blend(const psp_draw_state *st, uint32_t s, uint32_t d) {
+@@ -273,15 +430,25 @@ static uint32_t blend(const psp_draw_state *st, uint32_t s, uint32_t d) {
          default: out[ch] = sc > dc ? sc - dc : dc - sc; break;
          }
      }
@@ -4959,6 +4970,9 @@ index 6a20fb4..ca6042f 100644
 +        memset(&g_lin_cache[i], 0, sizeof g_lin_cache[i]);
 +    }
 +    g_lin_tick = 0;
++    free(g_tex_snap_buf);
++    g_tex_snap_buf = NULL;
++    g_tex_snap_cap = 0;
 +}
 +
  static int sw_init(int w, int h) { (void)w; (void)h; return 0; }
@@ -4967,7 +4981,7 @@ index 6a20fb4..ca6042f 100644
  
  static void sw_target(uint32_t addr, uint32_t stride, int fmt) {
      g_fb_addr = addr;
-@@ -290,10 +452,37 @@ static void sw_target(uint32_t addr, uint32_t stride, int fmt) {
+@@ -290,10 +457,37 @@ static void sw_target(uint32_t addr, uint32_t stride, int fmt) {
  }
  
  static uint32_t fb_read(uint32_t at) {
@@ -5007,7 +5021,7 @@ index 6a20fb4..ca6042f 100644
      switch (func) {
      case 0:  return 0;
      case 1:  return 1;
-@@ -308,11 +497,635 @@ static int depth_pass(int func, int z, int d) {
+@@ -308,11 +502,741 @@ static int depth_pass(int func, int z, int d) {
  
  /* One fragment through the pipeline. `c` is the interpolated vertex colour,
   * `zf` its depth. */
@@ -5616,6 +5630,112 @@ index 6a20fb4..ca6042f 100644
 +    return g_tex_lin;
 +}
 +
++/* ---- texture snapshot for host backends ---------------------------------- */
++
++/* Bind st's texture into the per-draw decode context: row bytes, source span
++ * and CLUT LUT. Returns 1 when the draw has a usable texture. */
++static int sw_tex_begin(const psp_draw_state *st) {
++    g_tex_span.data = NULL;
++    g_tex_base = NULL;
++    g_tex_lin = NULL;
++    g_tex_lin_tried = 0;
++    g_tex_raw_size = 0;
++    g_tex_fmt_ok = 0;
++    g_tex_in_draw = 1;
++    g_clut_fast = 0;
++    g_dxt_gen++;
++    if (!st->tex_enable || st->clear || st->tex_fmt < 0 ||
++        st->tex_fmt > PSP_TPSM_DXT5 || st->tex_w <= 0 || st->tex_h <= 0 ||
++        st->tex_bw <= 0)
++        return 0;
++    g_tex_fmt_ok = 1;
++    g_tex_rowb = (uint32_t)st->tex_bw * (uint32_t)TEX_BPP[st->tex_fmt] / 8u;
++    g_tex_blocks = g_tex_rowb >= 16u ? g_tex_rowb / 16u : 1u;
++    uint64_t size;
++    if (st->tex_fmt >= PSP_TPSM_DXT1) {
++        size = ((uint64_t)((st->tex_h - 1) / 4) * (unsigned)(st->tex_bw / 4) +
++                (unsigned)((st->tex_w - 1) / 4) + 1) * (st->tex_fmt == PSP_TPSM_DXT1 ? 8u : 16u);
++    } else {
++        const unsigned bpp = (unsigned)TEX_BPP[st->tex_fmt];
++        const uint64_t row = (uint64_t)(unsigned)st->tex_bw * bpp / 8;
++        const uint64_t x = (uint64_t)(unsigned)(st->tex_w - 1) * bpp / 8;
++        const unsigned y = (unsigned)(st->tex_h - 1);
++        if (st->tex_swizzle) {
++            const uint64_t blocks = row >= 16 ? row / 16 : 1;
++            uint64_t last = (y / 8 * blocks) * 128 + (y & 7) * 16;
++            if (y >= 8) {
++                const uint64_t prev = ((y / 8 - 1) * blocks) * 128 + 112;
++                if (prev > last) last = prev;
++            }
++            size = last + x / 16 * 128 + (x & 15);
++        } else size = y * row + x;
++        size += bpp < 8 ? 1 : bpp / 8;
++    }
++    g_tex_raw_size = size;
++    map_span(&g_tex_span, st->tex_addr, size);
++    g_tex_base = g_tex_span.data ? g_tex_span.data + (uint32_t)(st->tex_addr - g_tex_span.addr) : NULL;
++    if (st->clut && (st->tex_fmt == PSP_TPSM_T4 || st->tex_fmt == PSP_TPSM_T8)) {
++        const int n = st->tex_fmt == PSP_TPSM_T4 ? 16 : 256;
++        for (int i = 0; i < n; i++) g_clut_lut[i] = clut_entry(st, (uint32_t)i);
++        g_clut_fast = 1;
++    }
++    return g_tex_fmt_ok;
++}
++
++static void sw_tex_end(void) {
++    g_tex_in_draw = 0;
++    g_tex_fmt_ok = 0;
++    g_tex_base = NULL;
++    g_tex_lin = NULL;
++    g_tex_lin_tried = 0;
++    g_tex_raw_size = 0;
++    g_clut_fast = 0;
++    g_tex_span.data = NULL;
++}
++
++int psp_render_texture_rgba(const psp_draw_state *st, const uint32_t **rgba,
++                            int *w, int *h) {
++    const uint32_t *px;
++    if (!st || !rgba || !w || !h) return 0;
++    if (!sw_tex_begin(st)) {
++        sw_tex_end();
++        return 0;
++    }
++    if ((st->tex_fmt >= PSP_TPSM_T4 && st->tex_fmt <= PSP_TPSM_T32 && !st->clut) ||
++        (st->tex_fmt >= PSP_TPSM_DXT1 && st->tex_bw < 4)) {
++        sw_tex_end();
++        return 0;
++    }
++    px = sw_tex_resolve_linear(st);
++    if (!px) {
++        const size_t need = (size_t)st->tex_w * (size_t)st->tex_h;
++        if (need > g_tex_snap_cap) {
++            uint32_t *p = (uint32_t *)realloc(g_tex_snap_buf, need * sizeof(uint32_t));
++            if (!p) {
++                sw_tex_end();
++                return 0;
++            }
++            g_tex_snap_buf = p;
++            g_tex_snap_cap = need;
++        }
++        const uint64_t bad0 = g_bad_texels;
++        for (int y = 0; y < st->tex_h; y++) {
++            for (int x = 0; x < st->tex_w; x++)
++                g_tex_snap_buf[(size_t)y * (size_t)st->tex_w + (size_t)x] = psp_tex_fetch(st, x, y);
++        }
++        if (g_bad_texels != bad0) {
++            sw_tex_end();
++            return 0;
++        }
++        px = g_tex_snap_buf;
++    }
++    sw_tex_end();
++    *rgba = px;
++    *w = st->tex_w;
++    *h = st->tex_h;
++    return 1;
++}
++
 +static uint32_t apply_logic_op(int op, uint32_t s, uint32_t d) {
 +    uint32_t r;
 +    s &= 0x00FFFFFFu;
@@ -5647,7 +5767,7 @@ index 6a20fb4..ca6042f 100644
      const uint32_t bytes = g_fb_fmt == 3 ? 4u : 2u;
      const uint32_t at = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * bytes;
      /* Rounded: coplanar layers (WTF draws LED text on its panel at the same
-@@ -324,136 +1137,3032 @@ static void fragment(const psp_draw_state *st, int x, int y, uint32_t c, float u
+@@ -324,123 +1248,2971 @@ static void fragment(const psp_draw_state *st, int x, int y, uint32_t c, float u
      if (st->clear) {
          /* Clear mode writes only the buffers its flags name. A depth-only
           * clear leaves the colour alone. */
@@ -5897,36 +6017,20 @@ index 6a20fb4..ca6042f 100644
 -        for (int i = 0; i + 1 < count; i += 2) sw_sprite(&v[i], &v[i + 1], st);
 -        break;
 -    case PSP_PRIM_TRIANGLES:
--        for (int i = 0; i + 2 < count; i += 3) sw_tri(&v[i], &v[i + 1], &v[i + 2], st);
--        break;
--    case PSP_PRIM_TRIANGLE_STRIP:
--        for (int i = 0; i + 2 < count; i++) sw_tri(&v[i], &v[i + 1], &v[i + 2], st);
--        break;
--    case PSP_PRIM_TRIANGLE_FAN:
--        for (int i = 1; i + 1 < count; i++) sw_tri(&v[0], &v[i], &v[i + 1], st);
--        break;
--    default:
--        break;                       /* points, lines: not yet */
--    }
 +static inline int uv_fp_eligible(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c) {
 +    const float lim = 1e6f;
 +    return a->u > -lim && a->u < lim && b->u > -lim && b->u < lim && c->u > -lim && c->u < lim &&
 +           a->v > -lim && a->v < lim && b->v > -lim && b->v < lim && c->v > -lim && c->v < lim;
- }
- 
--static void sw_noop(void) { }
++}
++
 +static inline int clamp8(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
- 
--const psp_render_backend psp_render_software = {
--    "software", sw_init, sw_shutdown, sw_target, sw_draw, sw_noop, sw_noop
--};
++
 +static __attribute__((noinline)) void sw_tri_solid_za_fn(
 +    const psp_vertex *a, const psp_vertex *b, const psp_vertex *c,
 +    const psp_draw_state *st, int minx, int maxx, int miny, int maxy,
 +    int area, float h0, float h1, float h2,
 +    int bmode, int stencil, int ztest, int zwrite, int atest, int gouraud, int fog);
- 
--/* ---- null backend -------------------------------------------------------- */
++
 +static int sw_tri_opaque(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c,
 +                         const psp_draw_state *st, int minx, int maxx, int miny, int maxy,
 +                         int area, float inv, float h0, float h1, float h2, int gouraud, int fog) {
@@ -5949,10 +6053,7 @@ index 6a20fb4..ca6042f 100644
 +    const int32_t dbdx = gouraud ? (int32_t)(((-(double)dy1 * (int)B(a->rgba) - (double)dy2 * (int)B(b->rgba) - (double)dy0 * (int)B(c->rgba)) * inv_d) * 65536.0) : 0;
 +    const int32_t dadx = gouraud ? (int32_t)(((-(double)dy1 * (int)A(a->rgba) - (double)dy2 * (int)A(b->rgba) - (double)dy0 * (int)A(c->rgba)) * inv_d) * 65536.0) : 0;
 +    uint64_t px_drawn = 0;
- 
--/* Draws nothing, and that is the point. During bring-up the question is
-- * usually "did the game ask to draw" rather than "does it look right", and the
-- * answer is clearer without pixels in the way. */
++
 +    if (!fog && !gouraud && !need_z && g_fb_fmt == 3) {
 +        for (int y = miny; y <= maxy; y++) {
 +            int xs, xe, w0, w1, w2;
@@ -8687,49 +8788,7 @@ index 6a20fb4..ca6042f 100644
 +    const unsigned bytes = g_fb_fmt == 3 ? 4u : 2u;
 +    map_span(&g_fb_span, g_fb_addr, ((uint64_t)g_fb_stride * 271 + 480) * bytes);
 +    map_span(&g_z_span, st->zaddr, st->zbw > 0 ? ((uint64_t)st->zbw * 271 + 480) * 2 : 0);
-+    g_tex_span.data = NULL;
-+    g_tex_base = NULL;
-+    g_tex_lin = NULL;
-+    g_tex_lin_tried = 0;
-+    g_tex_raw_size = 0;
-+    g_tex_fmt_ok = 0;
-+    g_tex_in_draw = 1;
-+    g_clut_fast = 0;
-+    g_dxt_gen++;
-+    if (st->tex_enable && !st->clear && st->tex_fmt >= 0 && st->tex_fmt <= PSP_TPSM_DXT5 &&
-+            st->tex_w > 0 && st->tex_h > 0 && st->tex_bw > 0) {
-+        g_tex_fmt_ok = 1;
-+        g_tex_rowb = (uint32_t)st->tex_bw * (uint32_t)TEX_BPP[st->tex_fmt] / 8u;
-+        g_tex_blocks = g_tex_rowb >= 16u ? g_tex_rowb / 16u : 1u;
-+        uint64_t size;
-+        if (st->tex_fmt >= PSP_TPSM_DXT1) {
-+            size = ((uint64_t)((st->tex_h - 1) / 4) * (unsigned)(st->tex_bw / 4) +
-+                    (unsigned)((st->tex_w - 1) / 4) + 1) * (st->tex_fmt == PSP_TPSM_DXT1 ? 8u : 16u);
-+        } else {
-+            const unsigned bpp = (unsigned)TEX_BPP[st->tex_fmt];
-+            const uint64_t row = (uint64_t)(unsigned)st->tex_bw * bpp / 8;
-+            const uint64_t x = (uint64_t)(unsigned)(st->tex_w - 1) * bpp / 8;
-+            const unsigned y = (unsigned)(st->tex_h - 1);
-+            if (st->tex_swizzle) {
-+                const uint64_t blocks = row >= 16 ? row / 16 : 1;
-+                uint64_t last = (y / 8 * blocks) * 128 + (y & 7) * 16;
-+                if (y >= 8) {
-+                    const uint64_t prev = ((y / 8 - 1) * blocks) * 128 + 112;
-+                    if (prev > last) last = prev;
-+                }
-+                size = last + x / 16 * 128 + (x & 15);
-+            } else size = y * row + x;
-+            size += bpp < 8 ? 1 : bpp / 8;
-+        }
-+        g_tex_raw_size = size;
-+        map_span(&g_tex_span, st->tex_addr, size);
-+        g_tex_base = g_tex_span.data ? g_tex_span.data + (uint32_t)(st->tex_addr - g_tex_span.addr) : NULL;
-+        if (st->clut && (st->tex_fmt == PSP_TPSM_T4 || st->tex_fmt == PSP_TPSM_T8)) {
-+            const int n = st->tex_fmt == PSP_TPSM_T4 ? 16 : 256;
-+            for (int i = 0; i < n; i++) g_clut_lut[i] = clut_entry(st, (uint32_t)i);
-+            g_clut_fast = 1;
-+        }
-+    }
++    sw_tex_begin(st);
 +    switch (prim) {
 +    case PSP_PRIM_POINTS:
 +        for (int i = 0; i < count; i++) sw_point(&v[i], st);
@@ -8744,45 +8803,28 @@ index 6a20fb4..ca6042f 100644
 +        for (int i = 0; i + 1 < count; i += 2) sw_sprite(&v[i], &v[i + 1], st);
 +        break;
 +    case PSP_PRIM_TRIANGLES:
-+        for (int i = 0; i + 2 < count; i += 3) sw_tri(&v[i], &v[i + 1], &v[i + 2], st);
-+        break;
-+    case PSP_PRIM_TRIANGLE_STRIP:
+         for (int i = 0; i + 2 < count; i += 3) sw_tri(&v[i], &v[i + 1], &v[i + 2], st);
+         break;
+     case PSP_PRIM_TRIANGLE_STRIP:
+-        for (int i = 0; i + 2 < count; i++) sw_tri(&v[i], &v[i + 1], &v[i + 2], st);
 +        for (int i = 0; i + 2 < count; i++) {
 +            if (i & 1) sw_tri(&v[i + 1], &v[i], &v[i + 2], st);
 +            else       sw_tri(&v[i], &v[i + 1], &v[i + 2], st);
 +        }
+         break;
+     case PSP_PRIM_TRIANGLE_FAN:
+         for (int i = 1; i + 1 < count; i++) sw_tri(&v[0], &v[i], &v[i + 1], st);
+         break;
+     default:
+-        break;                       /* points, lines: not yet */
 +        break;
-+    case PSP_PRIM_TRIANGLE_FAN:
-+        for (int i = 1; i + 1 < count; i++) sw_tri(&v[0], &v[i], &v[i + 1], st);
-+        break;
-+    default:
-+        break;
-+    }
-+    g_tex_in_draw = 0;
-+    g_tex_fmt_ok = 0;
-+    g_tex_base = NULL;
-+    g_tex_lin = NULL;
-+    g_tex_lin_tried = 0;
-+    g_tex_raw_size = 0;
-+    g_clut_fast = 0;
-+    g_fb_span.data = g_z_span.data = g_tex_span.data = NULL;
-+}
-+
-+static void sw_noop(void) { }
-+
-+const psp_render_backend psp_render_software = {
-+    "software", sw_init, sw_shutdown, sw_target, sw_draw, sw_noop, sw_noop
-+};
-+
-+/* ---- null backend -------------------------------------------------------- */
-+
-+/* Draws nothing, and that is the point. During bring-up the question is
-+ * usually "did the game ask to draw" rather than "does it look right", and the
-+ * answer is clearer without pixels in the way. */
+     }
++    sw_tex_end();
++    g_fb_span.data = g_z_span.data = NULL;
+ }
  
- static int null_init(int w, int h) { (void)w; (void)h; return 0; }
- static void null_target(uint32_t a, uint32_t s, int f) { (void)a; (void)s; (void)f; }
-@@ -472,6 +4181,10 @@ static const psp_render_backend *g_backend = &psp_render_software;
+ static void sw_noop(void) { }
+@@ -472,6 +4244,10 @@ static const psp_render_backend *g_backend = &psp_render_software;
  
  const psp_render_backend *psp_render_current(void) { return g_backend; }
  
@@ -9896,7 +9938,7 @@ index b41d6ef..30e595d 100644
      psp_mem_free();
  
 diff --git a/tests/test_raster.c b/tests/test_raster.c
-index 0f821b5..c557dab 100644
+index 0f821b5..6867a83 100644
 --- a/tests/test_raster.c
 +++ b/tests/test_raster.c
 @@ -109,7 +109,7 @@ static void test_sprite(void) {
@@ -10745,7 +10787,7 @@ index 0f821b5..c557dab 100644
  }
  
  int main(void) {
-@@ -690,10 +1331,23 @@ int main(void) {
+@@ -690,10 +1331,71 @@ int main(void) {
      test_clear_mode_and_scissor();
      test_dxt1();
      test_depth();
@@ -10766,6 +10808,54 @@ index 0f821b5..c557dab 100644
 +    test_ctest_fog_logic_trx_tgen();
 +    test_points_lines_and_narrow_swizzle();
 +    test_t8_swizzle_bilinear_fast_oracle();
++
++    /* Verify psp_render_texture_rgba fallback path matches psp_tex_fetch on
++     * narrow swizzle T8, T16, and 4444. */
++    {
++        uint8_t clut_t8[256 * 4];
++        for (int i = 0; i < 256; i++) {
++            uint32_t c = 0xFF000000u | ((uint32_t)i << 16) | ((uint32_t)(255 - i) << 8) | (uint32_t)((i * 3) & 255);
++            memcpy(clut_t8 + i * 4, &c, 4);
++        }
++        for (int y = 0; y < 16; y++)
++            for (int x = 0; x < 8; x++)
++                psp_write8(TEX + (uint32_t)(((y >> 3) * 1u + (x >> 4)) * 128u + (y & 7) * 16u + (x & 15)), (uint8_t)(y * 8 + x));
++
++        psp_draw_state st = {0};
++        st.tex_enable = 1; st.tex_addr = TEX; st.tex_w = 8; st.tex_h = 16; st.tex_bw = 8;
++        st.tex_fmt = PSP_TPSM_T8; st.tex_swizzle = 1;
++        st.clut = clut_t8; st.clut_fmt = 3; st.clut_mask = 0xFF;
++        const uint32_t *rgba = NULL; int tw = 0, th = 0;
++        CHECK(psp_render_texture_rgba(&st, &rgba, &tw, &th) == 1 && tw == 8 && th == 16,
++              "snapshot narrow swizzled T8");
++        int bad = 0;
++        for (int y = 0; y < th && rgba; y++)
++            for (int x = 0; x < tw; x++)
++                if (rgba[y * tw + x] != psp_tex_fetch(&st, x, y)) bad++;
++        CHECK(bad == 0, "snapshot narrow T8 matches psp_tex_fetch: %d", bad);
++
++        for (int i = 0; i < 4 * 8; i++) psp_write16(TEX + (uint32_t)i * 2u, (uint16_t)(i & 0xFF));
++        st.tex_w = 4; st.tex_h = 4; st.tex_bw = 8; st.tex_fmt = PSP_TPSM_T16; st.tex_swizzle = 0;
++        rgba = NULL; tw = th = 0;
++        CHECK(psp_render_texture_rgba(&st, &rgba, &tw, &th) == 1 && tw == 4 && th == 4,
++              "snapshot T16");
++        bad = 0;
++        for (int y = 0; y < th && rgba; y++)
++            for (int x = 0; x < tw; x++)
++                if (rgba[y * tw + x] != psp_tex_fetch(&st, x, y)) bad++;
++        CHECK(bad == 0, "snapshot T16 matches psp_tex_fetch: %d", bad);
++
++        for (int i = 0; i < 4 * 8; i++) psp_write16(TEX + (uint32_t)i * 2u, (uint16_t)(0xF123u + i * 0x1111u));
++        st.tex_fmt = PSP_TPSM_4444; st.clut = NULL;
++        rgba = NULL; tw = th = 0;
++        CHECK(psp_render_texture_rgba(&st, &rgba, &tw, &th) == 1 && tw == 4 && th == 4,
++              "snapshot 4444");
++        bad = 0;
++        for (int y = 0; y < th && rgba; y++)
++            for (int x = 0; x < tw; x++)
++                if (rgba[y * tw + x] != psp_tex_fetch(&st, x, y)) bad++;
++        CHECK(bad == 0, "snapshot 4444 matches psp_tex_fetch: %d", bad);
++    }
  
      psp_mem_free();
      printf(failures ? "raster: %d failure(s)\n" : "raster: all tests passed\n", failures);

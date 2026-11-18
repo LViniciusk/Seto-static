@@ -18,8 +18,13 @@ int  seto_gl_present_active(void);
  * consumes them. Software rendering still runs for guest VRAM. */
 int  seto_ge_gpu_draw_mode(void);
 int  seto_ge_gpu_enqueue_target(uint32_t addr, uint32_t stride, int fmt);
+/* `tex` is an optional RGBA8888 snapshot (tex_w * tex_h, owned by the GPU
+ * thread on success); `tex_slot` is -1 (untextured) or 0..GE_TEX_CACHE_SLOTS-1.
+ * When `tex == NULL` and `tex_slot >= 0`, the GPU thread reuses that cached slot.
+ * On failure the caller keeps ownership of `tex`. */
 int  seto_ge_gpu_enqueue_draw(int prim, const psp_vertex *v, int count,
-                              const psp_draw_state *st);
-void seto_ge_gpu_present(void);
+                              const psp_draw_state *st, uint32_t *tex,
+                              int tex_slot);
+void seto_ge_gpu_present(uint32_t capture_id);
 
 #endif

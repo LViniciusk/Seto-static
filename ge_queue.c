@@ -14,8 +14,12 @@ int ge_queue_init(ge_queue *q, uint32_t capacity) {
 }
 
 void ge_queue_destroy(ge_queue *q) {
+    ge_cmd c;
     if (!q) return;
-    free(q->buf);
+    if (q->buf) {
+        while (ge_queue_pop(q, &c)) free(c.tex);
+        free(q->buf);
+    }
     q->buf = NULL;
     q->cap = q->mask = 0;
 }

@@ -10,6 +10,7 @@
  * (consumer). The command payload is copied; the consumer never dereferences
  * guest pointers. */
 #define GE_MAX_VERTS 512
+#define GE_TEX_CACHE_SLOTS 64
 
 typedef struct {
     uint32_t type;
@@ -19,6 +20,11 @@ typedef struct {
     uint32_t addr;
     uint32_t stride;
     uint32_t fmt;
+    int32_t  tex_slot;
+    /* GE_CMD_DRAW: optional decoded RGBA8888 (tex_w * tex_h) upload payload for
+     * `tex_slot`, allocated by the guest thread and freed by the GPU thread.
+     * When `tex == NULL` and `tex_slot >= 0`, reuse the slot's cached GL tex. */
+    uint32_t *tex;
     psp_draw_state state;
     psp_vertex verts[GE_MAX_VERTS];
 } ge_cmd;
