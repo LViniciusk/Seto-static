@@ -34,6 +34,9 @@ void psp_fpl_register(void);
 void seto_multimedia_register(void);
 void seto_multimedia_shutdown(void);
 #include "seto_net.h"
+#ifdef HAVE_TF3ENG_CORPUS
+#include "tf3_bridge.h"
+#endif
 int  psp_font_image_load(const char *path);
 int  psp_font_bind(void);
 #ifdef HAVE_FONT_CORPUS
@@ -2196,6 +2199,9 @@ int main(int argc, char **argv) {
                           !getenv("SETO_FREE_DUEL_PLAY");
 
     if (psp_mem_init() != 0) { fprintf(stderr, "memory init failed\n"); return 1; }
+#ifdef HAVE_TF3ENG_CORPUS
+    gx_runtime_init();
+#endif
     timeBeginPeriod(1);
 
     psp_module m;

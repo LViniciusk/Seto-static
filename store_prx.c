@@ -31,10 +31,11 @@ typedef struct {
     const char *name;
     const char *lbn;
     const char *prx;
-    uint32_t base, end_max, uid, entry, gp;
+    uint32_t base, end_max, uid, entry, gp, filesz, memsz;
     int map_extra;
     void (*reg)(void);
     int loaded;
+    uint8_t *image;
 } store_mod_t;
 
 #ifdef HAVE_CHARALIST_CORPUS
@@ -50,9 +51,9 @@ static void shop_psp_recomp_register(void) { }
 
 static store_mod_t g_store[] = {
     { "modcharalist", "sce_lbn0x56b0", "libcharalist.prx",
-      0x09410000u, 0x09700000u, 0x00080005u, 0, 0, 0, charalist_psp_recomp_register, 0 },
+      0x09410000u, 0x09700000u, 0x00080005u, 0, 0, 0, 0, 0, charalist_psp_recomp_register, 0, NULL },
     { "modshop",      "sce_lbn0x5dd0", "libshop.prx",
-      0x03600000u, 0x04000000u, 0x00080006u, 0, 0, 1, shop_psp_recomp_register,      0 },
+      0x03600000u, 0x04000000u, 0x00080006u, 0, 0, 0, 0, 1, shop_psp_recomp_register,      0, NULL },
 };
 #define NSTORE ((int)(sizeof g_store / sizeof g_store[0]))
 
@@ -213,6 +214,8 @@ static int load_mod(store_mod_t *m, const char *path) {
     }
     m->gp = psp_read32(info + 0x20);
     m->entry = rd32(d + 24);
+    if (m->base == 0x03600000u)
+        psp_dispatch_clear_range(0x03600000u, 0x04000000u);
     m->reg();
     psp_dispatch_module_gp(m->base, m->base + memsz, m->gp);
     int mod_exp_start = g_mod_nexports;
@@ -242,12 +245,37 @@ static int load_mod(store_mod_t *m, const char *path) {
         }
         e += stride;
     }
+    m->filesz = filesz;
+    m->memsz = memsz;
+    free(m->image);
+    m->image = (uint8_t *)malloc(filesz ? filesz : 1u);
+    if (m->image && filesz) memcpy(m->image, d + off, filesz);
     m->loaded = 1;
     free(d);
     fprintf(stderr, "store PRX %s 0x%08X..0x%08X (%u bytes .bss), gp 0x%08X, entry 0x%08X, %d exports\n",
             m->name, m->base, m->base + memsz, memsz - filesz, m->gp, m->entry,
             g_mod_nexports - mod_exp_start);
     return 0;
+}
+
+static void restore_mod_image(store_mod_t *m) {
+    if (!m->loaded || !m->image || !m->memsz) return;
+    if (m->map_extra) {
+        psp_mem_map_extra(m->base, m->memsz);
+        psp_mem_write_block(m->base, m->image, m->filesz);
+    } else {
+        psp_mem_write_block(m->base, m->image, m->filesz);
+        if (m->memsz > m->filesz) {
+            uint32_t n = m->memsz - m->filesz;
+            uint8_t *bss = psp_mem_unwatched_ptr(m->base + m->filesz, n);
+            if (bss) memset(bss, 0, n);
+            else for (uint32_t i = 0; i < n; i++) psp_write8(m->base + m->filesz + i, 0);
+        }
+    }
+    if (m->base == 0x03600000u)
+        psp_dispatch_clear_range(0x03600000u, 0x04000000u);
+    m->reg();
+    psp_dispatch_module_gp(m->base, m->base + m->memsz, m->gp);
 }
 
 int psp_store_images_load(const char *charalist_path, const char *shop_path, uint32_t eboot_info) {
@@ -270,6 +298,7 @@ int psp_store_load_uid(const char *path, uint32_t *uid) {
         store_mod_t *m = &g_store[i];
         if (!m->loaded) continue;
         if (strstr(path, m->lbn) || strcmp(base, m->prx) == 0) {
+            restore_mod_image(m);
             *uid = m->uid;
             return 1;
         }

@@ -30,6 +30,7 @@ typedef struct { uint32_t nid, addr; } deck_export_t;
 static deck_export_t g_exports[MAX_EXPORTS];
 static int g_nexports;
 static uint32_t g_eboot_gp, g_deck_gp;
+static uint32_t g_deck_image_end, g_deck_bss_end;
 static int g_deck_loaded;
 static char g_deck_path[512];
 static uint32_t g_eboot_info;
@@ -217,6 +218,8 @@ int psp_deck_image_load(const char *path, uint32_t eboot_info) {
         return -1;
     }
     g_deck_gp = psp_read32(info + 0x20);
+    g_deck_image_end = vaddr + filesz;
+    g_deck_bss_end = vaddr + memsz;
     deck_psp_recomp_register();
     if (!psp_lookup(DECK_ENTRY)) {
         free(d); fprintf(stderr, "deck PRX: dispatch entry missing\n"); return -1;
@@ -248,6 +251,12 @@ int psp_deck_load_uid(const char *path, uint32_t *uid) {
 
 int psp_deck_start(uint32_t uid, uint32_t status_ptr) {
     if (uid != DECK_UID || !g_deck_loaded) return 0;
+    if (g_deck_bss_end > g_deck_image_end) {
+        const uint32_t n = g_deck_bss_end - g_deck_image_end;
+        uint8_t *bss = psp_mem_unwatched_ptr(g_deck_image_end, n);
+        if (bss) memset(bss, 0, n);
+        else for (uint32_t i = 0; i < n; i++) psp_write8(g_deck_image_end + i, 0);
+    }
     uint32_t caller_gp = psp_cpu.r[PSP_REG_GP];
     psp_cpu.r[PSP_REG_A0] = psp_arg(1);
     psp_cpu.r[PSP_REG_A1] = psp_arg(2);

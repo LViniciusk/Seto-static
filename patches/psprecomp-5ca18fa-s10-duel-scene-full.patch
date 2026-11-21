@@ -14,10 +14,18 @@ index 3f7b1fb..def455c 100644
  
  target_include_directories(psprecomp PUBLIC
 diff --git a/include/psprecomp/dispatch.h b/include/psprecomp/dispatch.h
-index 331a13f..ee29f49 100644
+index 331a13f..6703dec 100644
 --- a/include/psprecomp/dispatch.h
 +++ b/include/psprecomp/dispatch.h
-@@ -42,6 +42,10 @@ void psp_dispatch(uint32_t addr);
+@@ -26,6 +26,7 @@ typedef void (*psp_fn_t)(void);
+  * function it defines, from a single init routine. */
+ void psp_register(uint32_t addr, psp_fn_t fn);
+ void psp_register_label(uint32_t addr, psp_fn_t fn);
++void psp_dispatch_clear_range(uint32_t lo, uint32_t hi);
+ void psp_dispatch_set_budget(uint64_t calls, void (*on_exceeded)(void));
+ uint64_t psp_dispatch_calls(void);
+ 
+@@ -42,6 +43,10 @@ void psp_dispatch(uint32_t addr);
   * is a return whatever $ra holds, and no unwind crosses it. */
  void psp_call_from_host(uint32_t addr);
  
@@ -328,10 +336,37 @@ index f419054..27be919 100644
   * vector instruction. Matrix ops do not apply them, and trap instead. */
  void psp_vfpu_set_prefix(int which, uint32_t value);
 diff --git a/src/dispatch.c b/src/dispatch.c
-index a2510f5..0427399 100644
+index a2510f5..d7fa55c 100644
 --- a/src/dispatch.c
 +++ b/src/dispatch.c
-@@ -198,7 +198,26 @@ int psp_ra_is_jump(uint32_t ra) {
+@@ -78,7 +78,10 @@ void psp_register_label(uint32_t addr, psp_fn_t fn) {
+     uint32_t m = g_cap - 1;
+     uint32_t j = hash_addr(addr) & m;
+     while (g_table[j].used) {
+-        if (g_table[j].addr == addr) return;      /* already known: keep it */
++        if (g_table[j].addr == addr) {
++            if (!g_table[j].fn) g_table[j].fn = fn;
++            return;      /* already known: keep real entry */
++        }
+         j = (j + 1) & m;
+     }
+     g_table[j].addr = addr;
+@@ -87,6 +90,14 @@ void psp_register_label(uint32_t addr, psp_fn_t fn) {
+     g_count++;
+ }
+ 
++void psp_dispatch_clear_range(uint32_t lo, uint32_t hi) {
++    if (!g_table) return;
++    for (uint32_t i = 0; i < g_cap; i++) {
++        if (g_table[i].used && g_table[i].addr >= lo && g_table[i].addr < hi)
++            g_table[i].fn = NULL;
++    }
++}
++
+ psp_fn_t psp_lookup(uint32_t addr) {
+     if (!g_table) return NULL;
+     uint32_t m = g_cap - 1;
+@@ -198,7 +209,28 @@ int psp_ra_is_jump(uint32_t ra) {
      return 1;
  }
  
@@ -342,7 +377,9 @@ index a2510f5..0427399 100644
 +
 +void psp_dispatch_module_gp(uint32_t lo, uint32_t hi, uint32_t gp) {
 +    for (int i = 0; i < g_nmods; i++) {
-+        if (g_mods[i].lo == lo && g_mods[i].hi == hi) {
++        if (lo < g_mods[i].hi && hi > g_mods[i].lo) {
++            g_mods[i].lo = lo;
++            g_mods[i].hi = hi;
 +            g_mods[i].gp = gp;
 +            return;
 +        }
@@ -359,7 +396,7 @@ index a2510f5..0427399 100644
      if (g_budget && ++g_calls >= g_budget) {
          g_budget = 0;                 /* fire once */
          if (g_over) g_over();
-@@ -227,6 +246,25 @@ void psp_dispatch(uint32_t addr) {
+@@ -227,6 +259,25 @@ void psp_dispatch(uint32_t addr) {
      (g_miss ? g_miss : default_miss)(addr);
  }
  
@@ -385,7 +422,7 @@ index a2510f5..0427399 100644
  uint32_t psp_dispatch_count(void)  { return g_count; }
  uint64_t psp_dispatch_misses(void) { return g_misses; }
  
-@@ -234,6 +272,7 @@ void psp_dispatch_reset(void) {
+@@ -234,6 +285,7 @@ void psp_dispatch_reset(void) {
      free(g_table);
      g_table = NULL;
      g_cap = g_count = 0;
@@ -2059,7 +2096,7 @@ index dca3249..5904099 100644
          if (!psp_lookup(s->handler)) {
              /* Worth naming loudly: the guest registered a handler we cannot
 diff --git a/src/hle/iofilemgr.c b/src/hle/iofilemgr.c
-index 6d0afc6..9f5f4cf 100644
+index 6d0afc6..bcb3a5e 100644
 --- a/src/hle/iofilemgr.c
 +++ b/src/hle/iofilemgr.c
 @@ -14,6 +14,8 @@
@@ -2071,7 +2108,7 @@ index 6d0afc6..9f5f4cf 100644
  
  #ifdef _WIN32
  #  include <io.h>
-@@ -32,7 +34,14 @@
+@@ -32,7 +34,15 @@
  #define PSP_O_CREAT  0x0200
  #define PSP_O_TRUNC  0x0400
  
@@ -2083,11 +2120,12 @@ index 6d0afc6..9f5f4cf 100644
 +    uint64_t start, end;
 +    int64_t async_res;
 +    int async_done;
++    int gx_kind;   /* 1 = cardinfo_eng.ehp, 2 = cardh_e.cip, 3 = cardm_e.cip */
 +} io_file;
  
  typedef struct {
      int used;
-@@ -49,12 +58,22 @@ typedef struct {
+@@ -49,17 +59,28 @@ typedef struct {
  static io_file g_file[MAX_FILES];
  static io_dir  g_dir[MAX_DIRS];
  static char    g_root[512];
@@ -2110,7 +2148,13 @@ index 6d0afc6..9f5f4cf 100644
  void psp_io_reset(void) {
      for (int i = 0; i < MAX_FILES; i++) {
          if (g_file[i].used && g_file[i].f) fclose(g_file[i].f);
-@@ -87,20 +106,62 @@ static void map_path(const char *guest, char *out, size_t cap) {
+         g_file[i].used = 0;
+         g_file[i].f = NULL;
++        g_file[i].gx_kind = 0;
+     }
+     memset(g_dir, 0, sizeof g_dir);
+     g_bytes_read = 0;
+@@ -87,23 +108,170 @@ static void map_path(const char *guest, char *out, size_t cap) {
      snprintf(out, cap, "%s/%s/%s", g_root, sub, p);
  }
  
@@ -2118,10 +2162,99 @@ index 6d0afc6..9f5f4cf 100644
 + * the image at that sector and remember the extent so a read cannot wander
 + * into the next file. Offsets stay below 2 GB (the disc image does), which is
 + * what a 32-bit host fseek can address. */
-+static FILE *open_lbn(const char *guest, uint64_t *start, uint64_t *end) {
++static int gx_ascii_ieq(const char *a, const char *b) {
++    while (*a && *b) {
++        unsigned char ca = (unsigned char)*a++, cb = (unsigned char)*b++;
++        if (ca >= 'A' && ca <= 'Z') ca += 32;
++        if (cb >= 'A' && cb <= 'Z') cb += 32;
++        if (ca != cb) return 0;
++    }
++    return *a == *b;
++}
++
++static const char *gx_lbn_filename(unsigned long lbn) {
++    switch (lbn) {
++    case 0x4b1e0ul: return "cardinfo_eng.ehp";
++    case 0x37d90ul: return "cardh_e.cip";
++    case 0x39160ul: return "cardm_e.cip";
++    case 0x39f30ul: return "deck_all_e.ehp";
++    default:        return NULL;
++    }
++}
++
++static const char *gx_guest_filename(const char *guest) {
++    const char *p = guest;
++    if (!strncmp(p, "disc0:", 6)) p += 6;
++    else if (!strncmp(p, "umd0:", 5)) p += 5;
++    while (*p == '/' || *p == '\\') p++;
++    if (gx_ascii_ieq(p, "PSP_GAME/USRDIR/duelsys/cardinfo_eng.ehp")) return "cardinfo_eng.ehp";
++    if (gx_ascii_ieq(p, "PSP_GAME/USRDIR/card/cardh_e.cip"))         return "cardh_e.cip";
++    if (gx_ascii_ieq(p, "PSP_GAME/USRDIR/card/cardm_e.cip"))         return "cardm_e.cip";
++    return NULL;
++}
++
++static int gx_file_kind(const char *fname) {
++    if (!fname) return 0;
++    if (!strcmp(fname, "cardinfo_eng.ehp")) return 1;
++    if (!strcmp(fname, "cardh_e.cip"))      return 2;
++    if (!strcmp(fname, "cardm_e.cip"))      return 3;
++    return 0;
++}
++
++static int gx_resolve_override(const char *fname, char *out, size_t cap, uint64_t *out_sz) {
++    if (!fname) return 0;
++    const char *env = getenv("SETO_GX_DATA_DIR");
++    const char *candidates[4];
++    char buf[4][1024];
++    int n = 0;
++    if (env && env[0]) {
++        snprintf(buf[n], sizeof buf[n], "%s/%s", env, fname);
++        candidates[n] = buf[n]; n++;
++    }
++    snprintf(buf[n], sizeof buf[n], "build/gx_data/%s", fname);
++    candidates[n] = buf[n]; n++;
++    snprintf(buf[n], sizeof buf[n], "gx_data/%s", fname);
++    candidates[n] = buf[n]; n++;
++    snprintf(buf[n], sizeof buf[n], "%s/gx_data/%s", g_root, fname);
++    candidates[n] = buf[n]; n++;
++
++    for (int i = 0; i < n; i++) {
++#ifdef _WIN32
++        struct _stat64 st;
++        if (_stat64(candidates[i], &st) == 0 && !(st.st_mode & _S_IFDIR)) {
++            if (out) snprintf(out, cap, "%s", candidates[i]);
++            if (out_sz) *out_sz = (uint64_t)st.st_size;
++            return 1;
++        }
++#else
++        struct stat st;
++        if (stat(candidates[i], &st) == 0 && !S_ISDIR(st.st_mode)) {
++            if (out) snprintf(out, cap, "%s", candidates[i]);
++            if (out_sz) *out_sz = (uint64_t)st.st_size;
++            return 1;
++        }
++#endif
++    }
++    return 0;
++}
++
++static FILE *open_lbn(const char *guest, uint64_t *start, uint64_t *end, char *ovr_host, size_t ovr_cap) {
 +    unsigned long lbn, size;
 +    if (sscanf(guest, "disc0:/sce_lbn0x%lx_size0x%lx", &lbn, &size) != 2)
 +        return NULL;
++    uint64_t ovr_sz = 0;
++    if (ovr_host) ovr_host[0] = '\0';
++    if (gx_resolve_override(gx_lbn_filename(lbn), ovr_host, ovr_cap, &ovr_sz)) {
++        FILE *f = fopen(ovr_host, "rb");
++        if (f) {
++            *start = 0;
++            *end = ovr_sz;
++            if (getenv("PSPRECOMP_TRACE_IO"))
++                fprintf(stderr, "io: VFS override LBN 0x%lx -> %s (%llu bytes)\n",
++                        lbn, ovr_host, (unsigned long long)ovr_sz);
++            return f;
++        }
++    }
 +    if (!g_umd[0]) return NULL;
 +    FILE *f = fopen(g_umd, "rb");
 +    if (!f) return NULL;
@@ -2134,6 +2267,8 @@ index 6d0afc6..9f5f4cf 100644
 +    *end = off + (uint64_t)size;
 +    return f;
 +}
++
++int g_tf3_post_deck_trace = 0;
 +
  static void hle_Open(void) {
      char guest[512], host[1024];
@@ -2151,16 +2286,26 @@ index 6d0afc6..9f5f4cf 100644
 -    if (!f && (flags & PSP_O_CREAT)) f = fopen(host, "w+b");
 +    const int raw = !strcmp(guest, "umd0:") || !strcmp(guest, "umd1:");
 +    FILE *f = NULL;
++    int gx_kind = 0;
 +    uint64_t lbn_start = 0, lbn_end = 0;
 +    if (!strncmp(guest, "disc0:/sce_lbn0x", 16)) {
-+        f = open_lbn(guest, &lbn_start, &lbn_end);
-+        snprintf(host, sizeof host, "%s @ %llu", g_umd[0] ? g_umd : "(no disc image set)",
-+                 (unsigned long long)lbn_start);
++        char ovr[1024] = "";
++        f = open_lbn(guest, &lbn_start, &lbn_end, ovr, sizeof ovr);
++        if (ovr[0]) {
++            unsigned long lbn = 0, lsz = 0;
++            if (sscanf(guest, "disc0:/sce_lbn0x%lx_size0x%lx", &lbn, &lsz) == 2)
++                gx_kind = gx_file_kind(gx_lbn_filename(lbn));
++            snprintf(host, sizeof host, "%s", ovr);
++        } else {
++            snprintf(host, sizeof host, "%s @ %llu", g_umd[0] ? g_umd : "(no disc image set)",
++                     (unsigned long long)lbn_start);
++        }
 +    } else if (raw) {
 +        if (g_umd[0]) f = fopen(g_umd, "rb");
 +        snprintf(host, sizeof host, "%s", g_umd[0] ? g_umd : "(no disc image set)");
 +    } else {
 +        map_path(guest, host, sizeof host);
++        uint64_t ovr_sz = 0;
 +        /* The system font library opens its PGF files from flash0. A host
 +         * directory (a PSP flash0 dump or an emulator asset tree) stands in
 +         * for it when PSPRECOMP_FLASH0 names one. */
@@ -2168,6 +2313,10 @@ index 6d0afc6..9f5f4cf 100644
 +            const char *root = getenv("PSPRECOMP_FLASH0");
 +            if (root)
 +                snprintf(host, sizeof host, "%s/%s", root, guest + 8);
++        } else if (gx_resolve_override(gx_guest_filename(guest), host, sizeof host, &ovr_sz)) {
++            lbn_start = 0;
++            lbn_end = ovr_sz;
++            gx_kind = gx_file_kind(gx_guest_filename(guest));
 +        }
 +
 +        const char *mode = "rb";
@@ -2181,45 +2330,75 @@ index 6d0afc6..9f5f4cf 100644
 +    }
      /* PSPRECOMP_TRACE_IO=1 names every open and whether it worked. A game
       * that cannot find its assets usually does not crash; it waits. */
-     if (getenv("PSPRECOMP_TRACE_IO"))
-@@ -118,6 +179,11 @@ static void hle_Open(void) {
+-    if (getenv("PSPRECOMP_TRACE_IO"))
++    if (getenv("PSPRECOMP_TRACE_IO") || g_tf3_post_deck_trace)
+         fprintf(stderr, "io: open \"%s\" -> \"%s\" flags 0x%X: %s\n",
+                 guest, host, flags, f ? "ok" : "not found");
+     if (!f) {
+@@ -118,6 +286,12 @@ static void hle_Open(void) {
          if (g_file[i].used) continue;
          g_file[i].f = f;
          g_file[i].used = 1;
 +        g_file[i].raw = raw;
 +        g_file[i].start = lbn_start;
 +        g_file[i].end = lbn_end;
++        g_file[i].gx_kind = gx_kind;
 +        g_file[i].async_res = 0;
 +        g_file[i].async_done = 0;
          psp_ret((uint32_t)(i + 3));   /* 0-2 are reserved for the std streams */
          return;
      }
-@@ -137,6 +203,9 @@ static void hle_Close(void) {
+@@ -137,6 +311,10 @@ static void hle_Close(void) {
      fclose(h->f);
      h->f = NULL;
      h->used = 0;
 +    h->raw = 0;
 +    h->start = 0;
 +    h->end = 0;
++    h->gx_kind = 0;
      psp_ret(0);
  }
  
-@@ -146,13 +215,26 @@ static void hle_Read(void) {
+@@ -146,13 +324,50 @@ static void hle_Read(void) {
      if (!h) { psp_ret(0x80020323); return; }
      if (!size) { psp_ret(0); return; }
  
 +    /* A block device counts the size in 2048-byte sectors, and reports what it
 +     * read back in the same unit. */
 +    size_t bytes = (size_t)size * (h->raw ? 2048u : 1u);
++    uint64_t left = 0;
 +    if (h->end && !h->raw) {
 +        long pos = ftell(h->f);
-+        uint64_t left = (pos >= 0 && (uint64_t)pos >= h->start && (uint64_t)pos < h->end)
-+                        ? h->end - (uint64_t)pos : 0;
++        left = (pos >= 0 && (uint64_t)pos >= h->start && (uint64_t)pos < h->end)
++               ? h->end - (uint64_t)pos : 0;
 +        if ((uint64_t)bytes > left) bytes = (size_t)left;
 +    }
-+    if (h->raw && getenv("PSPRECOMP_TRACE_IO"))
-+        fprintf(stderr, "io: raw read %u sector(s) at sector %ld\n",
-+                size, ftell(h->f) / 2048);
++    if (h->gx_kind && getenv("PSPRECOMP_TRACE_IO"))
++        fprintf(stderr, "io: gx%d read dst=%08X size=%u pos=%ld end=%llu\n",
++                h->gx_kind, dst, size, ftell(h->f), (unsigned long long)h->end);
++    /* The extended EHP carries its tables past the ISO's vanilla size. The
++     * guest buffer is the 2 MB GX window, so load the whole remainder on the
++     * first read; the caller already got every byte it asked for. */
++    if (h->gx_kind && !h->raw && left > (uint64_t)bytes &&
++        left <= 16u * 1024u * 1024u &&
++        (h->gx_kind == 1 ||
++         (h->gx_kind == 2 && dst == 0x06800000u) ||
++         (h->gx_kind == 3 && dst == 0x07700000u))) {
++        size_t full = (size_t)left;
++        uint8_t *tmp = (uint8_t *)malloc(full);
++        if (!tmp) { psp_ret(0x80020190); return; }
++        size_t got = fread(tmp, 1, full, h->f);
++        if (got && psp_mem_write_block(dst, tmp, (uint32_t)got) != 0) {
++            for (size_t i = 0; i < got; i++) psp_write8(dst + (uint32_t)i, tmp[i]);
++        }
++        free(tmp);
++        g_bytes_read += got;
++        psp_ret(size);
++        return;
++    }
++    if (h->raw && (getenv("PSPRECOMP_TRACE_IO") || g_tf3_post_deck_trace))
++        fprintf(stderr, "io: raw read %u byte(s) at sector %ld (offset 0x%lx) guest=\"%s\"\n",
++                size, ftell(h->f) / 2048, ftell(h->f), h->raw ? "lbn" : "");
 +
      /* Read through a host buffer and then place it, so a read that straddles
       * the end of a guest region is rejected by the memory layer rather than
@@ -2233,7 +2412,7 @@ index 6d0afc6..9f5f4cf 100644
      if (got && psp_mem_write_block(dst, tmp, (uint32_t)got) != 0) {
          /* Fall back to byte-at-a-time so a partially mapped destination still
           * gets what fits, and the bad-access counter records the rest. */
-@@ -160,7 +242,106 @@ static void hle_Read(void) {
+@@ -160,7 +375,113 @@ static void hle_Read(void) {
      }
      free(tmp);
      g_bytes_read += got;
@@ -2315,15 +2494,22 @@ index 6d0afc6..9f5f4cf 100644
 +    unsigned long lbn, lbn_size;
 +    if (!strncmp(guest, "disc0:/sce_lbn0x", 16) &&
 +        sscanf(guest, "disc0:/sce_lbn0x%lx_size0x%lx", &lbn, &lbn_size) == 2) {
-+        fill_io_stat(stat_addr, 0, (uint64_t)lbn_size, 0, 0, 0);
++        uint64_t sz = (uint64_t)lbn_size;
++        uint64_t ovr_sz = 0;
++        if (gx_resolve_override(gx_lbn_filename(lbn), host, sizeof host, &ovr_sz))
++            sz = ovr_sz;
++        fill_io_stat(stat_addr, 0, sz, 0, 0, 0);
 +        psp_ret(0);
 +        return;
 +    }
 +
 +    map_path(guest, host, sizeof host);
++    uint64_t dummy_sz = 0;
 +    if (!strncmp(guest, "flash0:/", 8)) {
 +        const char *root = getenv("PSPRECOMP_FLASH0");
 +        if (root) snprintf(host, sizeof host, "%s/%s", root, guest + 8);
++    } else {
++        gx_resolve_override(gx_guest_filename(guest), host, sizeof host, &dummy_sz);
 +    }
 +
 +#ifdef _WIN32
@@ -2341,7 +2527,7 @@ index 6d0afc6..9f5f4cf 100644
  }
  
  static void hle_Write(void) {
-@@ -194,11 +375,30 @@ static void hle_Lseek(void) {
+@@ -194,11 +515,30 @@ static void hle_Lseek(void) {
      uint32_t whence = psp_arg(4);
      if (!h) { psp_ret(0x80020323); return; }
  
@@ -2373,7 +2559,7 @@ index 6d0afc6..9f5f4cf 100644
      psp_cpu.r[PSP_REG_V1] = 0;
  }
  
-@@ -295,5 +495,11 @@ void psp_io_register(void) {
+@@ -295,5 +635,11 @@ void psp_io_register(void) {
      psp_hle_register(0x779103A0, "IoFileMgrForUser", "sceIoRename", hle_Rename);
      psp_hle_register(0xB29DDF9C, "IoFileMgrForUser", "sceIoDopen",  hle_Dopen);
      psp_hle_register(0xE3EB004C, "IoFileMgrForUser", "sceIoDread",  hle_Dread);

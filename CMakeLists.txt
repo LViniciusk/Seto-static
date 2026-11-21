@@ -101,6 +101,8 @@ file(GLOB DUELMGR_SOURCES CONFIGURE_DEPENDS
      ${CMAKE_CURRENT_SOURCE_DIR}/build/s9duel-mgr-reloc/*.c)
 file(GLOB DUELENG_SOURCES CONFIGURE_DEPENDS
      ${CMAKE_CURRENT_SOURCE_DIR}/build/s9duel-eng-reloc/*.c)
+file(GLOB TF3ENG_SOURCES CONFIGURE_DEPENDS
+     ${CMAKE_CURRENT_SOURCE_DIR}/build/s9duel-tf3eng-reloc/*.c)
 file(GLOB DUELDRAW_SOURCES CONFIGURE_DEPENDS
      ${CMAKE_CURRENT_SOURCE_DIR}/build/s9duel-draw-reloc/*.c)
 file(GLOB DUELSWAP_SOURCES CONFIGURE_DEPENDS
@@ -117,7 +119,16 @@ if(DUELMGR_SOURCES)
     target_include_directories(duelmgrprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s9duel-mgr-reloc)
     target_link_libraries(duelmgrprx PRIVATE psprecomp)
 endif()
-if(DUELENG_SOURCES)
+if(TF3ENG_SOURCES)
+    add_library(tf3engprx OBJECT ${TF3ENG_SOURCES})
+    target_compile_definitions(tf3engprx PRIVATE
+        PSPRECOMP_NAMESPACE=tf3eng_
+        psp_hle_call=tf3eng_import_forward)
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/build/s9duel-tf3eng-reloc/tf3eng_register.c PROPERTIES
+        COMPILE_OPTIONS "-O1;-Wa,-mbig-obj")
+    target_include_directories(tf3engprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s9duel-tf3eng-reloc)
+    target_link_libraries(tf3engprx PRIVATE psprecomp)
+elseif(DUELENG_SOURCES)
     add_library(duelengprx OBJECT ${DUELENG_SOURCES})
     target_compile_definitions(duelengprx PRIVATE
         PSPRECOMP_NAMESPACE=dueleng_
@@ -221,9 +232,12 @@ endif()
 if(DECKTUT_SOURCES)
     list(APPEND SETO_SOURCES decktut_prx.c)
 endif()
-if(DUELMGR_SOURCES AND DUELENG_SOURCES AND DUELDRAW_SOURCES AND
+if(DUELMGR_SOURCES AND (DUELENG_SOURCES OR TF3ENG_SOURCES) AND DUELDRAW_SOURCES AND
    DUELSWAP_SOURCES AND DUELTUT_SOURCES AND DUELREC_SOURCES)
     list(APPEND SETO_SOURCES duel_prx.c)
+    if(TF3ENG_SOURCES)
+        list(APPEND SETO_SOURCES tf3_bridge.c)
+    endif()
 endif()
 if(CHARALIST_SOURCES OR SHOP_SOURCES)
     list(APPEND SETO_SOURCES store_prx.c)
@@ -268,13 +282,19 @@ if(DECKTUT_SOURCES)
 else()
     message(STATUS "S9.7 deck tutorial corpus not found under build/s93-decktut-reloc; building without moddeck_tutorial")
 endif()
-if(DUELMGR_SOURCES AND DUELENG_SOURCES AND DUELDRAW_SOURCES AND
+if(DUELMGR_SOURCES AND (DUELENG_SOURCES OR TF3ENG_SOURCES) AND DUELDRAW_SOURCES AND
    DUELSWAP_SOURCES AND DUELTUT_SOURCES AND DUELREC_SOURCES)
     target_sources(Seto-static PRIVATE
-        $<TARGET_OBJECTS:duelmgrprx> $<TARGET_OBJECTS:duelengprx>
+        $<TARGET_OBJECTS:duelmgrprx>
         $<TARGET_OBJECTS:dueldrawprx> $<TARGET_OBJECTS:duelswapprx>
         $<TARGET_OBJECTS:dueltutprx> $<TARGET_OBJECTS:duelrecprx>)
-    target_compile_definitions(Seto-static PRIVATE HAVE_DUEL_CORPUS)
+    if(TF3ENG_SOURCES)
+        target_sources(Seto-static PRIVATE $<TARGET_OBJECTS:tf3engprx>)
+        target_compile_definitions(Seto-static PRIVATE HAVE_DUEL_CORPUS HAVE_TF3ENG_CORPUS)
+    else()
+        target_sources(Seto-static PRIVATE $<TARGET_OBJECTS:duelengprx>)
+        target_compile_definitions(Seto-static PRIVATE HAVE_DUEL_CORPUS)
+    endif()
 else()
     message(STATUS "S9.9 duel corpora not found under build/s9duel-*-reloc; building without the duel subsystem")
 endif()

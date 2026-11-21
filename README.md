@@ -1685,6 +1685,10 @@ detector and the passive BitBlt recorder. The psprecomp change is captured as
 `patches/psprecomp-5ca18fa-s10-duel-scene-full.patch`, a **cumulative** diff
 against the pinned `5ca18fa` (apply to a clean clone instead of the older
 individual patches).
+
+Apply `patches/psprecomp-5ca18fa-b23-stack-frames.patch` after the cumulative
+patch. Re-emit the generated corpora with the updated `allegrexrecomp` before
+building Seto-static so every guest call records its incoming stack pointer.
 Not yet verified after the 4 MB change: the real duel's opponent cut-in
 transition and the opponent hand showing faces instead of backs.
 
