@@ -70,18 +70,6 @@ if(FIELD_SOURCES)
     target_link_libraries(fieldprx PRIVATE psprecomp)
 endif()
 
-# S9.5: the relocated moddeck corpus, loaded when Free Duel asks for it.
-file(GLOB DECK_SOURCES CONFIGURE_DEPENDS
-     ${CMAKE_CURRENT_SOURCE_DIR}/build/s93-deck-reloc/*.c)
-if(DECK_SOURCES)
-    add_library(deckprx OBJECT ${DECK_SOURCES})
-    target_compile_definitions(deckprx PRIVATE
-        PSPRECOMP_NAMESPACE=deck_
-        psp_hle_call=deck_import_forward)
-    target_include_directories(deckprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s93-deck-reloc)
-    target_link_libraries(deckprx PRIVATE psprecomp)
-endif()
-
 # S9.7: the relocated moddeck_tutorial corpus, requested after the office exit.
 file(GLOB DECKTUT_SOURCES CONFIGURE_DEPENDS
      ${CMAKE_CURRENT_SOURCE_DIR}/build/s93-decktut-reloc/*.c)
@@ -111,6 +99,23 @@ file(GLOB DUELTUT_SOURCES CONFIGURE_DEPENDS
      ${CMAKE_CURRENT_SOURCE_DIR}/build/s9duel-tut-reloc/*.c)
 file(GLOB DUELREC_SOURCES CONFIGURE_DEPENDS
      ${CMAKE_CURRENT_SOURCE_DIR}/build/s9duel-rec-reloc/*.c)
+
+# S9.5: the relocated moddeck corpus, loaded when Free Duel asks for it.
+file(GLOB DECK_SOURCES CONFIGURE_DEPENDS
+     ${CMAKE_CURRENT_SOURCE_DIR}/build/s93-deck-reloc/*.c)
+if(DECK_SOURCES)
+    if(TF3ENG_SOURCES AND DUELMGR_SOURCES AND DUELDRAW_SOURCES AND
+       DUELSWAP_SOURCES AND DUELTUT_SOURCES AND DUELREC_SOURCES)
+        include(cmake/Tf3ExtraDeck.cmake)
+    endif()
+    add_library(deckprx OBJECT ${DECK_SOURCES})
+    target_compile_definitions(deckprx PRIVATE
+        PSPRECOMP_NAMESPACE=deck_
+        psp_hle_call=deck_import_forward)
+    target_include_directories(deckprx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/build/s93-deck-reloc)
+    target_link_libraries(deckprx PRIVATE psprecomp)
+endif()
+
 if(DUELMGR_SOURCES)
     add_library(duelmgrprx OBJECT ${DUELMGR_SOURCES})
     target_compile_definitions(duelmgrprx PRIVATE
