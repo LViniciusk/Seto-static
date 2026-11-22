@@ -383,14 +383,14 @@ static int find_auto_path(const char *dir_hint, const char *slug, char *out, siz
         if (sep) {
             size_t dlen = (size_t)(sep - dir_hint);
             if (dlen + 32 < out_sz) {
-                snprintf(out, out_sz, "%.*s/s13-%s-reloc.elf", (int)dlen, dir_hint, slug);
+                snprintf(out, out_sz, "%.*s/%s-reloc.elf", (int)dlen, dir_hint, slug);
                 if (file_exists(out)) return 1;
             }
         }
     }
-    snprintf(out, out_sz, "build/s13-%s-reloc.elf", slug);
+    snprintf(out, out_sz, "build/reloc/elf/%s-reloc.elf", slug);
     if (file_exists(out)) return 1;
-    snprintf(out, out_sz, "s13-%s-reloc.elf", slug);
+    snprintf(out, out_sz, "%s-reloc.elf", slug);
     return file_exists(out);
 }
 

@@ -194,10 +194,22 @@ void title_import_forward(uint32_t nid) {
     /* A cross-module call must run the callee with its own globals base. The
      * title code has no $gp-relative access, but the EBOOT does. */
     uint32_t caller_gp = psp_cpu.r[PSP_REG_GP];
+    uint32_t caller_ra = psp_cpu.r[PSP_REG_RA];
     uint32_t win = psp_cpu.r[PSP_REG_A0];
     psp_cpu.r[PSP_REG_GP] = gp;
     psp_call_from_host(addr);
     psp_cpu.r[PSP_REG_GP] = caller_gp;
+    if (nid == 0xE29EEFC7u && caller_ra == 0x0066116Cu &&
+        (win == 84u || win == 107u) && getenv("SETO_TRACE_NOVA")) {
+        const uint32_t slot = psp_cpu.r[PSP_REG_V0];
+        if (slot >= 0x08000000u && slot <= 0x0BFFFFEEu) {
+            fprintf(stderr, "[NOVA_SLOT] type=%u level=%u count=%u recipes=%u,%u,%u,%u,%u,%u value=%u\n",
+                    win, psp_read16(slot), psp_read16(slot + 2u),
+                    psp_read16(slot + 4u), psp_read16(slot + 6u), psp_read16(slot + 8u),
+                    psp_read16(slot + 10u), psp_read16(slot + 12u), psp_read16(slot + 14u),
+                    psp_read16(slot + 16u));
+        }
+    }
     if (nid == 0x39ADDA9Fu && getenv("SETO_TRACE_CONFIRM") &&
         atomic_load(&g_scene_state) == 4 && atomic_load(&g_scene_phase) == 6 &&
         win >= 0x01200000u && win < 0x01270000u) {

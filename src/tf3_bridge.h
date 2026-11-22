@@ -7,11 +7,13 @@
 uint32_t duel_eboot_export_addr(uint32_t nid, uint32_t *gp_out);
 uint32_t psp_duel_export(uint32_t nid, uint32_t *gp_out);
 
-/* Map and populate the 4 MB GX extension window (0x06400000..0x067FFFFF):
+/* Map and populate the GX extension window below EBOOT:
+ *   0x06200000..0x063FFFFF: shop cover materials for the second tab
  *   0x06400000..0x065FFFFF: relocated cardinfo_eng.ehp buffer (2 MB)
  *   0x06600000..0x0660FFFF: extended trunk / owned table for card_idx 2480..3479
  *   0x06610000..0x0661FFFF: modcardalbum extended list buffer
- *   0x06620000..0x0663FFFF: TF3 DLG_Text_E.bin & empty wstr for duel dialogs
+ *   0x06620000..0x06631FFF: TF3 duel text, empty wstr and translated duel info
+ *   0x06632000..0x0663FFFF: shop strings and booster pools
  */
 void gx_runtime_init(void);
 uint32_t gx_cip_tbl_addr(uint32_t s0);

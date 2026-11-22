@@ -41,6 +41,14 @@ static int extra_deck_open_dialog;
 static const char extra_deck_limit_message[] =
     "The Fusion Deck holds up to 15 cards. Remove cards before confirming.";
 
+int psp_deck_card_is_token(uint32_t kid) {
+    /* The EBOOT reads the kind from CARD_Prop. The converted TF3 records
+       retain their own kind numbers, including Gemini (9) and Token (10). */
+    psp_cpu.r[PSP_REG_A0] = kid;
+    psp_call_from_host(0x08049B20u);
+    return psp_cpu.r[PSP_REG_V0] == (kid < 6958u ? 9u : 10u);
+}
+
 int psp_deck_warn_extra_on_open(void) {
     if (!extra_deck_check_on_open) return 0;
     extra_deck_check_on_open = 0;
@@ -53,6 +61,28 @@ int psp_deck_warn_extra_on_open(void) {
     psp_call_from_host(0x014068BCu);
     extra_deck_open_dialog = 0;
     return 1;
+}
+
+uint32_t psp_deck_all_ehp_size(uint32_t iso_size) {
+    const char *env = getenv("SETO_GX_DATA_DIR");
+    char buf[3][1024];
+    int n = 0;
+    if (env && env[0]) snprintf(buf[n++], sizeof buf[0], "%s/deck_all_e.ehp", env);
+    snprintf(buf[n++], sizeof buf[0], "build/gx_data/deck_all_e.ehp");
+    snprintf(buf[n++], sizeof buf[0], "gx_data/deck_all_e.ehp");
+    for (int i = 0; i < n; i++) {
+        FILE *f = fopen(buf[i], "rb");
+        if (f) {
+            if (fseek(f, 0, SEEK_END) == 0) {
+                long sz = ftell(f);
+                fclose(f);
+                if (sz > 0 && (uint32_t)sz > iso_size) return (uint32_t)sz;
+                return iso_size;
+            }
+            fclose(f);
+        }
+    }
+    return iso_size;
 }
 #endif
 
@@ -256,6 +286,8 @@ int psp_deck_image_load(const char *path, uint32_t eboot_info) {
 #ifdef HAVE_TF3ENG_CORPUS
     for (uint32_t i = 0; i < sizeof extra_deck_limit_message; ++i)
         psp_write16(g_deck_bss_end + i * 2u, (uint8_t)extra_deck_limit_message[i]);
+    if (psp_read16(0x0141EA1Eu) == 2451u)
+        psp_write16(0x0141EA1Eu, 3480u);
 #endif
     deck_psp_recomp_register();
     if (!psp_lookup(DECK_ENTRY)) {

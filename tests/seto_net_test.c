@@ -6,8 +6,8 @@
  *   SETO_SERVER=127.0.0.1:<port> SETO_NICKNAME=Jaden ./test-seto-net host
  *   SETO_SERVER=127.0.0.1:<port> SETO_NICKNAME=Kaiba ./test-seto-net joiner
  */
-#include "../seto_net.h"
-#include "../seto_proto.h"
+#include "../src/seto_net.h"
+#include "../src/seto_proto.h"
 
 #include <psprecomp/cpu.h>
 #include <psprecomp/dispatch.h>

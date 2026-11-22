@@ -548,11 +548,59 @@ def extend_deck_all_ehp(tf1_all_ehp, tf3_all_ehp, new_gx):
     return build_ehp(ordered), len(new_items)
 
 
+def decode_psp_dxt1(payload, width, height):
+    import io
+    from PIL import Image
+
+    size = width * height // 2
+    payload = payload.ljust(size, b"\0")
+    blocks = b"".join(payload[i + 4:i + 8] + payload[i:i + 4] for i in range(0, size, 8))
+    dds = struct.pack("<4s7I44xII4s20xI16x", b"DDS ", 124, 0x81007,
+                      height, width, size, 0, 0, 32, 4, b"DXT1", 0x1000)
+    with Image.open(io.BytesIO(dds + blocks)) as image:
+        return image.convert("RGBA")
+
+
+def fill_deck_thumbnail_slots(deck_ehp, cardm, end_kid):
+    entries = dict(parse_ehp(deck_ehp))
+    count, = struct.unpack_from("<I", entries["fileTbl.dat"])
+    kids = struct.unpack_from(f"<{count - 1}H", entries["fileTbl.dat"], 4)
+    existing = set(kids)
+    missing = [(kid, payload) for kid in range(end_kid) if kid not in existing
+               and (payload := resolve_cip_block(cardm, kid, 1)) is not None]
+    if not missing:
+        return deck_ehp, 0
+
+    # Preserve the existing palette and tiles so earlier slot IDs keep their images.
+    from PIL import Image
+    palettes, sheets = _parse_cis_gim(entries["cis_all.gim"])
+    first_slot = (len(sheets) - 1) * 391
+    if count < first_slot or count + len(missing) > len(sheets) * 391:
+        raise ValueError("Missing deck thumbnails do not fit in the last atlas")
+    palette = Image.new("P", (1, 1))
+    palette.putpalette([color for i, color in enumerate(palettes[-1]) if i % 4 != 3])
+    sheet = bytearray(_unswizzle_8bpp(sheets[-1]))
+    for slot, (_, payload) in enumerate(missing, count - first_slot):
+        image = decode_psp_dxt1(payload, 64, 64).convert("RGB")
+        image = image.resize((22, 30), Image.Resampling.LANCZOS)
+        tile = image.quantize(palette=palette, dither=Image.Dither.NONE).tobytes()
+        x, y = slot % 23 * 22, slot // 23 * 30
+        for row in range(30):
+            offset = (y + row) * 512 + x
+            sheet[offset:offset + 22] = tile[row * 22:(row + 1) * 22]
+    sheets[-1] = _swizzle_8bpp(sheet)
+    kids += tuple(kid for kid, _ in missing)
+    entries["fileTbl.dat"] = struct.pack(f"<I{len(kids)}HH", len(kids) + 1, *kids, 0)
+    entries["cis_all.gim"] = _build_cis_gim(palettes, sheets)
+    return build_ehp(list(entries.items())), len(missing)
+
+
 def main():
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tf1-iso", default=r"C:\Users\Vinicius\Documents\Github\Seto\TF1.iso")
-    ap.add_argument("--tf3-iso", default="TF3.iso")
-    ap.add_argument("--out-dir", default="build/gx_data")
+    ap.add_argument("--tf1-iso", default=os.path.join(repo_root, "TF1.iso"))
+    ap.add_argument("--tf3-iso", default=os.path.join(repo_root, "TF3.iso"))
+    ap.add_argument("--out-dir", default=os.path.join(repo_root, "build", "gx_data"))
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -726,6 +774,10 @@ def main():
     tf1_deck_all = read_iso_slice(args.tf1_iso, TF1_DECK_ALL_LBN, TF1_DECK_ALL_SIZE)
     tf3_deck_all = read_iso_slice(args.tf3_iso, TF3_DECK_ALL_LBN, TF3_DECK_ALL_SIZE)
     deck_all_out, cis_added = extend_deck_all_ehp(tf1_deck_all, tf3_deck_all, new_gx)
+    deck_all_out, missing_added = fill_deck_thumbnail_slots(
+        deck_all_out, cpm_out, TF1_EXT_KID_START + len(new_gx),
+    )
+    cis_added += missing_added
     with open(os.path.join(args.out_dir, "deck_all_e.ehp"), "wb") as f:
         f.write(deck_all_out)
     print(f"Expanded deck_all_e.ehp: +{cis_added} cis_all thumbnails, size={len(deck_all_out)}")

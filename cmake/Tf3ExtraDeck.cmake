@@ -2,7 +2,7 @@
 # would leave the executed checks unchanged. Patch the generated C instead.
 # Apply all edits before writing the generated copies, so reconfigure is stable.
 function(tf3_limit_deck_source source_name)
-    set(source "${CMAKE_CURRENT_SOURCE_DIR}/build/s93-deck-reloc/${source_name}")
+    set(source "${CMAKE_CURRENT_SOURCE_DIR}/build/reloc/deck/${source_name}")
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${source}")
     file(READ "${source}" code)
     math(EXPR last "${ARGC} - 1")
@@ -32,6 +32,14 @@ function(tf3_limit_deck_source source_name)
     set(DECK_SOURCES "${DECK_SOURCES}" PARENT_SCOPE)
 endfunction()
 
+tf3_limit_deck_source(deck_funcs_000.c
+    01400198 "r_a0 = r_s0 & 0xFFFFu" [[
+    extern int psp_deck_card_is_token(uint32_t kid);
+    if (psp_deck_card_is_token(r_s0)) {
+        r_s0 += 1;
+        goto L_01400274;
+    }
+    r_a0 = r_s0 & 0xFFFFu]])
 tf3_limit_deck_source(deck_funcs_001.c
     014025AC "r_v0 = psp_sltu(r_v0, (uint32_t)35)" "r_v0 = psp_sltu(r_v0, (uint32_t)15)"
     014033B4 "r_v0 = psp_sltu(r_v0, (uint32_t)35)" "r_v0 = psp_sltu(r_v0, (uint32_t)15)")
@@ -46,5 +54,10 @@ tf3_limit_deck_source(deck_funcs_002.c
         goto L_01405494;
     }
     r_v0 = psp_read16(r_v0 + -7120)]])
+tf3_limit_deck_source(deck_funcs_003.c
+    01409840 "r_a1 = r_v0 | 0xE000u" "r_a1 = 0x00010000u"
+    014099C8 "r_s0 = r_v0 + r_zero" [[
+    extern uint32_t psp_deck_all_ehp_size(uint32_t iso_size);
+    r_s0 = psp_deck_all_ehp_size(r_v0)]])
 tf3_limit_deck_source(deck_funcs_005.c
     01410084 "r_at = psp_sltu(r_v0, (uint32_t)31)" "r_at = psp_sltu(r_v0, (uint32_t)16)")

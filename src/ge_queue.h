@@ -10,7 +10,7 @@
  * (consumer). The command payload is copied; the consumer never dereferences
  * guest pointers. */
 #define GE_MAX_VERTS 512
-#define GE_TEX_CACHE_SLOTS 64
+#define GE_TEX_CACHE_SLOTS 256
 #define GE_MAX_FBOS 16
 
 typedef struct {
@@ -26,6 +26,7 @@ typedef struct {
     int32_t  tex_slot;
     int32_t  fbo_tex_slot;
     int32_t  hd_path_off; /* offset in the HD path pool, resolved by the producer */
+    int32_t  card_front_path_off;
     int32_t  w;
     int32_t  h;
     int32_t  sx;

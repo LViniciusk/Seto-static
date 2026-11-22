@@ -3,6 +3,7 @@
  * Keeps Phase B isolated from host_window.c, GPU backend, and seto_net.c.
  */
 #include "tf3_bridge.h"
+#include "gx_trunk.h"
 
 #include <psprecomp/cpu.h>
 #include <psprecomp/mem.h>
@@ -53,10 +54,9 @@ typedef struct {            /* TF3, >= 0x34 */
     int unk30;              /* +0x30 */
 } Tf3DuelStats;
 
-/* 28 MB persistent GX extension window between module_htmlview (<=0x06104C10) and EBOOT (0x08000000). */
-#define GX_EXTRA_BASE            0x06400000u
-#define GX_EXTRA_SIZE            0x01C00000u
-#define GX_EXT_TRUNK_ADDR        0x06600000u /* 1000 slots * 4 bytes for card_idx 2480..3479 */
+/* Persistent GX window between module_htmlview (<=0x06104C10) and EBOOT (0x08000000). */
+#define GX_EXTRA_BASE            0x06200000u
+#define GX_EXTRA_SIZE            0x01E00000u
 #define GX_TF3_DLG_TEXT_ADDR     0x06620000u /* TF3 DLG_Text_E.bin (~59 KB) */
 #define GX_EMPTY_WSTR_ADDR       0x06630000u /* 16 zero bytes */
 #define GX_TF3_DUEL_INFO_ADDR    0x06631000u /* 4 KB TF1->TF3 translated 0x88B6C7F0 struct */
@@ -78,6 +78,8 @@ typedef struct {            /* TF3, >= 0x34 */
 #define TF3_SCRATCH_SPECIAL_ADDR 0x03858800u /* ~256 B translated TF1 duel_special_get */
 #define TF3_SCRATCH_RESULTS_ADDR 0x03858C00u /* TF3 game_state2 during duel_finish */
 #define TF3_RESULTS_SIZE         0x398u
+#define TF3_SCRATCH_NET_RECV_ADDR 0x03859000u /* 4 x 524 B (2096 B) translated 0x82249188 recv slots */
+#define TF3_NET_RECV_SLOT_SIZE    524u
 
 static int g_tf3_scratch_mapped;
 static int g_duel_bonuses_translated;
@@ -103,13 +105,7 @@ void gx_runtime_init(void) {
     /* Pre-seed extended Trunk (card_idx 2480..3479) with the save entry layout:
      * flags 0x05, owned count 3 (byte 1, read by CARD_GetNum), max 3 (byte 2).
      * The old pre-seed left byte 1 zero, so the game saw all 1,000 as unowned. */
-    for (uint32_t i = 0; i < 1000u; i++) {
-        uint32_t addr = GX_EXT_TRUNK_ADDR + i * 4u;
-        psp_write8(addr + 0u, 0x05u);
-        psp_write8(addr + 1u, 0x03u);
-        psp_write8(addr + 2u, 0x03u);
-        psp_write8(addr + 3u, 0x00u);
-    }
+    gx_trunk_defaults(psp_mem_ptr(GX_EXT_TRUNK_ADDR, GX_EXT_TRUNK_SIZE));
 }
 
 /* Out-of-band CIP/CPM index tables & preload/LRU cache in GX_EXTRA_BASE so PRXs with
@@ -256,6 +252,9 @@ void duel_tf3_on_duel_load(void) {
     }
     for (uint32_t off = 0; off < 0x3000u; off += 4u) {
         psp_write32(TF3_SCRATCH_BASE + off, 0u);
+    }
+    for (uint32_t off = 0; off < 4u * TF3_NET_RECV_SLOT_SIZE; off += 4u) {
+        psp_write32(TF3_SCRATCH_NET_RECV_ADDR + off, 0u);
     }
 }
 
@@ -1789,6 +1788,8 @@ static void tf3eng_import_forward_body(uint32_t nid) {
             for (uint32_t off = 0; off < 264u; off += 4u) {
                 psp_write32(d_slot + 152u + off, psp_read32(s_slot + 128u + off));
             }
+            /* Online comm-ID / peer slot index: TF1 s_slot+8 (+296) -> TF3 d_slot+24 (+432). */
+            psp_write16(d_slot + 24u, psp_read16(s_slot + 8u));
             if (g_duel_finish_in_progress) {
                 /* The finish path reads the participant kind at +0x1A4
                  * and the roster index eight bytes later. */
@@ -1797,6 +1798,47 @@ static void tf3eng_import_forward_body(uint32_t nid) {
             }
         }
         psp_ret(dst);
+        return;
+    }
+
+    case 0x82249188u: {
+        const uint32_t slot = psp_arg(0);
+        uint32_t gp = 0;
+        const uint32_t addr = duel_eboot_export_addr(nid, &gp);
+        if (!addr) {
+            psp_ret(0u);
+            return;
+        }
+        call_guest_addr(addr, gp);
+        const uint32_t src = psp_cpu.r[PSP_REG_V0];
+        if (!src) return;
+        if (!g_tf3_scratch_mapped) duel_tf3_on_duel_load();
+        const uint32_t dst = TF3_SCRATCH_NET_RECV_ADDR + (slot & 3u) * TF3_NET_RECV_SLOT_SIZE;
+        for (uint32_t off = 0; off < 252u; off += 4u) {
+            psp_write32(dst + off, psp_read32(src + 4u + off));
+        }
+        for (uint32_t off = 252u; off < TF3_NET_RECV_SLOT_SIZE; off += 4u) {
+            psp_write32(dst + off, 0u);
+        }
+        psp_ret(dst);
+        return;
+    }
+
+    case 0x0CEF10F0u: {
+        uint32_t gp = 0;
+        const uint32_t addr = duel_eboot_export_addr(nid, &gp);
+        if (!addr) {
+            psp_ret(0u);
+            return;
+        }
+        if (psp_arg(1) > 252u) {
+            static unsigned clamped_log;
+            if (clamped_log++ < 10u) {
+                fprintf(stderr, "tf3_bridge: 0x0CEF10F0 clamp len %u -> 252\n", psp_arg(1));
+            }
+            psp_cpu.r[PSP_REG_A1] = 252u;
+        }
+        call_guest_addr(addr, gp);
         return;
     }
 

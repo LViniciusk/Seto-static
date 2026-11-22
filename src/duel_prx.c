@@ -44,7 +44,8 @@ typedef struct {
 void duelmgr_psp_recomp_register(void);
 #ifdef HAVE_TF3ENG_CORPUS
 void tf3eng_psp_recomp_register(void);
-#else
+#endif
+#if !defined(HAVE_TF3ENG_CORPUS) || defined(HAVE_DUELENG_CORPUS)
 void dueleng_psp_recomp_register(void);
 #endif
 void dueldraw_psp_recomp_register(void);
@@ -72,6 +73,14 @@ static duel_mod_t g_duel[] = {
       0x03550000u, 0x03600000u, 0x00080015u, 0, 0, 0, 0, duelrec_psp_recomp_register, 0, 0, NULL, {{0,0,0}} },
 };
 #define NDUEL ((int)(sizeof g_duel / sizeof g_duel[0]))
+
+#if defined(HAVE_TF3ENG_CORPUS) && defined(HAVE_DUELENG_CORPUS)
+static duel_mod_t g_duel_tf1_eng = {
+    "modduel_eng", "sce_lbn0x5940", "libduel_eng.prx",
+    0x02E00000u, 0x03000000u, 0x00080011u, 0, 0, 0, 0, dueleng_psp_recomp_register, 0, 0, NULL, {{0,0,0}}
+};
+#endif
+static int g_duel_tutorial_mode;
 
 static struct { uint32_t nid, addr; } g_eboot_exports[MAX_EXPORTS];
 static int g_eboot_nexports;
@@ -281,20 +290,41 @@ static void restore_duel_mod_image(duel_mod_t *m) {
     psp_dispatch_module_gp(m->base, m->base + m->memsz, m->gp);
 }
 
+static void duel_check_scene_mode(uint32_t nid, uint32_t caller_ra, uint32_t ret_v0) {
+#if defined(HAVE_TF3ENG_CORPUS) && defined(HAVE_DUELENG_CORPUS)
+    if (nid != 0x60ABAEE7u || caller_ra != 0x0220005Cu || !g_duel_tf1_eng.loaded) return;
+    const int is_tut = ((ret_v0 & 0xFFFFu) == 1u) ? 1 : 0;
+    g_duel_tutorial_mode = is_tut;
+    if (is_tut) {
+        restore_duel_mod_image(&g_duel_tf1_eng);
+    } else {
+        restore_duel_mod_image(&g_duel[1]);
+        duel_tf3_on_duel_load();
+    }
+#else
+    (void)nid; (void)caller_ra; (void)ret_v0;
+#endif
+}
+
 int psp_duel_images_load(const char *const *paths, uint32_t eboot_info) {
     if (build_eboot_exports(eboot_info ? eboot_info : EBOOT_INFO) != 0) return -1;
     for (int i = 0; i < NDUEL; i++) {
         const char *p = paths[i];
         if (!p) continue;
 #ifdef HAVE_TF3ENG_CORPUS
+#ifdef HAVE_DUELENG_CORPUS
+        if (i == 1) {
+            if (load_mod(&g_duel_tf1_eng, p) != 0) return -1;
+        }
+#endif
         char tf3_alt[512];
         if (i == 1) {
-            const char *tok = strstr(p, "s9duel-eng-reloc.elf");
+            const char *tok = strstr(p, "duel-eng-reloc.elf");
             if (tok) {
                 size_t dir_len = (size_t)(tok - p);
-                if (dir_len + sizeof("s9duel-tf3eng-reloc.elf") <= sizeof(tf3_alt)) {
+                if (dir_len + sizeof("duel-tf3eng-reloc.elf") <= sizeof(tf3_alt)) {
                     memcpy(tf3_alt, p, dir_len);
-                    strcpy(tf3_alt + dir_len, "s9duel-tf3eng-reloc.elf");
+                    strcpy(tf3_alt + dir_len, "duel-tf3eng-reloc.elf");
                     FILE *probe = fopen(tf3_alt, "rb");
                     if (probe) { fclose(probe); p = tf3_alt; }
                 }
@@ -325,6 +355,14 @@ int psp_duel_load_uid(const char *path, uint32_t *uid) {
     duel_mod_t *m = find_path(path);
     if (!m) return 0;
     restore_duel_mod_image(m);
+#if defined(HAVE_TF3ENG_CORPUS) && defined(HAVE_DUELENG_CORPUS)
+    if (m == &g_duel[1])
+        restore_duel_mod_image(&g_duel_tf1_eng);
+    if (m == &g_duel[4]) {
+        g_duel_tutorial_mode = 1;
+        restore_duel_mod_image(&g_duel_tf1_eng);
+    }
+#endif
     *uid = m->uid;
     return 1;
 }
@@ -334,6 +372,11 @@ int psp_duel_start(uint32_t uid, uint32_t status_ptr) {
     for (int i = 0; i < NDUEL; i++) {
         duel_mod_t *m = &g_duel[i];
         if (!m->loaded || m->uid != uid) continue;
+#if defined(HAVE_TF3ENG_CORPUS) && defined(HAVE_DUELENG_CORPUS)
+        if (m == &g_duel[1] && g_duel_tutorial_mode && g_duel_tf1_eng.loaded) {
+            m = &g_duel_tf1_eng;
+        }
+#endif
         uint32_t caller_gp = psp_cpu.r[PSP_REG_GP];
         psp_cpu.r[PSP_REG_A0] = psp_arg(1);
         psp_cpu.r[PSP_REG_A1] = psp_arg(2);
@@ -360,7 +403,12 @@ int psp_duel_start(uint32_t uid, uint32_t status_ptr) {
 
 uint32_t psp_duel_export(uint32_t nid, uint32_t *gp_out) {
     for (int i = 0; i < NDUEL; i++) {
+#if defined(HAVE_TF3ENG_CORPUS) && defined(HAVE_DUELENG_CORPUS)
+        duel_mod_t *m = (i == 1 && g_duel_tutorial_mode && g_duel_tf1_eng.loaded)
+                        ? &g_duel_tf1_eng : &g_duel[i];
+#else
         duel_mod_t *m = &g_duel[i];
+#endif
         if (!m->loaded) continue;
         int lo = 0, hi = m->nexports - 1;
         while (lo <= hi) {
@@ -399,7 +447,8 @@ void duel_import_forward(uint32_t nid) {
         const uint32_t trace_ra = psp_cpu.r[PSP_REG_RA];
         int handled = 0;
 #ifdef HAVE_TF3ENG_CORPUS
-        handled = duel_tf3_handle_export(nid);
+        if (!g_duel_tutorial_mode)
+            handled = duel_tf3_handle_export(nid);
 #endif
         uint32_t gp = 0;
         uint32_t addr = handled ? 0u : psp_duel_export(nid, &gp);
@@ -453,6 +502,7 @@ void duel_import_forward(uint32_t nid) {
 #endif
             psp_call_from_host(addr);
             psp_cpu.r[PSP_REG_GP] = caller_gp;
+            duel_check_scene_mode(nid, trace_ra, psp_cpu.r[PSP_REG_V0]);
         }
 #ifdef HAVE_TF3ENG_CORPUS
         if (nid == 0x9992B977u && trace_ra == 0x03015F84u && trace_a0 < 512u &&
@@ -657,7 +707,7 @@ void duel_import_forward(uint32_t nid) {
         return;
     }
 #ifdef HAVE_TF3ENG_CORPUS
-    if (duel_tf3_handle_export(nid)) return;
+    if (!g_duel_tutorial_mode && duel_tf3_handle_export(nid)) return;
 #endif
     uint32_t gp = 0;
     uint32_t addr = psp_duel_export(nid, &gp);
@@ -673,7 +723,9 @@ void duel_import_forward(uint32_t nid) {
         return;
     }
     uint32_t caller_gp = psp_cpu.r[PSP_REG_GP];
+    const uint32_t caller_ra = psp_cpu.r[PSP_REG_RA];
     psp_cpu.r[PSP_REG_GP] = gp;
     psp_call_from_host(addr);
     psp_cpu.r[PSP_REG_GP] = caller_gp;
+    duel_check_scene_mode(nid, caller_ra, psp_cpu.r[PSP_REG_V0]);
 }

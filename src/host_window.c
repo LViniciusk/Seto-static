@@ -8,6 +8,7 @@
 #include <psprecomp/hle.h>
 
 #include "gl_present.h"
+#include "perf_mon.h"
 
 #include <windows.h>
 #include <gdiplus.h>
@@ -34,8 +35,17 @@ static HDC g_memdc;
 static HBITMAP g_membmp, g_memold;
 static int g_memw, g_memh;
 static char g_fps_text[64] = "FPS --.- | VPS --.-";
+static int g_hud_visible = -1;
 static ULONG_PTR g_gdiplus_token;
 static int g_gdiplus_ready;
+
+static int hud_is_visible(void) {
+    if (g_hud_visible < 0) {
+        const char *hud = getenv("SETO_GL_HUD");
+        g_hud_visible = (!hud || !hud[0] || hud[0] != '0') ? 1 : 0;
+    }
+    return g_hud_visible;
+}
 
 static int gdiplus_start_once(void) {
     if (g_gdiplus_ready) return 1;
@@ -71,9 +81,14 @@ static void update_frame(HWND hwnd) {
             double fps = (double)(cur_frames - last_frames) / dt;
             double vps = (double)(cur_vblanks - last_vblanks) / dt;
             snprintf(g_fps_text, sizeof g_fps_text, "FPS %.1f | VPS %.1f", fps, vps);
-            char title[96];
-            snprintf(title, sizeof title, "Seto-static | %s", g_fps_text);
-            SetWindowTextA(hwnd, title);
+            seto_perf_tick(fps, vps, seto_ge_gpu_current_scale(), seto_ge_gpu_current_msaa());
+            if (hud_is_visible()) {
+                char title[96];
+                snprintf(title, sizeof title, "Seto-static | %s", g_fps_text);
+                SetWindowTextA(hwnd, title);
+            } else {
+                SetWindowTextW(hwnd, L"Seto-static \u2014 Yu-Gi-Oh! GX Tag Force");
+            }
             last_ms = now;
             last_frames = cur_frames;
             last_vblanks = cur_vblanks;
@@ -352,8 +367,7 @@ static void gl_sync_overlay(HWND hwnd) {
         return;
     }
 
-    const char *hud = getenv("SETO_GL_HUD");
-    const int hud_on = (!hud || !hud[0] || hud[0] != '0');
+    const int hud_on = hud_is_visible();
     if (!hud_on || !g_fps_text[0]) {
         if (g_ovl_active_badge || g_ovl_was_osk) {
             seto_gl_present_set_overlay(NULL, 0, 0, 0, 0);
@@ -628,7 +642,7 @@ static void paint(HWND hwnd, HDC hdc) {
             }
         }
     }
-    if (g_fps_text[0]) {
+    if (hud_is_visible() && g_fps_text[0]) {
         HFONT old_font = (HFONT)SelectObject(g_memdc, GetStockObject(DEFAULT_GUI_FONT));
         COLORREF old_fg = SetTextColor(g_memdc, RGB(80, 255, 120));
         COLORREF old_bg = SetBkColor(g_memdc, RGB(12, 16, 20));
@@ -699,6 +713,19 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
             }
+        }
+        if (wp == VK_F5 && ((lp >> 30) & 1) == 0) {
+            g_hud_visible = !hud_is_visible();
+            if (g_hud_visible && g_fps_text[0]) {
+                char title[96];
+                snprintf(title, sizeof title, "Seto-static | %s", g_fps_text);
+                SetWindowTextA(hwnd, title);
+            } else {
+                SetWindowTextW(hwnd, L"Seto-static \u2014 Yu-Gi-Oh! GX Tag Force");
+            }
+            if (seto_gl_present_active()) gl_sync_overlay(hwnd);
+            else InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
         }
         if (wp == VK_RETURN) return 0;   /* input thread samples the keyboard */
         return DefWindowProcW(hwnd, msg, wp, lp);
@@ -832,6 +859,9 @@ static DWORD WINAPI window_thread(LPVOID unused) {
 }
 
 int seto_window_start(void) {
+    /* Headless test runs: no window and no GL context. The GE backend still
+     * fills the framebuffer, so the game loop and every log keep working. */
+    if (getenv("SETO_HEADLESS")) return -1;
     g_ready = CreateEventW(NULL, TRUE, FALSE, NULL);
     if (!g_ready) return -1;
     g_thread = CreateThread(NULL, 0, window_thread, NULL, 0, NULL);

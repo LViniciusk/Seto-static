@@ -16,6 +16,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef HAVE_TF3_SHOP_PACK
+#include "build/gx_data/gx_id_map.h"
+#include "gx_shop.h"
+#endif
+
 #define EBOOT_BASE      0x08000000u
 #define EBOOT_SIZE      0x00640000u
 #define EBOOT_INFO      (EBOOT_BASE + 0x0006B81Cu)
@@ -272,8 +277,12 @@ static void restore_mod_image(store_mod_t *m) {
             else for (uint32_t i = 0; i < n; i++) psp_write8(m->base + m->filesz + i, 0);
         }
     }
-    if (m->base == 0x03600000u)
+    if (m->base == 0x03600000u) {
         psp_dispatch_clear_range(0x03600000u, 0x04000000u);
+#ifdef HAVE_TF3_SHOP_PACK
+        install_tf3_shop_pack();
+#endif
+    }
     m->reg();
     psp_dispatch_module_gp(m->base, m->base + m->memsz, m->gp);
 }
@@ -341,6 +350,21 @@ uint32_t psp_store_export(uint32_t nid, uint32_t *gp_out) {
 }
 
 void store_import_forward(uint32_t nid) {
+#ifdef HAVE_TF3_SHOP_PACK
+    const uint32_t ret_pc = psp_cpu.r[PSP_REG_RA];
+    if (g_shop_tab && nid == 0xF1181D60u && ret_pc == 0x03606A18u) {
+        psp_ret(0);
+        return;
+    }
+    if (!g_shop_tab && g_shop_tf3_count && nid == 0xA8805FD2u &&
+        ret_pc == 0x03606994u && psp_arg(0) == 37u) {
+        psp_ret(2u);
+        return;
+    }
+    const int draw_tab = g_shop_tf3_count && nid == 0xB89D38DCu && ret_pc == 0x03608810u;
+    const uint32_t text_x = draw_tab ? psp_arg(0) + psp_arg(2) : 0;
+    const uint32_t text_y = draw_tab ? psp_arg(1) : 0;
+#endif
     uint32_t gp = g_eboot_gp;
     uint32_t addr = eboot_export(nid);
     if (!addr) addr = psp_store_export(nid, &gp);
@@ -354,5 +378,27 @@ void store_import_forward(uint32_t nid) {
     uint32_t caller_gp = psp_cpu.r[PSP_REG_GP];
     psp_cpu.r[PSP_REG_GP] = gp;
     psp_call_from_host(addr);
+#ifdef HAVE_TF3_SHOP_PACK
+    if (!g_shop_tab && g_shop_tf3_count && nid == 0xD4DE5DD8u) {
+        uint32_t roll = psp_cpu.r[PSP_REG_V0];
+        if (ret_pc == 0x036073D8u)
+            psp_ret(gx_shop_reweight(psp_cpu.r[PSP_REG_S3], psp_cpu.r[PSP_REG_S4], roll));
+        if (ret_pc == 0x03607508u)
+            psp_ret(gx_shop_reweight(psp_cpu.r[PSP_REG_S0], psp_cpu.r[PSP_REG_S2], roll));
+    }
+    if (nid == 0xF5E3080Cu && ret_pc == 0x0360220Cu)
+        gx_shop_handle_tabs(psp_cpu.r[PSP_REG_V0]);
+    if (draw_tab && text_x >= 24u * 64u) {
+        const uint32_t label = GX_SHOP_END - 8u;
+        uint32_t result = psp_cpu.r[PSP_REG_V0];
+        psp_write32(label, '1' + g_shop_tab);
+        psp_cpu.r[PSP_REG_A0] = text_x - 20u * 64u;
+        psp_cpu.r[PSP_REG_A1] = text_y;
+        psp_cpu.r[PSP_REG_A2] = 18u * 64u;
+        psp_cpu.r[PSP_REG_A3] = label;
+        psp_call_from_host(addr);
+        psp_ret(result);
+    }
+#endif
     psp_cpu.r[PSP_REG_GP] = caller_gp;
 }
