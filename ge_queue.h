@@ -25,6 +25,7 @@ typedef struct {
     int32_t  src_slot;
     int32_t  tex_slot;
     int32_t  fbo_tex_slot;
+    int32_t  hd_path_off; /* offset in the HD path pool, resolved by the producer */
     int32_t  w;
     int32_t  h;
     int32_t  sx;

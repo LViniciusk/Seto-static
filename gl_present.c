@@ -231,9 +231,22 @@ typedef struct {
     GLint wrap_t;
     uint8_t valid;
 } ge_tex_param_cache;
+
+typedef struct {
+    GLuint texture;
+    ge_tex_param_cache params;
+    uint64_t used_at;
+    unsigned refs;
+    int retain;
+    char path[640];
+} ge_hd_texture;
+
 static GLuint g_ge_tex_cache[GE_TEX_CACHE_SLOTS];
-static uint8_t g_ge_tex_is_hd[GE_TEX_CACHE_SLOTS];
 static ge_tex_param_cache g_ge_tex_params[GE_TEX_CACHE_SLOTS];
+// Keep reusable HD images around when the guest reuses its texture slots.
+static ge_hd_texture g_ge_hd_cache[GE_TEX_CACHE_SLOTS + 32];
+static ge_hd_texture *g_ge_hd_slots[GE_TEX_CACHE_SLOTS];
+static uint64_t g_ge_hd_clock;
 static uint64_t g_dumped_hashes[2048];
 static int g_dumped_count;
 static uint64_t g_hd_miss_hashes[512];
@@ -1857,7 +1870,7 @@ static void ge_hd_ini_load_once(const char *env_dir) {
 }
 
 static uint32_t ge_compute_ppsspp_data_hash(const psp_draw_state *st, int h_override,
-                                            int force_aligned) {
+                                            int force_aligned, int skip_dxt1_blocks) {
     static const uint32_t TEX_BPP[16] = {
         16u, 16u, 16u, 32u, 4u, 8u, 16u, 32u, 4u, 8u, 8u, 0u, 0u, 0u, 0u, 0u
     };
@@ -1902,12 +1915,8 @@ static uint32_t ge_compute_ppsspp_data_hash(const psp_draw_state *st, int h_over
     if ((int)bufw <= w) {
         const uint32_t total_px = bufw * (uint32_t)h + (uint32_t)(w - (int)bufw);
         uint32_t size_ram = (uint32_t)((float)((bpp * total_px) / 8u) * reduce_factor);
-        if (st->tex_fmt == PSP_TPSM_DXT1 && w == 128 && h == 64 &&
-            g_hd_skip_dxt1_128x64 > 0 && (uint32_t)(8 * g_hd_skip_dxt1_128x64) < size_ram)
-            size_ram -= (uint32_t)(8 * g_hd_skip_dxt1_128x64);
-        if (st->tex_fmt == PSP_TPSM_DXT1 && w == 128 && h == 128 &&
-            g_hd_skip_dxt1_128x128 > 0 && (uint32_t)(8 * g_hd_skip_dxt1_128x128) < size_ram)
-            size_ram -= (uint32_t)(8 * g_hd_skip_dxt1_128x128);
+        if (skip_dxt1_blocks > 0 && (uint32_t)skip_dxt1_blocks < size_ram / 8u)
+            size_ram -= (uint32_t)skip_dxt1_blocks * 8u;
         if (size_ram == 0u) return 0u;
         const uint8_t *checkp = (const uint8_t *)psp_mem_unwatched_ptr(st->tex_addr, size_ram);
         if (!checkp) return 0u;
@@ -1951,6 +1960,11 @@ static int32_t ge_hd_match_state_locked(const psp_draw_state *st) {
     const uint16_t dim = (uint16_t)((ge_log2_dim(st->tex_h) << 8) | ge_log2_dim(st->tex_w));
     const uint64_t addr_hi = ((uint64_t)(st->tex_addr & 0x3FFFFFFFu)) << 32;
     const int has_clut = (st->tex_fmt & 4) != 0;
+    int skip_dxt1_blocks = 0;
+    if (st->tex_fmt == PSP_TPSM_DXT1 && st->tex_w == 128) {
+        if (st->tex_h == 64) skip_dxt1_blocks = g_hd_skip_dxt1_128x64;
+        if (st->tex_h == 128) skip_dxt1_blocks = g_hd_skip_dxt1_128x128;
+    }
 
     const int h_candidates[3] = { st->tex_h, 272, 256 };
     const int n_hcand = (st->tex_h == 512) ? 3 : 1;
@@ -1958,11 +1972,17 @@ static int32_t ge_hd_match_state_locked(const psp_draw_state *st) {
     for (int hi = 0; hi < n_hcand; hi++) {
         for (int align_try = 0; align_try < 2; align_try++) {
             if (align_try == 1 && (st->tex_addr & 0xFu) == 0u) break;
-            const uint32_t dhash = ge_compute_ppsspp_data_hash(st, h_candidates[hi], align_try);
+            const uint32_t dhash = ge_compute_ppsspp_data_hash(st, h_candidates[hi], align_try, 0);
             if (!has_clut) {
                 const uint64_t ck = addr_hi | (uint64_t)dim;
                 const int32_t poff = ge_hd_lookup_wildcard(ck, dhash);
                 if (poff != -1) return poff;
+                if (skip_dxt1_blocks > 0) {
+                    const uint32_t cropped = ge_compute_ppsspp_data_hash(
+                        st, h_candidates[hi], align_try, skip_dxt1_blocks);
+                    const int32_t fallback = ge_hd_lookup_wildcard(ck, cropped);
+                    if (fallback != -1) return fallback;
+                }
                 if (hi == 0 && align_try == 0) {
                     static int n_trace_miss;
                     const char *tr = getenv("SETO_TRACE_HD_TEX");
@@ -2004,10 +2024,11 @@ static int32_t ge_hd_match_state_locked(const psp_draw_state *st) {
     return -1;
 }
 
-void seto_ge_hd_note_tex(uint64_t fnv_hash, const psp_draw_state *st) {
+static int32_t ge_hd_resolve_texture(uint64_t fnv_hash, const psp_draw_state *st) {
     const char *dir = getenv("SETO_HD_TEX_DIR");
-    if (!dir || !dir[0] || !fnv_hash || !st || !g_hd_ini_lock_ready) return;
+    if (!dir || !dir[0] || !fnv_hash || !st || !g_hd_ini_lock_ready) return -1;
 
+    int32_t path_off = -1;
     EnterCriticalSection(&g_hd_ini_lock);
     ge_hd_ini_load_once(dir);
     if (g_hd_ini_active) {
@@ -2017,80 +2038,99 @@ void seto_ge_hd_note_tex(uint64_t fnv_hash, const psp_draw_state *st) {
             g_hd_fnv_cache[slot].path_off = ge_hd_match_state_locked(st);
             g_hd_fnv_cache[slot].valid = 1;
         }
+        path_off = g_hd_fnv_cache[slot].path_off;
     }
     LeaveCriticalSection(&g_hd_ini_lock);
+    return path_off;
 }
 
-static int ge_try_load_hd_tex(uint64_t hash, int orig_w, int orig_h,
-                              uint32_t **out_px, int *out_w, int *out_h) {
-    const char *dir = getenv("SETO_HD_TEX_DIR");
-    if (!dir || !dir[0] || !hash) return 0;
-    for (int i = 0; i < 512; i++) {
-        if (g_hd_miss_hashes[i] == hash) return 0;
+static void ge_release_hd_texture(ge_hd_texture *hd) {
+    if (hd && --hd->refs == 0 && !hd->retain) {
+        glDeleteTextures(1, &hd->texture);
+        hd->texture = 0;
     }
+}
+
+static ge_hd_texture *ge_get_hd_texture_file(const char *path) {
+    ge_hd_texture *victim = NULL;
+    for (size_t i = 0; i < sizeof g_ge_hd_cache / sizeof g_ge_hd_cache[0]; i++) {
+        ge_hd_texture *entry = &g_ge_hd_cache[i];
+        if (entry->texture && strcmp(entry->path, path) == 0) {
+            entry->used_at = ++g_ge_hd_clock;
+            entry->refs++;
+            return entry;
+        }
+        if (!entry->refs && (!victim || !entry->texture ||
+            (victim->texture && entry->used_at < victim->used_at)))
+            victim = entry;
+    }
+    if (!victim) return NULL;
+
+    uint32_t *pixels = NULL;
+    int w = 0, h = 0;
+    if (!ge_load_png_rgba(path, &pixels, &w, &h) &&
+        !ge_load_ppm_rgba(path, &pixels, &w, &h))
+        return NULL;
+
+    if (!victim->texture) glGenTextures(1, &victim->texture);
+    if (!victim->texture) {
+        free(pixels);
+        return NULL;
+    }
+    glBindTexture(GL_TEXTURE_2D, victim->texture);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h,
+                 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    free(pixels);
+    victim->params.valid = 0;
+    victim->refs = 1;
+    victim->used_at = ++g_ge_hd_clock;
+    // Large interface atlases can stay bound but do not consume idle cache space.
+    victim->retain = (size_t)w * h * sizeof(uint32_t) <= 2u * 1024u * 1024u;
+    snprintf(victim->path, sizeof victim->path, "%s", path);
+    if (g_hd_logged < 16) {
+        g_hd_logged++;
+        fprintf(stderr, "gl: HD texture %s (%dx%d)\n", path, w, h);
+    }
+    return victim;
+}
+
+static ge_hd_texture *ge_get_hd_texture(uint64_t hash, int32_t path_off) {
+    const char *dir = getenv("SETO_HD_TEX_DIR");
+    if (!dir || !dir[0] || !hash || path_off == -2) return NULL;
 
     char ini_rel[260] = "";
     char base_dir[384] = "";
-    int32_t ini_poff = -1;
     if (g_hd_ini_lock_ready) {
         EnterCriticalSection(&g_hd_ini_lock);
         ge_hd_ini_load_once(dir);
         snprintf(base_dir, sizeof base_dir, "%s", g_hd_base_dir[0] ? g_hd_base_dir : dir);
-        if (g_hd_ini_active) {
-            const uint32_t slot = (uint32_t)(hash ^ (hash >> 32)) & (GE_HD_FNV_CACHE_CAP - 1u);
-            if (g_hd_fnv_cache[slot].valid && g_hd_fnv_cache[slot].fnv_hash == hash) {
-                ini_poff = g_hd_fnv_cache[slot].path_off;
-                if (ini_poff >= 0 && g_hd_path_pool)
-                    snprintf(ini_rel, sizeof ini_rel, "%s", g_hd_path_pool + ini_poff);
-            }
-        }
+        if (path_off >= 0 && (size_t)path_off < g_hd_path_len)
+            snprintf(ini_rel, sizeof ini_rel, "%s", g_hd_path_pool + path_off);
         LeaveCriticalSection(&g_hd_ini_lock);
     } else {
         snprintf(base_dir, sizeof base_dir, "%s", dir);
     }
 
     char path[640];
-    if (ini_poff == -2) {
-        g_hd_miss_hashes[g_hd_miss_cursor & 511] = hash;
-        g_hd_miss_cursor++;
-        return 0;
-    }
-    if (ini_poff >= 0 && ini_rel[0]) {
+    if (ini_rel[0]) {
         snprintf(path, sizeof path, "%s/%s", base_dir, ini_rel);
-        if (ge_load_png_rgba(path, out_px, out_w, out_h) ||
-            ge_load_ppm_rgba(path, out_px, out_w, out_h)) {
-            if (g_hd_logged < 16) {
-                g_hd_logged++;
-                fprintf(stderr, "gl: HD texture %016llx -> %s (%dx%d -> %dx%d)\n",
-                        (unsigned long long)hash, ini_rel, orig_w, orig_h, *out_w, *out_h);
-            }
-            return 1;
-        }
+        ge_hd_texture *hd = ge_get_hd_texture_file(path);
+        if (hd) return hd;
     }
-
+    for (int i = 0; i < 512; i++) {
+        if (g_hd_miss_hashes[i] == hash) return NULL;
+    }
     snprintf(path, sizeof path, "%s/%016llx.png", base_dir, (unsigned long long)hash);
-    if (ge_load_png_rgba(path, out_px, out_w, out_h)) {
-        if (g_hd_logged < 16) {
-            g_hd_logged++;
-            fprintf(stderr, "gl: HD texture %016llx (%dx%d -> %dx%d)\n",
-                    (unsigned long long)hash, orig_w, orig_h, *out_w, *out_h);
-        }
-        return 1;
-    }
-
+    ge_hd_texture *hd = ge_get_hd_texture_file(path);
+    if (hd) return hd;
     snprintf(path, sizeof path, "%s/%016llx.ppm", base_dir, (unsigned long long)hash);
-    if (ge_load_ppm_rgba(path, out_px, out_w, out_h)) {
-        if (g_hd_logged < 16) {
-            g_hd_logged++;
-            fprintf(stderr, "gl: HD texture %016llx (%dx%d -> %dx%d)\n",
-                    (unsigned long long)hash, orig_w, orig_h, *out_w, *out_h);
-        }
-        return 1;
-    }
+    hd = ge_get_hd_texture_file(path);
+    if (hd) return hd;
 
     g_hd_miss_hashes[g_hd_miss_cursor & 511] = hash;
     g_hd_miss_cursor++;
-    return 0;
+    return NULL;
 }
 
 static void ge_sync_stencil_to_alpha(ge_gpu_fbo *tf) {
@@ -2216,35 +2256,33 @@ static void ge_process_draw(const ge_cmd *c) {
                 glBindTexture(GL_TEXTURE_2D, tex);
             }
         } else if (c->tex_slot >= 0 && c->tex_slot < GE_TEX_CACHE_SLOTS) {
-            if (!g_ge_tex_cache[c->tex_slot]) glGenTextures(1, &g_ge_tex_cache[c->tex_slot]);
-            tex = g_ge_tex_cache[c->tex_slot];
-            glBindTexture(GL_TEXTURE_2D, tex);
+            const int slot = c->tex_slot;
+            ge_hd_texture *hd = g_ge_hd_slots[slot];
             if (c->tex) {
-                g_ge_tex_params[c->tex_slot].valid = 0;
                 if (c->tex_hash != 0u)
                     ge_dump_tex_png(c->tex_hash, c->tex, c->state.tex_w, c->state.tex_h);
-                uint32_t *hd_px = NULL;
-                int hd_w = 0, hd_h = 0;
-                if (c->tex_hash != 0u &&
-                    ge_try_load_hd_tex(c->tex_hash, c->state.tex_w, c->state.tex_h,
-                                       &hd_px, &hd_w, &hd_h)) {
-                    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, hd_w, hd_h,
-                                 0, GL_RGBA, GL_UNSIGNED_BYTE, hd_px);
-                    free(hd_px);
-                    g_ge_tex_is_hd[c->tex_slot] = 1;
-                } else {
-                    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, c->state.tex_w, c->state.tex_h,
-                                 0, GL_RGBA, GL_UNSIGNED_BYTE, c->tex);
-                    g_ge_tex_is_hd[c->tex_slot] = 0;
-                }
+                ge_hd_texture *replacement = ge_get_hd_texture(c->tex_hash, c->hd_path_off);
+                ge_release_hd_texture(hd);
+                g_ge_hd_slots[slot] = hd = replacement;
             }
-            tex_is_hd = g_ge_tex_is_hd[c->tex_slot];
+            if (hd) {
+                tex = hd->texture;
+                hd->used_at = ++g_ge_hd_clock;
+            } else {
+                if (!g_ge_tex_cache[slot]) glGenTextures(1, &g_ge_tex_cache[slot]);
+                tex = g_ge_tex_cache[slot];
+            }
+            glBindTexture(GL_TEXTURE_2D, tex);
+            if (!hd && c->tex) {
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, c->state.tex_w, c->state.tex_h,
+                             0, GL_RGBA, GL_UNSIGNED_BYTE, c->tex);
+            }
+            tex_is_hd = hd != NULL;
             const GLint tfilt = (tex_is_hd || (c->state.tex_filter & 0x101)) ? GL_LINEAR : GL_NEAREST;
             const GLint ws = c->state.tex_clamp_u ? GL_CLAMP_TO_EDGE : GL_REPEAT;
             const GLint wt = c->state.tex_clamp_v ? GL_CLAMP_TO_EDGE : GL_REPEAT;
-            ge_tex_param_cache *tp = &g_ge_tex_params[c->tex_slot];
+            ge_tex_param_cache *tp = hd ? &hd->params : &g_ge_tex_params[slot];
             if (!tp->valid || tp->filt != tfilt || tp->wrap_s != ws || tp->wrap_t != wt) {
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, tfilt);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, tfilt);
@@ -2705,8 +2743,13 @@ static void ge_free_gl(void) {
     if (g_ge_front_tex) glDeleteTextures(1, &g_ge_front_tex);
     glDeleteTextures(GE_TEX_CACHE_SLOTS, g_ge_tex_cache);
     memset(g_ge_tex_cache, 0, sizeof g_ge_tex_cache);
-    memset(g_ge_tex_is_hd, 0, sizeof g_ge_tex_is_hd);
     memset(g_ge_tex_params, 0, sizeof g_ge_tex_params);
+    for (size_t i = 0; i < sizeof g_ge_hd_cache / sizeof g_ge_hd_cache[0]; i++) {
+        if (g_ge_hd_cache[i].texture) glDeleteTextures(1, &g_ge_hd_cache[i].texture);
+    }
+    memset(g_ge_hd_cache, 0, sizeof g_ge_hd_cache);
+    memset(g_ge_hd_slots, 0, sizeof g_ge_hd_slots);
+    g_ge_hd_clock = 0;
     memset(g_dumped_hashes, 0, sizeof g_dumped_hashes);
     g_dumped_count = 0;
     memset(g_hd_miss_hashes, 0, sizeof g_hd_miss_hashes);
@@ -4015,6 +4058,7 @@ int seto_ge_gpu_enqueue_draw(int prim, const psp_vertex *v, int count,
     c.tex_slot = tex_slot;
     c.fbo_tex_slot = fbo_tex_slot;
     c.tex_hash = tex_hash;
+    c.hd_path_off = tex ? ge_hd_resolve_texture(tex_hash, st) : -1;
     c.state = *st;
     memcpy(c.verts, v, (size_t)count * sizeof *v);
     return ge_enqueue_wait(&c, 1000);

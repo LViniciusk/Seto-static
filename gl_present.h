@@ -52,6 +52,5 @@ int  seto_gl_present_has_gpu_frame(void);
 int  seto_ge_gpu_read_front(uint32_t *out_top_down);
 void seto_gl_present_set_overlay(const uint32_t *rgba_top_down, int x, int y,
                                  int w, int h);
-void seto_ge_hd_note_tex(uint64_t fnv_hash, const psp_draw_state *st);
 
 #endif
