@@ -78,27 +78,35 @@ def run(cmd, cwd=ROOT):
     subprocess.run(cmd, cwd=cwd, check=True)
 
 
+EXE_EXT = ".exe" if os.name == "nt" else ""
+
+
 def pick_cmake_generator():
     if shutil.which("ninja"):
         return "Ninja"
-    return "MinGW Makefiles"
+    return "MinGW Makefiles" if os.name == "nt" else "Unix Makefiles"
 
 
 def check_tools():
     required = ["git", "cmake", "gcc", "g++", "pkg-config"]
     missing = [t for t in required if shutil.which(t) is None]
     if missing:
-        raise RuntimeError(
-            "Missing build tools in PATH: "
-            + ", ".join(missing)
-            + ". Install Git, CMake and MSYS2 UCRT64 (gcc, g++, pkg-config, ffmpeg, zlib, openssl; recommended: ninja, lld, ccache)."
+        hint = (
+            "Install Git, CMake and MSYS2 UCRT64 (gcc, g++, pkg-config, ffmpeg, zlib, openssl; recommended: ninja, lld, ccache)."
+            if os.name == "nt"
+            else "Install git, cmake, gcc, g++, pkg-config, ninja-build, libsdl2-dev, libpng-dev, libgl-dev, ffmpeg dev libs, libssl-dev, zlib1g-dev."
         )
-    r = subprocess.run(
-        ["pkg-config", "--exists", "libavcodec", "libavformat", "libswresample", "libswscale", "libavutil"],
-        capture_output=True,
-    )
+        raise RuntimeError(
+            "Missing build tools in PATH: " + ", ".join(missing) + ". " + hint
+        )
+    pkgs = ["libavcodec", "libavformat", "libswresample", "libswscale", "libavutil"]
+    if os.name != "nt":
+        pkgs += ["sdl2", "libpng", "gl"]
+    r = subprocess.run(["pkg-config", "--exists"] + pkgs, capture_output=True)
     if r.returncode != 0:
-        raise RuntimeError("FFmpeg dev packages (libavcodec/libavformat/libswresample/libswscale/libavutil) not found via pkg-config.")
+        raise RuntimeError(
+            f"Missing dev packages via pkg-config ({', '.join(pkgs)})."
+        )
     try:
         import PIL  # noqa: F401
     except ImportError as exc:
@@ -195,7 +203,7 @@ def ensure_flash0(flash0_dir=FLASH0_DIR, clean=False):
 def ensure_psprecomp(jobs, clean=False):
     pre_dir = os.path.join(DEPS_DIR, "psprecomp")
     pre_build = os.path.join(pre_dir, "build")
-    recomp_exe = os.path.join(pre_build, "tools", "allegrexrecomp", "allegrexrecomp.exe")
+    recomp_exe = os.path.join(pre_build, "tools", "allegrexrecomp", f"allegrexrecomp{EXE_EXT}")
 
     if clean and os.path.isdir(pre_dir):
         run(["git", "-C", pre_dir, "reset", "--hard", PSPRECOMP_COMMIT])
@@ -231,7 +239,7 @@ def ensure_psprecomp(jobs, clean=False):
 
 def ensure_pspdecrypt(jobs, clean=False):
     pdec_dir = os.path.join(DEPS_DIR, "pspdecrypt")
-    pdec_exe = os.path.join(pdec_dir, "pspdecrypt.exe")
+    pdec_exe = os.path.join(pdec_dir, f"pspdecrypt{EXE_EXT}")
 
     if not os.path.isdir(os.path.join(pdec_dir, ".git")):
         if os.path.isdir(pdec_dir):
@@ -241,19 +249,20 @@ def ensure_pspdecrypt(jobs, clean=False):
         run(["git", "-C", pdec_dir, "-c", "advice.detachedHead=false", "checkout", PSPDECRYPT_COMMIT])
 
     if clean or not os.path.isfile(pdec_exe):
-        log("Compiling pspdecrypt.exe...")
+        log(f"Compiling pspdecrypt{EXE_EXT}...")
         jobs_compile = []
         objs = []
+        obj_tag = ".win.o" if os.name == "nt" else ".lnx.o"
         for root_d, _, files in os.walk(pdec_dir):
             if ".git" in root_d.split(os.sep):
                 continue
             for fn in sorted(files):
                 src = os.path.join(root_d, fn)
                 if fn.endswith(".c"):
-                    obj = src + ".win.o"
+                    obj = src + obj_tag
                     jobs_compile.append((["gcc", "-O1", "-c", src, "-o", obj], obj))
                 elif fn.endswith(".cpp"):
-                    obj = src + ".win.o"
+                    obj = src + obj_tag
                     jobs_compile.append((["g++", "-O1", "-c", src, "-o", obj], obj))
         with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
             futs = [pool.submit(subprocess.run, cmd, check=True) for cmd, _ in jobs_compile]
@@ -472,10 +481,10 @@ def main():
     log("[6/7] Generating Pure GX data and applying Phase C patches...")
     build_gx_data_and_patch(args.tf1_iso, args.tf3_iso)
 
-    log("[7/7] Building Seto-static.exe...")
+    log(f"[7/7] Building Seto-static{EXE_EXT}...")
     build_host(args.tf3_iso, args.jobs)
 
-    exe_path = os.path.join(BUILD, "out", "Seto-static.exe")
+    exe_path = os.path.join(BUILD, "out", f"Seto-static{EXE_EXT}")
     if not os.path.isfile(exe_path):
         raise RuntimeError(f"Build finished but {exe_path} was not produced.")
     if not os.path.isfile(os.path.join(FLASH0_DIR, "font", "ltn0.pgf")):

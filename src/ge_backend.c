@@ -7,6 +7,7 @@
 #include "gl_present.h"
 #include "ge_queue.h"
 #include "perf_mon.h"
+#include "seto_os.h"
 
 #include <psprecomp/hle.h>
 #include <psprecomp/mem.h>
@@ -522,13 +523,13 @@ static int ge_find_tex_fbo(const psp_draw_state *st) {
 
 static void ge_trace_text(int prim, const psp_vertex *v, int count, const psp_draw_state *st,
                           int tw, int th, const uint32_t *px) {
-    static DWORD t0;
+    static uint64_t t0;
     static int n;
     static int ge_trace_text_flag = -1;
     if (ge_trace_text_flag < 0) ge_trace_text_flag = getenv("SETO_GE_TRACE_TEXT") != NULL ? 1 : 0;
     if (!ge_trace_text_flag) return;
-    if (!t0) t0 = GetTickCount();
-    if (GetTickCount() - t0 < 25000 || n >= 40) return;
+    if (!t0) t0 = seto_ticks_ms();
+    if (seto_ticks_ms() - t0 < 25000u || n >= 40) return;
     n++;
     fprintf(stderr, "text: #%d prim=%d n=%d %dx%d fmt=%d swz=%d func=%d ta=%d "
             "at=%d/%d/%d bl=%d/%d/%d sc=%d,%d-%d,%d reg=%d:%d,%d-%d,%d "

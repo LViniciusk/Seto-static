@@ -1,7 +1,11 @@
 #ifndef SETO_PERF_MON_H
 #define SETO_PERF_MON_H
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <time.h>
+#endif
 #include <stdatomic.h>
 #include <stdint.h>
 
@@ -43,6 +47,7 @@ void seto_perf_tick(double fps, double vps, int scale, int msaa);
 
 static inline uint64_t seto_perf_now_us(void) {
     if (!g_seto_perf_enabled) return 0;
+#ifdef _WIN32
     static uint64_t freq;
     LARGE_INTEGER li;
     if (!freq) {
@@ -52,6 +57,11 @@ static inline uint64_t seto_perf_now_us(void) {
     }
     QueryPerformanceCounter(&li);
     return (uint64_t)li.QuadPart * 1000000ULL / freq;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)(ts.tv_nsec / 1000L);
+#endif
 }
 
 static inline void seto_perf_add(_Atomic uint64_t *dst, uint64_t v) {
