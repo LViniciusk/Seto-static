@@ -1,6 +1,6 @@
 # Seto-static
 
-Native Windows static recompilation of **Yu-Gi-Oh! GX Tag Force** (PSP, `ULUS-10136`), upgraded with the **Yu-Gi-Oh! GX Tag Force 3** (`ULES-01183`) duel engine, expanded card pool, and a hardware-accelerated OpenGL 3.3 renderer.
+Native Windows static recompilation of **Yu-Gi-Oh! GX Tag Force** (PSP, `ULUS-10136`), upgraded with the **Yu-Gi-Oh! GX Tag Force 3** (`ULES-01183`) duel engine and expanded card pool, and a hardware-accelerated OpenGL 3.3 renderer.
 
 > **Legal Notice:** This repository contains no copyrighted game assets, binaries, or BIOS/firmware files. You must provide your own legally dumped `TF1.iso` (`ULUS-10136`) and `TF3.iso` (`ULES-01183`) images to build and play.
 
@@ -53,6 +53,15 @@ python -u tools/setup_build.py --tf1-iso "path\to\TF1.iso" --tf3-iso "path\to\TF
 ```
 
 Pass `--clean` to force regeneration of all dependencies and emitted C files.
+
+---
+
+## HD Texture Packs
+
+- **HD Texture Pack (FULL):** [Download FULL](https://nanika.lvinik.app/share/spoS4O3#pHpDpvw4O9TgnqkwLd4zChx0uPJ_OVulYjMi6Q_SGDQ)
+- **HD Texture Pack (LIGHT):** [Download LIGHT](https://nanika.lvinik.app/share/vCsR4sH#8SiP6bdtWXJZ7oMCo_MAKTAsJSYrVwg0DV0A5MLZ5L8)
+
+Extract the pack and select the extracted folder in the launcher's **HD Textures** field (optional).
 
 ---
 

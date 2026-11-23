@@ -291,6 +291,7 @@ int g_seto_perf_enabled = 0;
 static char g_gl_gpu_info[256] = "unknown";
 static ge_hd_texture *g_ge_hd_slots[GE_TEX_CACHE_SLOTS];
 static uint8_t g_ge_hd_pending_slots[GE_TEX_CACHE_SLOTS];
+static int32_t g_ge_hd_pending_path_off[GE_TEX_CACHE_SLOTS];
 static uint64_t g_ge_hd_clock;
 static uint64_t g_dumped_hashes[2048];
 static int g_dumped_count;
@@ -2356,12 +2357,14 @@ enum {
 typedef struct {
     char     path[640];
     int      state;
+    uint64_t seq;
     uint32_t *pixels;
     int      w;
     int      h;
 } ge_hd_async_job;
 
 static ge_hd_async_job g_hd_async_jobs[GE_HD_ASYNC_JOBS];
+static uint64_t g_hd_async_seq;
 static CRITICAL_SECTION g_hd_async_lock;
 static CONDITION_VARIABLE g_hd_async_cv;
 static HANDLE g_hd_worker_thread;
@@ -2455,7 +2458,17 @@ static void ge_release_hd_texture(ge_hd_texture *hd) {
     }
 }
 
-static ge_hd_texture *ge_get_hd_texture_file(const char *path, int *out_pending) {
+static int ge_hd_file_exists(const char *path) {
+    WCHAR wpath[520];
+    if (!path || !path[0]) return 0;
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 520) <= 0 &&
+        MultiByteToWideChar(CP_ACP, 0, path, -1, wpath, 520) <= 0)
+        return 0;
+    const DWORD attr = GetFileAttributesW(wpath);
+    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+static ge_hd_texture *ge_get_hd_texture_file(const char *path, int allow_async, int *out_pending) {
     if (out_pending) *out_pending = 0;
     ge_hd_texture *victim = NULL;
     for (size_t i = 0; i < sizeof g_ge_hd_cache / sizeof g_ge_hd_cache[0]; i++) {
@@ -2476,18 +2489,31 @@ static ge_hd_texture *ge_get_hd_texture_file(const char *path, int *out_pending)
     uint32_t *pixels = NULL;
     int w = 0, h = 0;
 
-    ge_hd_async_ensure_started();
-    if (g_hd_worker_thread) {
+    if (allow_async) {
+        ge_hd_async_ensure_started();
+    }
+    if (allow_async && g_hd_worker_thread) {
         EnterCriticalSection(&g_hd_async_lock);
         int found = -1;
         int empty = -1;
+        int evict_failed = -1;
+        int evict_ready = -1;
         for (int i = 0; i < GE_HD_ASYNC_JOBS; i++) {
             const int st = g_hd_async_jobs[i].state;
             if (st == GE_HD_JOB_EMPTY) {
                 if (empty < 0) empty = i;
-            } else if (strcmp(g_hd_async_jobs[i].path, path) == 0) {
-                found = i;
-                break;
+            } else {
+                if (strcmp(g_hd_async_jobs[i].path, path) == 0) {
+                    found = i;
+                    break;
+                }
+                if (st == GE_HD_JOB_FAILED &&
+                    (evict_failed < 0 || g_hd_async_jobs[i].seq < g_hd_async_jobs[evict_failed].seq)) {
+                    evict_failed = i;
+                } else if (st == GE_HD_JOB_READY &&
+                           (evict_ready < 0 || g_hd_async_jobs[i].seq < g_hd_async_jobs[evict_ready].seq)) {
+                    evict_ready = i;
+                }
             }
         }
         if (found >= 0) {
@@ -2516,15 +2542,49 @@ static ge_hd_texture *ge_get_hd_texture_file(const char *path, int *out_pending)
                 return NULL;
             }
         } else {
-            if (empty >= 0) {
-                snprintf(g_hd_async_jobs[empty].path, sizeof g_hd_async_jobs[empty].path, "%s", path);
-                g_hd_async_jobs[empty].pixels = NULL;
-                g_hd_async_jobs[empty].state = GE_HD_JOB_PENDING;
-                WakeConditionVariable(&g_hd_async_cv);
-            }
-            if (out_pending) *out_pending = 1;
             LeaveCriticalSection(&g_hd_async_lock);
-            return NULL;
+            if (!ge_hd_file_exists(path)) {
+                seto_perf_add(&g_seto_perf.hd_miss_io, 1);
+                seto_perf_add(&g_seto_perf.hd_miss_us, seto_perf_now_us() - t0);
+                return NULL;
+            }
+            EnterCriticalSection(&g_hd_async_lock);
+            /* Re-scan empty/evict slot in case another state changed while unlocked. */
+            empty = -1;
+            evict_failed = -1;
+            evict_ready = -1;
+            for (int i = 0; i < GE_HD_ASYNC_JOBS; i++) {
+                const int st = g_hd_async_jobs[i].state;
+                if (st == GE_HD_JOB_EMPTY) {
+                    if (empty < 0) empty = i;
+                } else if (st == GE_HD_JOB_FAILED &&
+                           (evict_failed < 0 || g_hd_async_jobs[i].seq < g_hd_async_jobs[evict_failed].seq)) {
+                    evict_failed = i;
+                } else if (st == GE_HD_JOB_READY &&
+                           (evict_ready < 0 || g_hd_async_jobs[i].seq < g_hd_async_jobs[evict_ready].seq)) {
+                    evict_ready = i;
+                }
+            }
+            int dst = empty >= 0 ? empty : (evict_failed >= 0 ? evict_failed : evict_ready);
+            if (dst >= 0) {
+                free(g_hd_async_jobs[dst].pixels);
+                snprintf(g_hd_async_jobs[dst].path, sizeof g_hd_async_jobs[dst].path, "%s", path);
+                g_hd_async_jobs[dst].pixels = NULL;
+                g_hd_async_jobs[dst].seq = ++g_hd_async_seq;
+                g_hd_async_jobs[dst].state = GE_HD_JOB_PENDING;
+                WakeConditionVariable(&g_hd_async_cv);
+                if (out_pending) *out_pending = 1;
+                LeaveCriticalSection(&g_hd_async_lock);
+                return NULL;
+            }
+            LeaveCriticalSection(&g_hd_async_lock);
+            /* Fallback to synchronous load if all 64 worker slots are actively decoding. */
+            if (!ge_load_png_rgba(path, &pixels, &w, &h) &&
+                !ge_load_ppm_rgba(path, &pixels, &w, &h)) {
+                seto_perf_add(&g_seto_perf.hd_miss_io, 1);
+                seto_perf_add(&g_seto_perf.hd_miss_us, seto_perf_now_us() - t0);
+                return NULL;
+            }
         }
     } else {
         if (!ge_load_png_rgba(path, &pixels, &w, &h) &&
@@ -2562,7 +2622,8 @@ static ge_hd_texture *ge_get_hd_texture_file(const char *path, int *out_pending)
     return victim;
 }
 
-static ge_hd_texture *ge_get_hd_texture(uint64_t hash, int32_t path_off, int *out_pending) {
+static ge_hd_texture *ge_get_hd_texture(uint64_t hash, int32_t path_off,
+                                        int allow_async, int *out_pending) {
     if (out_pending) *out_pending = 0;
     const char *dir = ge_hd_tex_dir_env();
     if (!dir || !dir[0] || !hash || path_off == -2) return NULL;
@@ -2585,7 +2646,7 @@ static ge_hd_texture *ge_get_hd_texture(uint64_t hash, int32_t path_off, int *ou
     if (ini_rel[0]) {
         int p = 0;
         snprintf(path, sizeof path, "%s/%s", base_dir, ini_rel);
-        ge_hd_texture *hd = ge_get_hd_texture_file(path, &p);
+        ge_hd_texture *hd = ge_get_hd_texture_file(path, allow_async, &p);
         if (hd) return hd;
         if (p) {
             if (out_pending) *out_pending = 1;
@@ -2598,14 +2659,14 @@ static ge_hd_texture *ge_get_hd_texture(uint64_t hash, int32_t path_off, int *ou
     {
         int p = 0;
         snprintf(path, sizeof path, "%s/%016llx.png", base_dir, (unsigned long long)hash);
-        ge_hd_texture *hd = ge_get_hd_texture_file(path, &p);
+        ge_hd_texture *hd = ge_get_hd_texture_file(path, allow_async, &p);
         if (hd) return hd;
         pending |= p;
     }
     {
         int p = 0;
         snprintf(path, sizeof path, "%s/%016llx.ppm", base_dir, (unsigned long long)hash);
-        ge_hd_texture *hd = ge_get_hd_texture_file(path, &p);
+        ge_hd_texture *hd = ge_get_hd_texture_file(path, allow_async, &p);
         if (hd) return hd;
         pending |= p;
     }
@@ -2720,9 +2781,7 @@ static void ge_process_draw_verts(const ge_cmd *c, const psp_vertex *verts, uint
     if (c->state.tex_enable && !c->state.clear &&
         c->state.tex_w > 0 && c->state.tex_h > 0) {
         if (c->card_front_path_off >= 0) {
-            int hd_pending = 0;
-            card_front = ge_get_hd_texture(1, c->card_front_path_off, &hd_pending);
-            (void)hd_pending;
+            card_front = ge_get_hd_texture(1, c->card_front_path_off, 0, NULL);
             if (!card_front) {
                 seto_perf_add(&g_seto_perf.g_draw_us, seto_perf_now_us() - t_proc0);
                 return;
@@ -2780,18 +2839,26 @@ static void ge_process_draw_verts(const ge_cmd *c, const psp_vertex *verts, uint
                 int hd_pending = 0;
                 if (c->tex_hash != 0u)
                     ge_dump_tex_png(c->tex_hash, c->tex, c->state.tex_w, c->state.tex_h);
-                ge_hd_texture *replacement = ge_get_hd_texture(c->tex_hash, c->hd_path_off, &hd_pending);
+                ge_hd_texture *replacement = ge_get_hd_texture(c->tex_hash, c->hd_path_off, 1, &hd_pending);
                 ge_release_hd_texture(hd);
                 g_ge_hd_slots[slot] = hd = replacement;
-                g_ge_hd_pending_slots[slot] = (!hd && hd_pending) ? 1u : 0u;
+                if (!hd && hd_pending) {
+                    g_ge_hd_pending_slots[slot] = 1u;
+                    g_ge_hd_pending_path_off[slot] = c->hd_path_off;
+                } else {
+                    g_ge_hd_pending_slots[slot] = 0u;
+                    g_ge_hd_pending_path_off[slot] = -1;
+                }
             } else if (!hd && g_ge_hd_pending_slots[slot] && c->tex_hash != 0u) {
                 int hd_pending = 0;
-                ge_hd_texture *replacement = ge_get_hd_texture(c->tex_hash, c->hd_path_off, &hd_pending);
+                ge_hd_texture *replacement = ge_get_hd_texture(c->tex_hash, g_ge_hd_pending_path_off[slot], 1, &hd_pending);
                 if (replacement) {
                     g_ge_hd_slots[slot] = hd = replacement;
                     g_ge_hd_pending_slots[slot] = 0u;
+                    g_ge_hd_pending_path_off[slot] = -1;
                 } else if (!hd_pending) {
                     g_ge_hd_pending_slots[slot] = 0u;
+                    g_ge_hd_pending_path_off[slot] = -1;
                 }
             }
             if (hd) {
@@ -3448,6 +3515,7 @@ static void ge_free_gl(void) {
     memset(g_ge_hd_cache, 0, sizeof g_ge_hd_cache);
     memset(g_ge_hd_slots, 0, sizeof g_ge_hd_slots);
     memset(g_ge_hd_pending_slots, 0, sizeof g_ge_hd_pending_slots);
+    for (int i = 0; i < GE_TEX_CACHE_SLOTS; i++) g_ge_hd_pending_path_off[i] = -1;
     g_ge_hd_clock = 0;
     memset(g_dumped_hashes, 0, sizeof g_dumped_hashes);
     g_dumped_count = 0;

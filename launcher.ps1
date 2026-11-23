@@ -1817,13 +1817,23 @@ $setupBuildBtn.Add_Click({
             if ($script:setupRunner -and -not $script:setupRunner.HasExited -and ($script:setupTickCount % 4 -eq 0)) {
                 $elapsed = (Get-Date) - $script:setupStartTime
                 $idleSec = ((Get-Date) - $script:setupLastLineTime).TotalSeconds
-                $dots = '.' * ((($script:setupTickCount / 4) % 3) + 1)
+                $nDots = [int](($script:setupTickCount / 4) % 3) + 1
+                $visDots = '.' * $nDots
+                $padDots = '.' * (3 - $nDots)
                 $elStr = '{0:mm\:ss}' -f $elapsed
-                if ($idleSec -gt 5) {
-                    $setupStatusText.Text = "Working (compiling/linking)$dots ($elStr)"
-                } else {
-                    $setupStatusText.Text = "Installing$dots ($elStr)"
+                $prefix = if ($idleSec -gt 5) { 'Working (compiling/linking)' } else { 'Installing' }
+
+                # Pad missing dots with transparent dots so (mm:ss) never shifts horizontally.
+                $setupStatusText.Inlines.Clear()
+                [void]$setupStatusText.Inlines.Add((New-Object System.Windows.Documents.Run ($prefix + $visDots)))
+                if ($padDots.Length -gt 0) {
+                    $rPad = New-Object System.Windows.Documents.Run $padDots
+                    $rPad.Foreground = [System.Windows.Media.Brushes]::Transparent
+                    [void]$setupStatusText.Inlines.Add($rPad)
                 }
+                $rTime = New-Object System.Windows.Documents.Run (" ($elStr)")
+                [System.Windows.Documents.Typography]::SetNumeralAlignment($rTime, [System.Windows.FontNumeralAlignment]::Tabular)
+                [void]$setupStatusText.Inlines.Add($rTime)
             }
 
             if ($script:setupRunner -and $script:setupRunner.HasExited) {
