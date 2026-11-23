@@ -37,10 +37,12 @@ typedef struct {
 } seto_perf_counters;
 
 extern seto_perf_counters g_seto_perf;
+extern int g_seto_perf_enabled;
 
 void seto_perf_tick(double fps, double vps, int scale, int msaa);
 
 static inline uint64_t seto_perf_now_us(void) {
+    if (!g_seto_perf_enabled) return 0;
     static uint64_t freq;
     LARGE_INTEGER li;
     if (!freq) {
@@ -53,10 +55,12 @@ static inline uint64_t seto_perf_now_us(void) {
 }
 
 static inline void seto_perf_add(_Atomic uint64_t *dst, uint64_t v) {
+    if (!g_seto_perf_enabled) return;
     atomic_fetch_add_explicit(dst, v, memory_order_relaxed);
 }
 
 static inline void seto_perf_max(_Atomic uint64_t *dst, uint64_t v) {
+    if (!g_seto_perf_enabled) return;
     uint64_t cur = atomic_load_explicit(dst, memory_order_relaxed);
     while (v > cur &&
            !atomic_compare_exchange_weak_explicit(dst, &cur, v,

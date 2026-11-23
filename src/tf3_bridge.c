@@ -24,6 +24,22 @@
 
 extern uint64_t psp_display_vblanks(void);
 
+static inline int tf3_env_flag(int *slot, const char *name) {
+    if (*slot < 0) *slot = getenv(name) != NULL ? 1 : 0;
+    return *slot;
+}
+static int tf3_trace_bridge(void)   { static int f = -1; return tf3_env_flag(&f, "TF3_BRIDGE_TRACE"); }
+static int tf3_trace_abi_ev(void)   { static int f = -1; return tf3_env_flag(&f, "SETO_ABI_TRACE_EVENT"); }
+static int tf3_trace_abi_vis(void)  { static int f = -1; return tf3_env_flag(&f, "SETO_ABI_TRACE_VISUAL"); }
+static int tf3_trace_abi_stats(void){ static int f = -1; return tf3_env_flag(&f, "SETO_ABI_TRACE_STATS"); }
+static int tf3_trace_abi_calls(void){ static int f = -1; return tf3_env_flag(&f, "SETO_ABI_TRACE_CALLS"); }
+static int tf3_trace_step(void)     { static int f = -1; return tf3_env_flag(&f, "SETO_TRACE_STEP"); }
+static int tf3_trace_ff(void)       { static int f = -1; return tf3_env_flag(&f, "SETO_TRACE_FF"); }
+static int tf3_trace_prompt(void)   { static int f = -1; return tf3_env_flag(&f, "SETO_TRACE_PROMPT"); }
+static int tf3_trace_nova(void)     { static int f = -1; return tf3_env_flag(&f, "SETO_TRACE_NOVA"); }
+static int tf3_trace_post_deck(void){ static int f = -1; return tf3_env_flag(&f, "SETO_TRACE_POST_DECK"); }
+static int tf3_test_gx_deck(void)   { static int f = -1; return tf3_env_flag(&f, "SETO_TEST_GX_DECK"); }
+
 typedef struct {            /* TF1, 0x2C */
     int id;                 /* +0x00 */
     int attr;               /* +0x04 */
@@ -305,7 +321,7 @@ static void handle_deck_load(void) {
     uint32_t side_n  = psp_read32(tf1_ptr + 4u);
     uint32_t extra_n = psp_read32(tf1_ptr + 8u);
 
-    if (getenv("SETO_TEST_GX_DECK") && psp_cpu.r[PSP_REG_A0] == 0u) {
+    if (tf3_test_gx_deck() && psp_cpu.r[PSP_REG_A0] == 0u) {
         static const uint16_t gx_main[] = {
             7661, /* Elemental Hero Prisma */
             7277, /* Crystal Beast Amethyst Cat */
@@ -342,7 +358,7 @@ static void handle_deck_load(void) {
         extra_n = 12u;
     }
 
-    if (getenv("SETO_TRACE_POST_DECK")) g_tf3_post_deck_trace = 1;
+    if (tf3_trace_post_deck()) g_tf3_post_deck_trace = 1;
     if (g_tf3_post_deck_trace) {
         const uint32_t player = psp_cpu.r[PSP_REG_A0];
         fprintf(stderr, "[DECKLOAD] player=%u main=%u side=%u extra=%u first=%u,%u,%u"
@@ -358,7 +374,7 @@ static void handle_deck_load(void) {
                 psp_read16(tf1_ptr + 0xCAu), psp_read16(tf1_ptr + 0xCCu),
                 psp_read16(tf1_ptr + 0xCEu));
         fprintf(stderr, "[MAINDECK] player=%u ids=", player);
-        const uint32_t trace_main_limit = getenv("SETO_TRACE_NOVA") ? 80u : 10u;
+        const uint32_t trace_main_limit = tf3_trace_nova() ? 80u : 10u;
         for (uint32_t i = 0; i < main_n && i < trace_main_limit; i++)
             fprintf(stderr, " %u", psp_read16(tf1_ptr + RECIPE_MAIN + i * 2u));
         fprintf(stderr, "\n");
@@ -481,7 +497,7 @@ static uint32_t tf3_prompt_kind_to_tf1_raw(uint32_t kind, uint32_t text) {
  * back to the kind/text the TF3 engine asked for. */
 static uint32_t tf3_prompt_kind_to_tf1(uint32_t kind, uint32_t text) {
     const uint32_t out = tf3_prompt_kind_to_tf1_raw(kind, text);
-    if (g_tf3_post_deck_trace || getenv("SETO_TRACE_PROMPT")) {
+    if (g_tf3_post_deck_trace || tf3_trace_prompt()) {
         static unsigned n;
         if (n++ < 120u)
             fprintf(stderr, "[PROMPT] vb=%llu tf3_kind=%u text=0x%X -> tf1_kind=%u%s\n",
@@ -723,7 +739,7 @@ static void update_hand_visibility(uint32_t player, uint32_t uid) {
                 const uint32_t face = psp_cpu.r[PSP_REG_V0] & 1u;
                 const uint32_t flags = psp_read8(card + 0x8Du);
                 psp_write8(card + 0x8Du, (uint8_t)((flags & ~8u) | (face << 3)));
-                if (getenv("SETO_ABI_TRACE_VISUAL"))
+                if (tf3_trace_abi_vis())
                     fprintf(stderr, "[HAND_VIS] vb=%llu player=%u requested_uid=%u uid=%u index=%u face=%u\n",
                             (unsigned long long)psp_display_vblanks(), player, uid, card_uid, index, face);
             }
@@ -814,7 +830,7 @@ static int duel_tf3_handle_export_body(uint32_t nid) {
         if (psp_arg(0) == BRIDGE_FLIP_PREVIEW_EVENT) {
             start_flip_preview(psp_arg(1), psp_arg(2), psp_arg(3));
         } else if (psp_arg(0) == 47u && g_flip_preview.pending) {
-            if (getenv("SETO_ABI_TRACE_VISUAL"))
+            if (tf3_trace_abi_vis())
                 fprintf(stderr, "[FLIP_PREVIEW] vb=%llu deferred player=%u zone=%u mode=%u\n",
                         (unsigned long long)psp_display_vblanks(), psp_arg(1), psp_arg(2), psp_arg(3));
         } else if (psp_arg(0) == 18u && psp_arg(1) <= 1u && psp_lookup(0x0300C600u)) {
@@ -840,10 +856,10 @@ static int duel_tf3_handle_export_body(uint32_t nid) {
             static uint32_t last_step = 0xFFFFFFFFu;
             const uint32_t step = psp_read32(0x03847B60u);
             if (step != last_step) {
-                if (getenv("SETO_TRACE_FF") && (step == 109u || (last_step == 109u && step == 0u)))
+                if (tf3_trace_ff() && (step == 109u || (last_step == 109u && step == 0u)))
                     trace_future_fusion_slots(psp_display_vblanks(), step);
                 last_step = step;
-                if (g_tf3_post_deck_trace || getenv("SETO_TRACE_STEP"))
+                if (g_tf3_post_deck_trace || tf3_trace_step())
                     fprintf(stderr, "[STEP] vb=%llu step=%u turn=%u phase=%u active_player=%u\n",
                             (unsigned long long)psp_display_vblanks(), step,
                             psp_read32(0x0384BDE0u), psp_read32(0x0384BDE8u),
@@ -853,7 +869,7 @@ static int duel_tf3_handle_export_body(uint32_t nid) {
         if (popped && out_ptr >= 0x08000000u && out_ptr < 0x0C000000u) {
             uint32_t tf3_ev = psp_read32(out_ptr + 0u);
             uint32_t tf1_ev = tf3_event_to_tf1(tf3_ev);
-            if (getenv("SETO_TRACE_FF")) {
+            if (tf3_trace_ff()) {
                 static uint32_t last_turn = UINT32_MAX, last_phase = UINT32_MAX, last_player = UINT32_MAX;
                 const uint32_t turn = psp_read32(0x0384BDE0u);
                 const uint32_t phase = psp_read32(0x0384BDE8u);
@@ -867,7 +883,7 @@ static int duel_tf3_handle_export_body(uint32_t nid) {
                     trace_future_fusion_slots(psp_display_vblanks(), psp_read32(0x03847B60u));
                 }
             }
-            if (g_tf3_post_deck_trace || getenv("TF3_BRIDGE_TRACE")) {
+            if (g_tf3_post_deck_trace || tf3_trace_bridge()) {
                 static unsigned ev_log;
                 if (ev_log < 12000u) {
                     ev_log++;
@@ -879,7 +895,7 @@ static int duel_tf3_handle_export_body(uint32_t nid) {
                     fflush(stderr);
                 }
             }
-            if ((g_tf3_post_deck_trace || getenv("SETO_ABI_TRACE_EVENT")) &&
+            if ((g_tf3_post_deck_trace || tf3_trace_abi_ev()) &&
                 (tf3_ev == 4u || tf3_ev == 55u || tf3_ev == 60u)) {
                 static unsigned abi_ev_log;
                 if (abi_ev_log < 200u) {
@@ -902,7 +918,7 @@ static int duel_tf3_handle_export_body(uint32_t nid) {
                 /* TF3 packs attacker as player | zone << 8; TF1 tracks player separately. */
                 const uint32_t attacker = psp_read32(out_ptr + 4u);
                 const uint32_t zone = (attacker >> 8) & 0xFFu;
-                if (g_tf3_post_deck_trace || getenv("SETO_ABI_TRACE_EVENT"))
+                if (g_tf3_post_deck_trace || tf3_trace_abi_ev())
                     fprintf(stderr, "[ABI_ATTACK] vb=%llu attacker=0x%X player=%u zone=%u target=[0x%X,0x%X]\n",
                             (unsigned long long)psp_display_vblanks(), attacker, attacker & 0xFFu,
                             zone, psp_read32(out_ptr + 8u), psp_read32(out_ptr + 12u));
@@ -914,7 +930,7 @@ static int duel_tf3_handle_export_body(uint32_t nid) {
                 const uint32_t uid = psp_read32(out_ptr + 8u);
                 const uint32_t player = loc & 1u;
                 const uint32_t zone = (loc >> 1) & 0x1Fu;
-                if (g_tf3_post_deck_trace || getenv("SETO_ABI_TRACE_EVENT")) {
+                if (g_tf3_post_deck_trace || tf3_trace_abi_ev()) {
                     const uint32_t field = 0x03849128u + 2876u * player + 0x34u;
                     const uint32_t card = zone < 11u ? psp_read16(field + 0x14u * zone) & 0x3FFFu : 0;
                     fprintf(stderr, "[ABI_BANNER] vb=%llu loc=0x%X player=%u zone=%u uid=%u field_card=0x%04X\n",
@@ -943,7 +959,7 @@ static int duel_tf3_handle_export_body(uint32_t nid) {
                         if (tf3_kid != 0u) {
                             const uint32_t tf1_kid = (uint32_t)gx_tf3_to_tf1(tf3_kid);
                             psp_write32(out_ptr + 8u, tf1_kid);
-                            if (g_tf3_post_deck_trace || getenv("TF3_BRIDGE_TRACE") || getenv("SETO_ABI_TRACE_EVENT")) {
+                            if (g_tf3_post_deck_trace || tf3_trace_bridge() || tf3_trace_abi_ev()) {
                                 fprintf(stderr, "[ABI_CUTIN] vb=%llu tf3=%u->tf1=%u a1=0x%X uid=%u tf3_kid=0x%04X -> tf1_kid=%u\n",
                                         (unsigned long long)psp_display_vblanks(),
                                         tf3_ev, tf1_ev, raw_a1, uid, tf3_kid, tf1_kid);
@@ -963,7 +979,7 @@ static int duel_tf3_handle_export_body(uint32_t nid) {
                 const uint32_t text = psp_read32(out_ptr + 8u);
                 const uint32_t arg = psp_read32(out_ptr + 12u);
                 const uint32_t mapped = tf3_prompt_kind_to_tf1(kind, text);
-                if (g_tf3_post_deck_trace || getenv("SETO_ABI_TRACE_EVENT")) {
+                if (g_tf3_post_deck_trace || tf3_trace_abi_ev()) {
                     static unsigned ev49_log;
                     if (ev49_log < 4000u) {
                         ev49_log++;
@@ -982,7 +998,7 @@ static int duel_tf3_handle_export_body(uint32_t nid) {
                 uint32_t display = text;
                 if ((text & 0xFFFF0000u) == 0u && duel_text_is_empty(text)) {
                     display = tf3_dlg_str_ptr(text);
-                    if ((g_tf3_post_deck_trace || getenv("SETO_ABI_TRACE_EVENT")))
+                    if ((g_tf3_post_deck_trace || tf3_trace_abi_ev()))
                         fprintf(stderr, "[EV49] TF1 text %u empty, using TF3 0x%X\n", text, display);
                 }
                 /* The draw reads pointer text after the guest stack frame that
@@ -991,7 +1007,7 @@ static int duel_tf3_handle_export_body(uint32_t nid) {
                 if (stable != text)
                     psp_write32(out_ptr + 8u, stable);
             }
-            if (tf1_ev == 50u && (g_tf3_post_deck_trace || getenv("SETO_ABI_TRACE_EVENT"))) {
+            if (tf1_ev == 50u && (g_tf3_post_deck_trace || tf3_trace_abi_ev())) {
                 /* Who is choosing? Thunder Dragon's NPC search opened the
                  * player's selection UI, so measure the turn owner here. */
                 fprintf(stderr, "[EV50] vb=%llu player=%u kind=%u arg2=0x%X turn_player=%u turn=%u phase=%u\n",
@@ -1046,7 +1062,7 @@ static int duel_tf3_handle_export_body(uint32_t nid) {
         }
         const Tf3DuelStats *s3 =
             (const Tf3DuelStats *)psp_mem_unwatched_ptr(shadow, sizeof(Tf3DuelStats));
-        if (g_tf3_post_deck_trace || getenv("SETO_ABI_TRACE_STATS")) {
+        if (g_tf3_post_deck_trace || tf3_trace_abi_stats()) {
             static unsigned stats_log;
             if (stats_log < 40u) {
                 stats_log++;
@@ -1524,7 +1540,7 @@ static void tf3eng_import_forward_body(uint32_t nid) {
     {
         uint32_t val = 0;
         if (tf3_arch_eval(nid, kid, &val)) {
-            if (getenv("SETO_ABI_TRACE_CALLS")) {
+            if (tf3_trace_abi_calls()) {
                 static unsigned arch_log;
                 if (arch_log++ < 3000u)
                     fprintf(stderr, "[ARCH] vb=%llu nid=0x%08X kid=%u idx=%u -> %u\n",
@@ -1602,7 +1618,7 @@ static void tf3eng_import_forward_body(uint32_t nid) {
             lim = psp_cpu.r[PSP_REG_V0];
         }
         psp_ret(lim);
-        if (getenv("TF3_BRIDGE_TRACE")) {
+        if (tf3_trace_bridge()) {
             static unsigned lim_log;
             if (lim_log++ < 20u) {
                 fprintf(stderr, "tf3_bridge: 0xFE91A2EC(GetCardLimit) kid=%u -> tf1=%u -> %u\n",
@@ -1624,7 +1640,7 @@ static void tf3eng_import_forward_body(uint32_t nid) {
             uint16_t w = (uint16_t)entry[word_off] | ((uint16_t)entry[word_off + 1u] << 8);
             res = (w & (1u << (bit & 15u))) ? 1u : 0u;
         }
-        if (getenv("TF3_BRIDGE_TRACE")) {
+        if (tf3_trace_bridge()) {
             static unsigned genre_log;
             if (genre_log++ < 25u) {
                 fprintf(stderr, "tf3_bridge: 0x21F9E97E kid=%u idx=%u tbl=%u -> %u\n",
@@ -1639,7 +1655,7 @@ static void tf3eng_import_forward_body(uint32_t nid) {
     case 0xCB6030CFu: { /* TF3 BOOT 0x0002ec94: DLG_Text_E[DLG_Indx_E[id]] */
         uint32_t id = psp_arg(0);
         uint32_t ptr = tf3_dlg_str_ptr(id);
-        if (getenv("TF3_BRIDGE_TRACE")) {
+        if (tf3_trace_bridge()) {
             static unsigned dlg_log;
             if (dlg_log++ < 20u) {
                 fprintf(stderr, "tf3_bridge: 0xCB6030CF(%u) -> 0x%08X\n", id, ptr);
@@ -1653,7 +1669,7 @@ static void tf3eng_import_forward_body(uint32_t nid) {
     case 0xE3C8F657u: { /* TF3 BOOT 0x0002ecb8: id ? DLG[id + 500] : "" */
         uint32_t id = psp_arg(0);
         uint32_t ptr = id ? tf3_dlg_str_ptr(id + 500u) : GX_EMPTY_WSTR_ADDR;
-        if (getenv("TF3_BRIDGE_TRACE")) {
+        if (tf3_trace_bridge()) {
             static unsigned dlg2_log;
             if (dlg2_log++ < 20u) {
                 fprintf(stderr, "tf3_bridge: 0xE3C8F657(%u) -> 0x%08X\n", id, ptr);
@@ -1667,7 +1683,7 @@ static void tf3eng_import_forward_body(uint32_t nid) {
     case 0x375A7F03u: { /* TF3 BOOT 0x0002ed58: id ? DLG[id + 530] : "" */
         uint32_t id = psp_arg(0);
         uint32_t ptr = id ? tf3_dlg_str_ptr(id + 530u) : GX_EMPTY_WSTR_ADDR;
-        if (getenv("TF3_BRIDGE_TRACE")) {
+        if (tf3_trace_bridge()) {
             static unsigned dlg3_log;
             if (dlg3_log++ < 20u) {
                 fprintf(stderr, "tf3_bridge: 0x375A7F03(%u) -> 0x%08X\n", id, ptr);
@@ -1770,31 +1786,51 @@ static void tf3eng_import_forward_body(uint32_t nid) {
         if (!src) return;
         if (!g_gx_extra_mapped) gx_runtime_init();
         uint32_t dst = GX_TF3_DUEL_INFO_ADDR;
-        for (uint32_t off = 0; off < 280u; off += 4u) {
-            psp_write32(dst + off, psp_read32(src + off));
-        }
-        for (uint32_t off = 280u; off < 2120u; off += 4u) {
-            psp_write32(dst + off, 0u);
-        }
-        for (uint32_t off = 0; off < 8u; off++) {
-            psp_write8(dst + 400u + off, psp_read8(src + 280u + off));
-        }
-        for (uint32_t i = 0; i < 4u; i++) {
-            uint32_t s_slot = src + 288u + i * 392u;
-            uint32_t d_slot = dst + 408u + i * 428u;
-            for (uint32_t off = 0; off < 128u; off += 4u) {
-                psp_write32(d_slot + off, psp_read32(s_slot + off));
+        const uint8_t *sp = (const uint8_t *)psp_mem_ptr(src, 288u + 4u * 392u);
+        uint8_t *dp = (uint8_t *)psp_mem_ptr(dst, 2120u);
+        if (sp && dp) {
+            memcpy(dp, sp, 280u);
+            memset(dp + 280u, 0, 2120u - 280u);
+            memcpy(dp + 400u, sp + 280u, 8u);
+            for (uint32_t i = 0; i < 4u; i++) {
+                const uint8_t *s_slot = sp + 288u + i * 392u;
+                uint8_t *d_slot = dp + 408u + i * 428u;
+                memcpy(d_slot, s_slot, 128u);
+                memcpy(d_slot + 152u, s_slot + 128u, 264u);
+                /* Online comm-ID / peer slot index: TF1 s_slot+8 (+296) -> TF3 d_slot+24 (+432). */
+                memcpy(d_slot + 24u, s_slot + 8u, 2u);
+                if (g_duel_finish_in_progress) {
+                    memcpy(d_slot + 12u, s_slot, 2u);
+                    memcpy(d_slot + 20u, s_slot + 4u, 2u);
+                }
             }
-            for (uint32_t off = 0; off < 264u; off += 4u) {
-                psp_write32(d_slot + 152u + off, psp_read32(s_slot + 128u + off));
+        } else {
+            for (uint32_t off = 0; off < 280u; off += 4u) {
+                psp_write32(dst + off, psp_read32(src + off));
             }
-            /* Online comm-ID / peer slot index: TF1 s_slot+8 (+296) -> TF3 d_slot+24 (+432). */
-            psp_write16(d_slot + 24u, psp_read16(s_slot + 8u));
-            if (g_duel_finish_in_progress) {
-                /* The finish path reads the participant kind at +0x1A4
-                 * and the roster index eight bytes later. */
-                psp_write16(d_slot + 12u, psp_read16(s_slot));
-                psp_write16(d_slot + 20u, psp_read16(s_slot + 4u));
+            for (uint32_t off = 280u; off < 2120u; off += 4u) {
+                psp_write32(dst + off, 0u);
+            }
+            for (uint32_t off = 0; off < 8u; off++) {
+                psp_write8(dst + 400u + off, psp_read8(src + 280u + off));
+            }
+            for (uint32_t i = 0; i < 4u; i++) {
+                uint32_t s_slot = src + 288u + i * 392u;
+                uint32_t d_slot = dst + 408u + i * 428u;
+                for (uint32_t off = 0; off < 128u; off += 4u) {
+                    psp_write32(d_slot + off, psp_read32(s_slot + off));
+                }
+                for (uint32_t off = 0; off < 264u; off += 4u) {
+                    psp_write32(d_slot + 152u + off, psp_read32(s_slot + 128u + off));
+                }
+                /* Online comm-ID / peer slot index: TF1 s_slot+8 (+296) -> TF3 d_slot+24 (+432). */
+                psp_write16(d_slot + 24u, psp_read16(s_slot + 8u));
+                if (g_duel_finish_in_progress) {
+                    /* The finish path reads the participant kind at +0x1A4
+                     * and the roster index eight bytes later. */
+                    psp_write16(d_slot + 12u, psp_read16(s_slot));
+                    psp_write16(d_slot + 20u, psp_read16(s_slot + 4u));
+                }
             }
         }
         psp_ret(dst);
@@ -1814,11 +1850,18 @@ static void tf3eng_import_forward_body(uint32_t nid) {
         if (!src) return;
         if (!g_tf3_scratch_mapped) duel_tf3_on_duel_load();
         const uint32_t dst = TF3_SCRATCH_NET_RECV_ADDR + (slot & 3u) * TF3_NET_RECV_SLOT_SIZE;
-        for (uint32_t off = 0; off < 252u; off += 4u) {
-            psp_write32(dst + off, psp_read32(src + 4u + off));
-        }
-        for (uint32_t off = 252u; off < TF3_NET_RECV_SLOT_SIZE; off += 4u) {
-            psp_write32(dst + off, 0u);
+        const void *sp = psp_mem_ptr(src + 4u, 252u);
+        uint8_t *dp = (uint8_t *)psp_mem_ptr(dst, TF3_NET_RECV_SLOT_SIZE);
+        if (sp && dp) {
+            memcpy(dp, sp, 252u);
+            memset(dp + 252u, 0, TF3_NET_RECV_SLOT_SIZE - 252u);
+        } else {
+            for (uint32_t off = 0; off < 252u; off += 4u) {
+                psp_write32(dst + off, psp_read32(src + 4u + off));
+            }
+            for (uint32_t off = 252u; off < TF3_NET_RECV_SLOT_SIZE; off += 4u) {
+                psp_write32(dst + off, 0u);
+            }
         }
         psp_ret(dst);
         return;
@@ -1864,7 +1907,7 @@ static void tf3eng_import_forward_body(uint32_t nid) {
         call_guest_addr(addr, gp);
         psp_cpu.r[PSP_REG_A0] = flag;
         if (flag != mapped && psp_cpu.r[PSP_REG_V0] &&
-            (g_tf3_post_deck_trace || getenv("SETO_ABI_TRACE_EVENT"))) {
+            (g_tf3_post_deck_trace || tf3_trace_abi_ev())) {
             static unsigned busy_logs;
             static unsigned popup_busy_logs;
             unsigned *budget = flag == 34u || flag == 52u ? &popup_busy_logs : &busy_logs;

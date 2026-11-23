@@ -287,8 +287,10 @@ static const char *ge_present_shot_dir_env(void) {
     return ge_cached_env(&v, &init, "SETO_GL_PRESENT_SHOT_DIR");
 }
 seto_perf_counters g_seto_perf;
+int g_seto_perf_enabled = 0;
 static char g_gl_gpu_info[256] = "unknown";
 static ge_hd_texture *g_ge_hd_slots[GE_TEX_CACHE_SLOTS];
+static uint8_t g_ge_hd_pending_slots[GE_TEX_CACHE_SLOTS];
 static uint64_t g_ge_hd_clock;
 static uint64_t g_dumped_hashes[2048];
 static int g_dumped_count;
@@ -2343,6 +2345,108 @@ int32_t seto_ge_card_front_path(uint32_t texture_addr) {
     return path;
 }
 
+#define GE_HD_ASYNC_JOBS 64
+enum {
+    GE_HD_JOB_EMPTY    = 0,
+    GE_HD_JOB_PENDING  = 1,
+    GE_HD_JOB_READY    = 2,
+    GE_HD_JOB_FAILED   = 3,
+    GE_HD_JOB_DECODING = 4
+};
+typedef struct {
+    char     path[640];
+    int      state;
+    uint32_t *pixels;
+    int      w;
+    int      h;
+} ge_hd_async_job;
+
+static ge_hd_async_job g_hd_async_jobs[GE_HD_ASYNC_JOBS];
+static CRITICAL_SECTION g_hd_async_lock;
+static CONDITION_VARIABLE g_hd_async_cv;
+static HANDLE g_hd_worker_thread;
+static int g_hd_async_init;
+static int g_hd_async_stop;
+
+static DWORD WINAPI ge_hd_worker_proc(LPVOID arg) {
+    (void)arg;
+    for (;;) {
+        char path[640];
+        int job_idx = -1;
+        EnterCriticalSection(&g_hd_async_lock);
+        while (!g_hd_async_stop) {
+            for (int i = 0; i < GE_HD_ASYNC_JOBS; i++) {
+                if (g_hd_async_jobs[i].state == GE_HD_JOB_PENDING) {
+                    job_idx = i;
+                    snprintf(path, sizeof path, "%s", g_hd_async_jobs[i].path);
+                    g_hd_async_jobs[i].state = GE_HD_JOB_DECODING;
+                    break;
+                }
+            }
+            if (job_idx >= 0) break;
+            SleepConditionVariableCS(&g_hd_async_cv, &g_hd_async_lock, INFINITE);
+        }
+        if (g_hd_async_stop) {
+            LeaveCriticalSection(&g_hd_async_lock);
+            return 0;
+        }
+        LeaveCriticalSection(&g_hd_async_lock);
+
+        uint32_t *pixels = NULL;
+        int w = 0, h = 0;
+        const int ok = ge_load_png_rgba(path, &pixels, &w, &h) ||
+                       ge_load_ppm_rgba(path, &pixels, &w, &h);
+
+        EnterCriticalSection(&g_hd_async_lock);
+        if (g_hd_async_stop) {
+            free(pixels);
+            g_hd_async_jobs[job_idx].pixels = NULL;
+            g_hd_async_jobs[job_idx].state = GE_HD_JOB_EMPTY;
+        } else if (ok && pixels) {
+            g_hd_async_jobs[job_idx].pixels = pixels;
+            g_hd_async_jobs[job_idx].w = w;
+            g_hd_async_jobs[job_idx].h = h;
+            g_hd_async_jobs[job_idx].state = GE_HD_JOB_READY;
+        } else {
+            free(pixels);
+            g_hd_async_jobs[job_idx].pixels = NULL;
+            g_hd_async_jobs[job_idx].state = GE_HD_JOB_FAILED;
+        }
+        LeaveCriticalSection(&g_hd_async_lock);
+    }
+}
+
+static void ge_hd_async_ensure_started(void) {
+    if (g_hd_async_init) return;
+    ge_gdiplus_start_once();
+    InitializeCriticalSection(&g_hd_async_lock);
+    InitializeConditionVariable(&g_hd_async_cv);
+    memset(g_hd_async_jobs, 0, sizeof g_hd_async_jobs);
+    g_hd_async_stop = 0;
+    g_hd_worker_thread = CreateThread(NULL, 0, ge_hd_worker_proc, NULL, 0, NULL);
+    g_hd_async_init = 1;
+}
+
+static void ge_hd_async_shutdown(void) {
+    if (!g_hd_async_init) return;
+    EnterCriticalSection(&g_hd_async_lock);
+    g_hd_async_stop = 1;
+    WakeAllConditionVariable(&g_hd_async_cv);
+    LeaveCriticalSection(&g_hd_async_lock);
+    if (g_hd_worker_thread) {
+        WaitForSingleObject(g_hd_worker_thread, 5000);
+        CloseHandle(g_hd_worker_thread);
+        g_hd_worker_thread = NULL;
+    }
+    for (int i = 0; i < GE_HD_ASYNC_JOBS; i++) {
+        free(g_hd_async_jobs[i].pixels);
+        g_hd_async_jobs[i].pixels = NULL;
+        g_hd_async_jobs[i].state = GE_HD_JOB_EMPTY;
+    }
+    DeleteCriticalSection(&g_hd_async_lock);
+    g_hd_async_init = 0;
+}
+
 static void ge_release_hd_texture(ge_hd_texture *hd) {
     if (hd && --hd->refs == 0 && !hd->retain) {
         if (g_gl_sc.bound_tex == hd->texture) g_gl_sc.bound_tex = 0;
@@ -2351,7 +2455,8 @@ static void ge_release_hd_texture(ge_hd_texture *hd) {
     }
 }
 
-static ge_hd_texture *ge_get_hd_texture_file(const char *path) {
+static ge_hd_texture *ge_get_hd_texture_file(const char *path, int *out_pending) {
+    if (out_pending) *out_pending = 0;
     ge_hd_texture *victim = NULL;
     for (size_t i = 0; i < sizeof g_ge_hd_cache / sizeof g_ge_hd_cache[0]; i++) {
         ge_hd_texture *entry = &g_ge_hd_cache[i];
@@ -2370,11 +2475,64 @@ static ge_hd_texture *ge_get_hd_texture_file(const char *path) {
     const uint64_t t0 = seto_perf_now_us();
     uint32_t *pixels = NULL;
     int w = 0, h = 0;
-    if (!ge_load_png_rgba(path, &pixels, &w, &h) &&
-        !ge_load_ppm_rgba(path, &pixels, &w, &h)) {
-        seto_perf_add(&g_seto_perf.hd_miss_io, 1);
-        seto_perf_add(&g_seto_perf.hd_miss_us, seto_perf_now_us() - t0);
-        return NULL;
+
+    ge_hd_async_ensure_started();
+    if (g_hd_worker_thread) {
+        EnterCriticalSection(&g_hd_async_lock);
+        int found = -1;
+        int empty = -1;
+        for (int i = 0; i < GE_HD_ASYNC_JOBS; i++) {
+            const int st = g_hd_async_jobs[i].state;
+            if (st == GE_HD_JOB_EMPTY) {
+                if (empty < 0) empty = i;
+            } else if (strcmp(g_hd_async_jobs[i].path, path) == 0) {
+                found = i;
+                break;
+            }
+        }
+        if (found >= 0) {
+            ge_hd_async_job *job = &g_hd_async_jobs[found];
+            if (job->state == GE_HD_JOB_PENDING || job->state == GE_HD_JOB_DECODING) {
+                if (out_pending) *out_pending = 1;
+                LeaveCriticalSection(&g_hd_async_lock);
+                return NULL;
+            }
+            if (job->state == GE_HD_JOB_FAILED) {
+                job->state = GE_HD_JOB_EMPTY;
+                LeaveCriticalSection(&g_hd_async_lock);
+                seto_perf_add(&g_seto_perf.hd_miss_io, 1);
+                seto_perf_add(&g_seto_perf.hd_miss_us, seto_perf_now_us() - t0);
+                return NULL;
+            }
+            if (job->state == GE_HD_JOB_READY) {
+                pixels = job->pixels;
+                w = job->w;
+                h = job->h;
+                job->pixels = NULL;
+                job->state = GE_HD_JOB_EMPTY;
+                LeaveCriticalSection(&g_hd_async_lock);
+            } else {
+                LeaveCriticalSection(&g_hd_async_lock);
+                return NULL;
+            }
+        } else {
+            if (empty >= 0) {
+                snprintf(g_hd_async_jobs[empty].path, sizeof g_hd_async_jobs[empty].path, "%s", path);
+                g_hd_async_jobs[empty].pixels = NULL;
+                g_hd_async_jobs[empty].state = GE_HD_JOB_PENDING;
+                WakeConditionVariable(&g_hd_async_cv);
+            }
+            if (out_pending) *out_pending = 1;
+            LeaveCriticalSection(&g_hd_async_lock);
+            return NULL;
+        }
+    } else {
+        if (!ge_load_png_rgba(path, &pixels, &w, &h) &&
+            !ge_load_ppm_rgba(path, &pixels, &w, &h)) {
+            seto_perf_add(&g_seto_perf.hd_miss_io, 1);
+            seto_perf_add(&g_seto_perf.hd_miss_us, seto_perf_now_us() - t0);
+            return NULL;
+        }
     }
 
     if (!victim->texture) glGenTextures(1, &victim->texture);
@@ -2404,7 +2562,8 @@ static ge_hd_texture *ge_get_hd_texture_file(const char *path) {
     return victim;
 }
 
-static ge_hd_texture *ge_get_hd_texture(uint64_t hash, int32_t path_off) {
+static ge_hd_texture *ge_get_hd_texture(uint64_t hash, int32_t path_off, int *out_pending) {
+    if (out_pending) *out_pending = 0;
     const char *dir = ge_hd_tex_dir_env();
     if (!dir || !dir[0] || !hash || path_off == -2) return NULL;
 
@@ -2422,21 +2581,39 @@ static ge_hd_texture *ge_get_hd_texture(uint64_t hash, int32_t path_off) {
     }
 
     char path[640];
+    int pending = 0;
     if (ini_rel[0]) {
+        int p = 0;
         snprintf(path, sizeof path, "%s/%s", base_dir, ini_rel);
-        ge_hd_texture *hd = ge_get_hd_texture_file(path);
+        ge_hd_texture *hd = ge_get_hd_texture_file(path, &p);
         if (hd) return hd;
+        if (p) {
+            if (out_pending) *out_pending = 1;
+            return NULL;
+        }
     }
     for (int i = 0; i < 512; i++) {
         if (g_hd_miss_hashes[i] == hash) return NULL;
     }
-    snprintf(path, sizeof path, "%s/%016llx.png", base_dir, (unsigned long long)hash);
-    ge_hd_texture *hd = ge_get_hd_texture_file(path);
-    if (hd) return hd;
-    snprintf(path, sizeof path, "%s/%016llx.ppm", base_dir, (unsigned long long)hash);
-    hd = ge_get_hd_texture_file(path);
-    if (hd) return hd;
+    {
+        int p = 0;
+        snprintf(path, sizeof path, "%s/%016llx.png", base_dir, (unsigned long long)hash);
+        ge_hd_texture *hd = ge_get_hd_texture_file(path, &p);
+        if (hd) return hd;
+        pending |= p;
+    }
+    {
+        int p = 0;
+        snprintf(path, sizeof path, "%s/%016llx.ppm", base_dir, (unsigned long long)hash);
+        ge_hd_texture *hd = ge_get_hd_texture_file(path, &p);
+        if (hd) return hd;
+        pending |= p;
+    }
 
+    if (pending) {
+        if (out_pending) *out_pending = 1;
+        return NULL;
+    }
     g_hd_miss_hashes[g_hd_miss_cursor & 511] = hash;
     g_hd_miss_cursor++;
     return NULL;
@@ -2543,7 +2720,9 @@ static void ge_process_draw_verts(const ge_cmd *c, const psp_vertex *verts, uint
     if (c->state.tex_enable && !c->state.clear &&
         c->state.tex_w > 0 && c->state.tex_h > 0) {
         if (c->card_front_path_off >= 0) {
-            card_front = ge_get_hd_texture(1, c->card_front_path_off);
+            int hd_pending = 0;
+            card_front = ge_get_hd_texture(1, c->card_front_path_off, &hd_pending);
+            (void)hd_pending;
             if (!card_front) {
                 seto_perf_add(&g_seto_perf.g_draw_us, seto_perf_now_us() - t_proc0);
                 return;
@@ -2598,11 +2777,22 @@ static void ge_process_draw_verts(const ge_cmd *c, const psp_vertex *verts, uint
             const int slot = c->tex_slot;
             ge_hd_texture *hd = g_ge_hd_slots[slot];
             if (c->tex) {
+                int hd_pending = 0;
                 if (c->tex_hash != 0u)
                     ge_dump_tex_png(c->tex_hash, c->tex, c->state.tex_w, c->state.tex_h);
-                ge_hd_texture *replacement = ge_get_hd_texture(c->tex_hash, c->hd_path_off);
+                ge_hd_texture *replacement = ge_get_hd_texture(c->tex_hash, c->hd_path_off, &hd_pending);
                 ge_release_hd_texture(hd);
                 g_ge_hd_slots[slot] = hd = replacement;
+                g_ge_hd_pending_slots[slot] = (!hd && hd_pending) ? 1u : 0u;
+            } else if (!hd && g_ge_hd_pending_slots[slot] && c->tex_hash != 0u) {
+                int hd_pending = 0;
+                ge_hd_texture *replacement = ge_get_hd_texture(c->tex_hash, c->hd_path_off, &hd_pending);
+                if (replacement) {
+                    g_ge_hd_slots[slot] = hd = replacement;
+                    g_ge_hd_pending_slots[slot] = 0u;
+                } else if (!hd_pending) {
+                    g_ge_hd_pending_slots[slot] = 0u;
+                }
             }
             if (hd) {
                 tex = hd->texture;
@@ -3257,6 +3447,7 @@ static void ge_free_gl(void) {
     }
     memset(g_ge_hd_cache, 0, sizeof g_ge_hd_cache);
     memset(g_ge_hd_slots, 0, sizeof g_ge_hd_slots);
+    memset(g_ge_hd_pending_slots, 0, sizeof g_ge_hd_pending_slots);
     g_ge_hd_clock = 0;
     memset(g_dumped_hashes, 0, sizeof g_dumped_hashes);
     g_dumped_count = 0;
@@ -4181,6 +4372,7 @@ static void gl_cleanup(void) {
     g_last_pres_cw = g_last_pres_ch = 0;
     atomic_store_explicit(&g_present_force_redraw, 0, memory_order_release);
     atomic_store_explicit(&g_ovl_pending_redraw, 0, memory_order_release);
+    ge_hd_async_shutdown();
     if (g_gdiplus_ready) {
         GdiplusShutdown(g_gdiplus_token);
         g_gdiplus_ready = 0;
@@ -4210,6 +4402,7 @@ int seto_gl_present_init(HWND hwnd) {
     PFNWGLCREATECONTEXTATTRIBSARBPROC create_ctx;
 
     if (!present || strcmp(present, "gl") != 0) return 0;
+    g_seto_perf_enabled = getenv("SETO_PERF_LOG") != NULL ? 1 : 0;
     f = getenv("SETO_FILTER");
     g_filter = f ? atoi(f) : 0;
     if (g_filter < 0 || g_filter > 2) g_filter = 0;
@@ -4707,9 +4900,7 @@ int seto_ge_gpu_current_msaa(void) {
 }
 
 void seto_perf_tick(double fps, double vps, int scale, int msaa) {
-    static int enabled = -1;
-    if (enabled < 0) enabled = getenv("SETO_PERF_LOG") != NULL;
-    if (!enabled) return;
+    if (!g_seto_perf_enabled) return;
 
     static ULONGLONG last_flush;
     static FILE *perf_fp;

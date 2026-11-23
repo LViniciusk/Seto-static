@@ -58,6 +58,17 @@ static uint32_t g_prod_lru;
 static uint32_t g_tex_list_gen = 1u;
 static int g_last_tex_slot = -1;
 
+#define GE_TEX_HASH_BUCKETS 512
+#define GE_TEX_HASH_MASK    (GE_TEX_HASH_BUCKETS - 1)
+static int16_t g_tex_bucket_head[GE_TEX_HASH_BUCKETS];
+static int16_t g_tex_next[GE_TEX_CACHE_SLOTS];
+static int g_tex_hash_init;
+
+static uint32_t *g_rb_rgba;
+static size_t g_rb_rgba_cap;
+static uint32_t *g_rb_ds;
+static size_t g_rb_ds_cap;
+
 static ge_prod_fbo g_prod_fbos[GE_MAX_FBOS];
 static uint8_t g_fbo_force_new[GE_MAX_FBOS];
 static uint32_t g_fbo_lru;
@@ -140,8 +151,40 @@ static uint32_t ge_tex_byte_span(int bw, int tw, int th, int fmt) {
     return (uint32_t)bytes;
 }
 
+static inline unsigned ge_tex_bucket(uint32_t addr) {
+    return ((addr >> 4) * 2654435761u) & GE_TEX_HASH_MASK;
+}
+
+static void ge_tex_hash_reset(void) {
+    for (int i = 0; i < GE_TEX_HASH_BUCKETS; i++) g_tex_bucket_head[i] = -1;
+    for (int i = 0; i < GE_TEX_CACHE_SLOTS; i++) g_tex_next[i] = -1;
+    g_tex_hash_init = 1;
+}
+
+static void ge_tex_hash_remove(int slot, uint32_t addr) {
+    if (!g_tex_hash_init || slot < 0 || slot >= GE_TEX_CACHE_SLOTS) return;
+    const unsigned b = ge_tex_bucket(addr);
+    int16_t *cur = &g_tex_bucket_head[b];
+    while (*cur >= 0) {
+        if (*cur == slot) {
+            *cur = g_tex_next[slot];
+            g_tex_next[slot] = -1;
+            return;
+        }
+        cur = &g_tex_next[*cur];
+    }
+}
+
+static void ge_tex_hash_insert(int slot, uint32_t addr) {
+    if (!g_tex_hash_init) ge_tex_hash_reset();
+    const unsigned b = ge_tex_bucket(addr);
+    g_tex_next[slot] = g_tex_bucket_head[b];
+    g_tex_bucket_head[b] = (int16_t)slot;
+}
+
 static void ge_prod_cache_reset(void) {
     memset(g_prod_tex, 0, sizeof g_prod_tex);
+    ge_tex_hash_reset();
     g_prod_lru = 0;
     g_last_tex_slot = -1;
     memset(g_prod_fbos, 0, sizeof g_prod_fbos);
@@ -156,6 +199,7 @@ static void ge_invalidate_tex_range(uint32_t addr, uint32_t bytes) {
     for (int i = 0; i < GE_TEX_CACHE_SLOTS; i++) {
         if (!g_prod_tex[i].valid) continue;
         if ((uint64_t)g_prod_tex[i].addr < end && (uint64_t)g_prod_tex[i].end_addr > addr) {
+            ge_tex_hash_remove(i, g_prod_tex[i].addr);
             g_prod_tex[i].valid = 0;
             if (g_last_tex_slot == i) g_last_tex_slot = -1;
         }
@@ -227,24 +271,28 @@ static int ge_sync_fbo_to_vram(int slot) {
     if (w <= 0 || h <= 0) return 0;
 
     const size_t npx = (size_t)w * (size_t)h;
-    uint32_t *rgba = (uint32_t *)malloc(npx * sizeof(uint32_t));
-    if (!rgba) return -1;
-    const int need_ds = f->z_dirty || (f->stencil_written && f->fmt != 0);
-    uint32_t *ds = need_ds ? (uint32_t *)malloc(npx * sizeof(uint32_t)) : NULL;
-    if (need_ds && !ds) {
-        free(rgba);
-        return -1;
+    if (npx > g_rb_rgba_cap) {
+        uint32_t *nb = (uint32_t *)realloc(g_rb_rgba, npx * sizeof(uint32_t));
+        if (!nb) return -1;
+        g_rb_rgba = nb;
+        g_rb_rgba_cap = npx;
     }
+    uint32_t *rgba = g_rb_rgba;
+    const int need_ds = f->z_dirty || (f->stencil_written && f->fmt != 0);
+    if (need_ds && npx > g_rb_ds_cap) {
+        uint32_t *nb = (uint32_t *)realloc(g_rb_ds, npx * sizeof(uint32_t));
+        if (!nb) return -1;
+        g_rb_ds = nb;
+        g_rb_ds_cap = npx;
+    }
+    uint32_t *ds = need_ds ? g_rb_ds : NULL;
 
     const uint64_t t_rb0 = seto_perf_now_us();
     seto_perf_add(&g_seto_perf.p_readbacks, 1);
     const int rb_res = seto_ge_gpu_readback(slot, w, h, rgba, ds);
     seto_perf_add(&g_seto_perf.p_rb_us, seto_perf_now_us() - t_rb0);
-    if (rb_res != 0) {
-        free(ds);
-        free(rgba);
+    if (rb_res != 0)
         return -1;
-    }
 
     const uint32_t bpp = ge_fmt_bpp(f->fmt);
     for (int y = 0; y < h; y++) {
@@ -297,8 +345,6 @@ static int ge_sync_fbo_to_vram(int slot) {
 
     f->dirty = 0;
     f->z_dirty = 0;
-    free(ds);
-    free(rgba);
     return 0;
 }
 
@@ -823,10 +869,11 @@ static int ge_emit_chunk(int prim, const psp_vertex *verts, int nverts,
         return 1;
     }
 
+    if (!g_tex_hash_init) ge_tex_hash_reset();
     const uint32_t taddr = ge_vram_addr(st->tex_addr);
+    const unsigned b = ge_tex_bucket(taddr);
     int hit = -1;
-    int victim = 0;
-    for (int i = 0; i < GE_TEX_CACHE_SLOTS; i++) {
+    for (int i = g_tex_bucket_head[b]; i >= 0; i = g_tex_next[i]) {
         const ge_prod_tex_slot *s = &g_prod_tex[i];
         if (s->valid && s->addr == taddr && s->bw == st->tex_bw &&
             s->w == tw && s->h == th && s->fmt == st->tex_fmt &&
@@ -834,8 +881,6 @@ static int ge_emit_chunk(int prim, const psp_vertex *verts, int nverts,
             hit = i;
             break;
         }
-        if (!g_prod_tex[victim].valid) continue;
-        if (!s->valid || s->lru < g_prod_tex[victim].lru) victim = i;
     }
     if (hit >= 0) {
         if (!seto_ge_gpu_enqueue_draw(prim, verts, nverts, st, fbo_slot,
@@ -854,15 +899,25 @@ static int ge_emit_chunk(int prim, const psp_vertex *verts, int nverts,
         ge_log_draw(prim, nverts, st, tw, th);
         return 1;
     }
+    int victim = 0;
+    for (int i = 0; i < GE_TEX_CACHE_SLOTS; i++) {
+        const ge_prod_tex_slot *s = &g_prod_tex[i];
+        if (!s->valid) { victim = i; break; }
+        if (s->lru < g_prod_tex[victim].lru) victim = i;
+    }
     uint32_t *copy = ge_tex_copy(tex_px, tw, th);
     if (!copy) return 0;
     if (!seto_ge_gpu_enqueue_draw(prim, verts, nverts, st, fbo_slot,
                                   copy, victim, -1, hash, -1)) {
         free(copy);
+        if (g_prod_tex[victim].valid)
+            ge_tex_hash_remove(victim, g_prod_tex[victim].addr);
         g_prod_tex[victim].valid = 0;
         ge_note_reject("queue", prim, nverts, st);
         return 0;
     }
+    if (g_prod_tex[victim].valid)
+        ge_tex_hash_remove(victim, g_prod_tex[victim].addr);
     g_prod_tex[victim].valid = 1;
     g_prod_tex[victim].addr = taddr;
     g_prod_tex[victim].end_addr =
@@ -878,6 +933,7 @@ static int ge_emit_chunk(int prim, const psp_vertex *verts, int nverts,
     g_prod_tex[victim].raw_hash = raw_hash;
     g_prod_tex[victim].hash = hash;
     g_prod_tex[victim].lru = ++g_prod_lru;
+    ge_tex_hash_insert(victim, taddr);
     g_last_tex_slot = victim;
     ge_log_draw(prim, nverts, st, tw, th);
     return 1;
@@ -1057,8 +1113,9 @@ static void ge_draw(int prim, const psp_vertex *v, int count,
                         pre_hit_slot = g_last_tex_slot;
                     }
                 }
-                if (pre_hit_slot < 0) {
-                    for (int i = 0; i < GE_TEX_CACHE_SLOTS; i++) {
+                if (pre_hit_slot < 0 && g_tex_hash_init) {
+                    const unsigned b = ge_tex_bucket(taddr);
+                    for (int i = g_tex_bucket_head[b]; i >= 0; i = g_tex_next[i]) {
                         const ge_prod_tex_slot *s = &g_prod_tex[i];
                         if (s->valid && s->valid_gen == g_tex_list_gen &&
                             s->addr == taddr && s->bw == st->tex_bw &&
@@ -1094,8 +1151,9 @@ static void ge_draw(int prim, const psp_vertex *v, int count,
                             pre_hit_slot = g_last_tex_slot;
                         }
                     }
-                    if (pre_hit_slot < 0) {
-                        for (int i = 0; i < GE_TEX_CACHE_SLOTS; i++) {
+                    if (pre_hit_slot < 0 && g_tex_hash_init) {
+                        const unsigned b = ge_tex_bucket(taddr);
+                        for (int i = g_tex_bucket_head[b]; i >= 0; i = g_tex_next[i]) {
                             const ge_prod_tex_slot *s = &g_prod_tex[i];
                             if (s->valid && s->has_raw_hash && s->addr == taddr &&
                                 s->bw == st->tex_bw && s->w == st->tex_w &&

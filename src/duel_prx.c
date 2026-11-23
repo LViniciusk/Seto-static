@@ -381,15 +381,17 @@ int psp_duel_start(uint32_t uid, uint32_t status_ptr) {
         psp_cpu.r[PSP_REG_A0] = psp_arg(1);
         psp_cpu.r[PSP_REG_A1] = psp_arg(2);
         if (m->entry < 0x80000000u) {
+            static int trace_mod = -1;
+            if (trace_mod < 0) trace_mod = getenv("SETO_TRACE_MODULE") != NULL ? 1 : 0;
             psp_cpu.r[PSP_REG_GP] = m->gp;
             if (m == &g_duel[0]) {
                 atomic_store(&g_duel_mgr_start_requested, 1);
-                if (getenv("SETO_TRACE_MODULE"))
+                if (trace_mod)
                     fprintf(stderr, "module: start '%s' entry=0x%08X\n",
                             m->name, m->entry);
             }
             psp_call_from_host(m->entry);
-            if (getenv("SETO_TRACE_MODULE"))
+            if (trace_mod)
                 fprintf(stderr, "module: start '%s' entry=0x%08X returned 0x%08X\n",
                         m->name, m->entry, psp_cpu.r[PSP_REG_V0]);
         }
@@ -469,8 +471,10 @@ void duel_import_forward(uint32_t nid) {
             psp_cpu.r[PSP_REG_GP] = gp;
 #ifdef HAVE_TF3ENG_CORPUS
             static int b25_probe_done;
+            static int test_b25 = -1;
+            if (test_b25 < 0) test_b25 = getenv("SETO_TEST_B25") != NULL ? 1 : 0;
             if (!b25_probe_done && addr == 0x030136A0u && trace_a0 == 24u &&
-                getenv("SETO_TEST_B25")) {
+                test_b25) {
                 b25_probe_done = 1;
                 const uint32_t kind = psp_read32(0x03848518u);
                 const uint32_t count = psp_read32(0x03848520u);
@@ -505,8 +509,10 @@ void duel_import_forward(uint32_t nid) {
             duel_check_scene_mode(nid, trace_ra, psp_cpu.r[PSP_REG_V0]);
         }
 #ifdef HAVE_TF3ENG_CORPUS
+        static int trace_selraw = -1;
+        if (trace_selraw < 0) trace_selraw = getenv("SETO_TRACE_SELRAW") != NULL ? 1 : 0;
         if (nid == 0x9992B977u && trace_ra == 0x03015F84u && trace_a0 < 512u &&
-            getenv("SETO_TRACE_SELRAW")) {
+            trace_selraw) {
             const uint32_t returned = psp_cpu.r[PSP_REG_V0];
             const uint32_t entry = 0x03848528u + 4u * trace_a0;
             const uint32_t raw = psp_read16(entry);
@@ -622,7 +628,9 @@ void duel_import_forward(uint32_t nid) {
                 }
                 if (nid == 0xACB25738u && trace_a0 != 1u) {
                     static unsigned draw_evt_cnt;
-                    if (draw_evt_cnt < 80u || getenv("SETO_ABI_TRACE_VISUAL")) {
+                    static int trace_vis = -1;
+                    if (trace_vis < 0) trace_vis = getenv("SETO_ABI_TRACE_VISUAL") != NULL ? 1 : 0;
+                    if (draw_evt_cnt < 80u || trace_vis) {
                         draw_evt_cnt++;
                         fprintf(stderr, "[DRAW_EVT %llu] a0=%u a1=0x%X a2=0x%X a3=0x%X -> v0=0x%X\n",
                                 (unsigned long long)psp_display_vblanks(),
