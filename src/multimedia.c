@@ -9,6 +9,7 @@
 #include <psprecomp/recomp_rt.h>
 
 #include "gl_present.h"
+#include "seto_os.h"
 
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -17,8 +18,11 @@
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 
-#include <windows.h>
+#ifdef _WIN32
 #include <mmsystem.h>
+#else
+#include <SDL2/SDL.h>
+#endif
 
 #include <stdint.h>
 #include <stdio.h>
@@ -42,15 +46,21 @@ typedef struct {
     int32_t    vol_r;
     uint64_t   due_us;
 
+#ifdef _WIN32
     HWAVEOUT   hwo;
     WAVEHDR    hdrs[AUDIO_HDR_COUNT];
     uint8_t   *bufs[AUDIO_HDR_COUNT];
     int        hdr_init;
     int        next_hdr;
+#else
+    SDL_AudioDeviceID dev;
+    int16_t   *mix_buf;
+    uint32_t   mix_cap_samples;
+#endif
 } audio_ch_state;
 
 static audio_ch_state g_aud[AUDIO_CHANNELS];
-static CRITICAL_SECTION g_aud_cs;
+static seto_mutex_t g_aud_cs;
 static int g_aud_cs_init;
 
 static int audio_headless(void) {
@@ -59,6 +69,7 @@ static int audio_headless(void) {
     return cached;
 }
 
+#ifdef _WIN32
 static void audio_close_ch(audio_ch_state *c) {
     if (!c->hwo) return;
     waveOutReset(c->hwo);
@@ -107,6 +118,39 @@ static int audio_ensure_open(audio_ch_state *c) {
     c->next_hdr = 0;
     return 1;
 }
+#else
+static int g_sdl_aud_init;
+
+static void audio_close_ch(audio_ch_state *c) {
+    if (c->dev) {
+        SDL_ClearQueuedAudio(c->dev);
+        SDL_CloseAudioDevice(c->dev);
+        c->dev = 0;
+    }
+    free(c->mix_buf);
+    c->mix_buf = NULL;
+    c->mix_cap_samples = 0;
+}
+
+static int audio_ensure_open(audio_ch_state *c) {
+    if (audio_headless()) return 0;
+    if (c->dev) return 1;
+    if (!g_sdl_aud_init) {
+        if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) return 0;
+        g_sdl_aud_init = 1;
+    }
+    SDL_AudioSpec want;
+    memset(&want, 0, sizeof want);
+    want.freq = 44100;
+    want.format = AUDIO_S16LSB;
+    want.channels = 2;
+    want.samples = 1024;
+    c->dev = SDL_OpenAudioDevice(NULL, 0, &want, NULL, 0);
+    if (!c->dev) return 0;
+    SDL_PauseAudioDevice(c->dev, 0);
+    return 1;
+}
+#endif
 
 static int16_t clamp_s16(int32_t v) {
     if (v > 32767) return 32767;
@@ -126,9 +170,10 @@ static void audio_submit_pcm(int ch, uint32_t buf_addr, int32_t vl, int32_t vr, 
 
     const int max_q = (samples >= 1024u) ? 4 : 8;
 
-    EnterCriticalSection(&g_aud_cs);
+#ifdef _WIN32
+    seto_mutex_lock(&g_aud_cs);
     if (!audio_ensure_open(c)) {
-        LeaveCriticalSection(&g_aud_cs);
+        seto_mutex_unlock(&g_aud_cs);
         return;
     }
 
@@ -140,26 +185,63 @@ static void audio_submit_pcm(int ch, uint32_t buf_addr, int32_t vl, int32_t vr, 
         }
         if ((hdr->dwFlags & WHDR_DONE) && in_flight < max_q) break;
         if (!blocking) {
-            LeaveCriticalSection(&g_aud_cs);
+            seto_mutex_unlock(&g_aud_cs);
             return;
         }
         /* Release both the audio lock and the CPU baton while WinMM plays out
          * a queued buffer, keeping audio locked to 44.1 kHz without stalling video. */
-        LeaveCriticalSection(&g_aud_cs);
+        seto_mutex_unlock(&g_aud_cs);
         psp_threadman_host_sleep_ms(1);
-        EnterCriticalSection(&g_aud_cs);
+        seto_mutex_lock(&g_aud_cs);
         if (!c->reserved || !c->hwo) {
-            LeaveCriticalSection(&g_aud_cs);
+            seto_mutex_unlock(&g_aud_cs);
             return;
         }
         hdr = &c->hdrs[c->next_hdr];
     }
     if (!(hdr->dwFlags & WHDR_DONE)) {
-        LeaveCriticalSection(&g_aud_cs);
+        seto_mutex_unlock(&g_aud_cs);
         return;
     }
 
     int16_t *dst = (int16_t *)hdr->lpData;
+#else
+    seto_mutex_lock(&g_aud_cs);
+    if (!audio_ensure_open(c)) {
+        seto_mutex_unlock(&g_aud_cs);
+        return;
+    }
+    const uint32_t max_q_bytes = (uint32_t)max_q * samples * 4u;
+    for (int wait = 0; wait < 500; wait++) {
+        if (SDL_GetQueuedAudioSize(c->dev) < max_q_bytes) break;
+        if (!blocking) {
+            seto_mutex_unlock(&g_aud_cs);
+            return;
+        }
+        seto_mutex_unlock(&g_aud_cs);
+        psp_threadman_host_sleep_ms(1);
+        seto_mutex_lock(&g_aud_cs);
+        if (!c->reserved || !c->dev) {
+            seto_mutex_unlock(&g_aud_cs);
+            return;
+        }
+    }
+    if (SDL_GetQueuedAudioSize(c->dev) >= max_q_bytes * 2u) {
+        seto_mutex_unlock(&g_aud_cs);
+        return;
+    }
+    if (samples > c->mix_cap_samples) {
+        int16_t *nb = (int16_t *)realloc(c->mix_buf, (size_t)samples * 4u);
+        if (!nb) {
+            seto_mutex_unlock(&g_aud_cs);
+            return;
+        }
+        c->mix_buf = nb;
+        c->mix_cap_samples = samples;
+    }
+    int16_t *dst = c->mix_buf;
+#endif
+
     if (c->format == 0x10u) {
         for (uint32_t i = 0; i < samples; i++) {
             int32_t s = raw[i];
@@ -175,11 +257,15 @@ static void audio_submit_pcm(int ch, uint32_t buf_addr, int32_t vl, int32_t vr, 
         }
     }
 
+#ifdef _WIN32
     hdr->dwFlags &= ~WHDR_DONE;
     hdr->dwBufferLength = samples * 4u;
     waveOutWrite(c->hwo, hdr, sizeof(WAVEHDR));
     c->next_hdr = (c->next_hdr + 1) % AUDIO_HDR_COUNT;
-    LeaveCriticalSection(&g_aud_cs);
+#else
+    SDL_QueueAudio(c->dev, dst, samples * 4u);
+#endif
+    seto_mutex_unlock(&g_aud_cs);
 }
 
 static void hle_audio_ch_reserve(void) {
@@ -202,9 +288,9 @@ static void hle_audio_ch_reserve(void) {
 static void hle_audio_ch_release(void) {
     int32_t ch = (int32_t)psp_arg(0);
     if (ch < 0 || ch >= AUDIO_CHANNELS) { psp_ret(0x80000001u); return; }
-    EnterCriticalSection(&g_aud_cs);
+    seto_mutex_lock(&g_aud_cs);
     audio_close_ch(&g_aud[ch]);
-    LeaveCriticalSection(&g_aud_cs);
+    seto_mutex_unlock(&g_aud_cs);
     g_aud[ch].reserved = 0;
     psp_ret(0);
 }
@@ -1368,7 +1454,7 @@ static void hle_adhoc_ptp_closed(void) {
 
 void seto_multimedia_register(void) {
     if (!g_aud_cs_init) {
-        InitializeCriticalSection(&g_aud_cs);
+        seto_mutex_init(&g_aud_cs);
         g_aud_cs_init = 1;
     }
 
@@ -1441,13 +1527,19 @@ void seto_multimedia_register(void) {
 
 void seto_multimedia_shutdown(void) {
     if (g_aud_cs_init) {
-        EnterCriticalSection(&g_aud_cs);
+        seto_mutex_lock(&g_aud_cs);
         for (int i = 0; i < AUDIO_CHANNELS; i++) {
             audio_close_ch(&g_aud[i]);
             g_aud[i].reserved = 0;
         }
-        LeaveCriticalSection(&g_aud_cs);
+        seto_mutex_unlock(&g_aud_cs);
     }
+#ifndef _WIN32
+    if (g_sdl_aud_init) {
+        SDL_QuitSubSystem(SDL_INIT_AUDIO);
+        g_sdl_aud_init = 0;
+    }
+#endif
     atrac_reset_all();
     mpeg_reset_state();
 }

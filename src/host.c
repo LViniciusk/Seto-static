@@ -14,16 +14,24 @@
 #include <psprecomp/render.h>
 
 #include "gl_present.h"
+#include "seto_os.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#ifdef _WIN32
 #include <mmsystem.h>
 
 /* Request discrete GPU on NVIDIA Optimus / AMD Switchable Graphics laptops. */
 __declspec(dllexport) DWORD NvOptimusEnablement = 0x00000001;
 __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+#else
+#define Sleep(ms)       seto_sleep_ms((uint32_t)(ms))
+#define GetTickCount()  ((uint32_t)seto_ticks_ms())
+typedef uint32_t DWORD;
+uint32_t seto_linux_poll_pad(uint8_t *out_ax, uint8_t *out_ay);
+int      seto_linux_key_t_down(void);
+#endif
 
 extern const psp_render_backend seto_ge_backend;
 
@@ -191,7 +199,7 @@ static void on_budget(void) {
  * SETO_BRINGUP_CAP=<seconds> bounds the run; without it the game keeps running. */
 static unsigned g_cap_seconds;
 
-static DWORD WINAPI bringup_cap(LPVOID unused) {
+static seto_thread_ret_t SETO_THREAD_CALL bringup_cap(seto_thread_arg_t unused) {
     (void)unused;
     Sleep(g_cap_seconds * 1000u);
     char why[64];
@@ -217,6 +225,7 @@ static DWORD WINAPI bringup_cap(LPVOID unused) {
 #define PSP_CTRL_CROSS    0x00004000u
 #define PSP_CTRL_SQUARE   0x00008000u
 
+#ifdef _WIN32
 /* Keyboard state, only while one of our own windows has the foreground, so
  * typing in another application does not drive the game. */
 static SHORT host_key_state(int vk) {
@@ -253,6 +262,18 @@ static uint32_t poll_host_pad(uint8_t *out_ax, uint8_t *out_ay) {
     }
     return fm;
 }
+
+static int host_key_t_down(void) {
+    return (host_key_state('T') & 0x8000) != 0;
+}
+#else
+static uint32_t poll_host_pad(uint8_t *out_ax, uint8_t *out_ay) {
+    return seto_linux_poll_pad(out_ax, out_ay);
+}
+static int host_key_t_down(void) {
+    return seto_linux_key_t_down();
+}
+#endif
 
 #ifdef HAVE_TITLE_CORPUS
 /* Send one menu button until the guest changes the observed cursor or scene
@@ -469,7 +490,7 @@ static void hold_field_input(void) {
             psp_ctrl_set(fm, ax, ay);
         }
         /* T: log every GE primitive of the next frame to stderr. */
-        const int t = (host_key_state('T') & 0x8000) != 0;
+        const int t = host_key_t_down();
         if (t && !t_down) {
             psp_ge_trace_next_frame();
             fprintf(stderr, "input: manual GE trace requested\n");
@@ -1104,7 +1125,7 @@ static void enter_free_duel(void) {
 }
 #endif
 
-static DWORD WINAPI field_state_monitor(LPVOID unused) {
+static seto_thread_ret_t SETO_THREAD_CALL field_state_monitor(seto_thread_arg_t unused) {
     (void)unused;
     uint32_t last = 0xFFFFFFFFu;
     for (;;) {
@@ -1122,7 +1143,7 @@ static DWORD WINAPI field_state_monitor(LPVOID unused) {
 
 /* Deck/card metadata pointers: EBOOT card data base (0x08262B98), EHP buffer
  * global (0x083E4E88) and the parsed EHP table struct (0x080EAE88). */
-static DWORD WINAPI trunk_monitor(LPVOID unused) {
+static seto_thread_ret_t SETO_THREAD_CALL trunk_monitor(seto_thread_arg_t unused) {
     (void)unused;
     while (!psp_exit_requested()) {
         const uint32_t st = psp_read32(0x080EAE88u);
@@ -1152,7 +1173,7 @@ static volatile int g_input_done;
 
 /* Passive frame recorder for the headless runs: the input thread is inside the
  * long classroom/menu loops when the duel starts, so it cannot capture it. */
-static DWORD WINAPI shot_thread(LPVOID unused) {
+static seto_thread_ret_t SETO_THREAD_CALL shot_thread(seto_thread_arg_t unused) {
     (void)unused;
     const char *dir = getenv("SETO_SHOT_DIR");
     if (!dir) return 0;
@@ -1168,7 +1189,7 @@ static DWORD WINAPI shot_thread(LPVOID unused) {
 /* Headless duel detector: the duel HUD is the only screen with the blue LP
  * bar at (216,10), the red bar at (403,10) and a black field at (236,187).
  * On that signature, trace the next GE lists and capture the frame. */
-static DWORD WINAPI duel_detect_thread(LPVOID unused) {
+static seto_thread_ret_t SETO_THREAD_CALL duel_detect_thread(seto_thread_arg_t unused) {
     (void)unused;
     static uint32_t px[480 * 272];
     for (int i = 0; !psp_exit_requested(); i++) {
@@ -1213,7 +1234,7 @@ static DWORD WINAPI duel_detect_thread(LPVOID unused) {
 
 /* Per-second FPS/VPS for headless runs; the window title shows the same
  * counters. */
-static DWORD WINAPI fps_log_thread(LPVOID unused) {
+static seto_thread_ret_t SETO_THREAD_CALL fps_log_thread(seto_thread_arg_t unused) {
     (void)unused;
     uint64_t lf = psp_display_frames(), lv = psp_display_vblanks();
     DWORD lt = GetTickCount();
@@ -1230,7 +1251,7 @@ static DWORD WINAPI fps_log_thread(LPVOID unused) {
     return 0;
 }
 
-static DWORD WINAPI input_thread(LPVOID unused) {
+static seto_thread_ret_t SETO_THREAD_CALL input_thread(seto_thread_arg_t unused) {
     (void)unused;
     const char *auto_start = getenv("SETO_AUTO_START");
     int sent = 0;
@@ -2415,7 +2436,9 @@ int main(int argc, char **argv) {
 #ifdef HAVE_TF3ENG_CORPUS
     gx_runtime_init();
 #endif
+#ifdef _WIN32
     timeBeginPeriod(1);
+#endif
 
     psp_module m;
     if (psp_module_load(elf, MODULE_SPAN, &m) != 0) {
@@ -2589,22 +2612,25 @@ int main(int argc, char **argv) {
         psp_render_set_backend(&seto_ge_backend);
         fprintf(stderr, "render: GL GE frontend active\n");
     }
-    CreateThread(NULL, 0, input_thread, NULL, 0, NULL);
-    if (getenv("SETO_SHOT_DIR"))
-        CreateThread(NULL, 0, shot_thread, NULL, 0, NULL);
-    if (getenv("SETO_DUEL_DETECT"))
-        CreateThread(NULL, 0, duel_detect_thread, NULL, 0, NULL);
-    if (getenv("SETO_FPS_LOG"))
-        CreateThread(NULL, 0, fps_log_thread, NULL, 0, NULL);
-    if (getenv("SETO_TRACE_FIELD"))
-        CreateThread(NULL, 0, field_state_monitor, NULL, 0, NULL);
-    if (getenv("SETO_TRACE_TRUNK"))
-        CreateThread(NULL, 0, trunk_monitor, NULL, 0, NULL);
-    const char *cap = getenv("SETO_BRINGUP_CAP");
-    if (cap && atoi(cap) > 0) {
-        g_cap_seconds = (unsigned)atoi(cap);
-        printf("bring-up cap %u s\n", g_cap_seconds);
-        CreateThread(NULL, 0, bringup_cap, NULL, 0, NULL);
+    {
+        seto_thread_t th;
+        if (seto_thread_create(&th, input_thread, NULL) == 0) seto_thread_detach(th);
+        if (getenv("SETO_SHOT_DIR") && seto_thread_create(&th, shot_thread, NULL) == 0)
+            seto_thread_detach(th);
+        if (getenv("SETO_DUEL_DETECT") && seto_thread_create(&th, duel_detect_thread, NULL) == 0)
+            seto_thread_detach(th);
+        if (getenv("SETO_FPS_LOG") && seto_thread_create(&th, fps_log_thread, NULL) == 0)
+            seto_thread_detach(th);
+        if (getenv("SETO_TRACE_FIELD") && seto_thread_create(&th, field_state_monitor, NULL) == 0)
+            seto_thread_detach(th);
+        if (getenv("SETO_TRACE_TRUNK") && seto_thread_create(&th, trunk_monitor, NULL) == 0)
+            seto_thread_detach(th);
+        const char *cap = getenv("SETO_BRINGUP_CAP");
+        if (cap && atoi(cap) > 0) {
+            g_cap_seconds = (unsigned)atoi(cap);
+            printf("bring-up cap %u s\n", g_cap_seconds);
+            if (seto_thread_create(&th, bringup_cap, NULL) == 0) seto_thread_detach(th);
+        }
     }
 
     uint32_t r = psp_module_start(&m);
@@ -2622,7 +2648,9 @@ int main(int argc, char **argv) {
     seto_window_stop();
     seto_multimedia_shutdown();
     seto_net_shutdown();
+#ifdef _WIN32
     timeEndPeriod(1);
+#endif
     report("run ended");
     return 0;
 }

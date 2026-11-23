@@ -8,13 +8,22 @@
 #include "gl_present.h"
 #include "ge_queue.h"
 #include "perf_mon.h"
+#include "seto_os.h"
 
 #include <psprecomp/mem.h>
-#include <windows.h>
+#ifdef _WIN32
 #include <gdiplus.h>
 #include <GL/gl.h>
 #include <GL/glext.h>
 #include <GL/wglext.h>
+#else
+#include <SDL2/SDL.h>
+#include <GL/gl.h>
+#include <GL/glext.h>
+#include <png.h>
+#include <dirent.h>
+#include <unistd.h>
+#endif
 
 #include <ctype.h>
 #include <stdatomic.h>
@@ -91,26 +100,29 @@
 #define GL_TIMEOUT_IGNORED 0xFFFFFFFFFFFFFFFFULL
 #endif
 
-static HWND g_hwnd;
+static seto_native_window g_hwnd;
+#ifdef _WIN32
 static HDC g_dc;
 static HGLRC g_ctx;
+static PFNWGLSWAPINTERVALEXTPROC g_swap_interval;
+static ULONG_PTR g_gdiplus_token;
+static int g_gdiplus_ready;
+#else
+static SDL_GLContext g_ctx;
+#endif
 static int g_active;
 static int g_filter;
 static int g_post_filter;
 static GLuint g_prog, g_vao, g_vbo, g_tex;
 static GLint g_u_tex, g_u_texel, g_u_mode, g_u_flip, g_u_post, g_u_overlay;
-static PFNWGLSWAPINTERVALEXTPROC g_swap_interval;
 
-static CRITICAL_SECTION g_ovl_lock;
+static seto_mutex_t g_ovl_lock;
 static int g_ovl_lock_ready;
 static GLuint g_ovl_tex;
 static int g_ovl_tex_w, g_ovl_tex_h;
 static uint32_t *g_ovl_px;
 static size_t g_ovl_cap;
 static int g_ovl_x, g_ovl_y, g_ovl_w, g_ovl_h, g_ovl_dirty;
-
-static ULONG_PTR g_gdiplus_token;
-static int g_gdiplus_ready;
 
 static PFNGLCREATESHADERPROC p_glCreateShader;
 static PFNGLSHADERSOURCEPROC p_glShaderSource;
@@ -187,14 +199,22 @@ typedef struct {
     GLuint   msaa_depth_rb;
 } ge_gpu_fbo;
 
+#ifdef _WIN32
 static HGLRC g_ge_ctx;
-static HANDLE g_ge_thread;
-static HANDLE g_ge_ready;
-static HANDLE g_ge_wake;
-static HANDLE g_ge_rb_done;
-static volatile LONG g_ge_quit;
-static CRITICAL_SECTION g_ge_lock;
-static CRITICAL_SECTION g_ge_rb_lock;
+#else
+static SDL_GLContext g_ge_ctx;
+#endif
+static seto_thread_t g_ge_thread;
+static int g_ge_thread_ok;
+static seto_event_t g_ge_ready;
+static int g_ge_ready_ok;
+static seto_event_t g_ge_wake;
+static int g_ge_wake_ok;
+static seto_event_t g_ge_rb_done;
+static int g_ge_rb_done_ok;
+static atomic_int g_ge_quit;
+static seto_mutex_t g_ge_lock;
+static seto_mutex_t g_ge_rb_lock;
 static int g_ge_lock_ready;
 static int g_ge_rb_lock_ready;
 static int g_ge_active;
@@ -474,6 +494,7 @@ static const float verts[] = {
      1.0f,  1.0f, 1.0f, 0.0f
 };
 
+#ifdef _WIN32
 #define SETO_GL_LOAD(type, name)                                                   \
     do {                                                                      \
         p_##name = (type)wglGetProcAddress(#name);                            \
@@ -495,6 +516,21 @@ static const float verts[] = {
             if (glmod) p_##name = (type)GetProcAddress(glmod, #name);         \
         }                                                                     \
     } while (0)
+#else
+#define SETO_GL_LOAD(type, name)                                                   \
+    do {                                                                      \
+        p_##name = (type)SDL_GL_GetProcAddress(#name);                        \
+        if (!p_##name) {                                                      \
+            fprintf(stderr, "gl: missing %s\n", #name);                       \
+            return 0;                                                         \
+        }                                                                     \
+    } while (0)
+
+#define SETO_GL_LOAD_OPT(type, name)                                               \
+    do {                                                                      \
+        p_##name = (type)SDL_GL_GetProcAddress(#name);                        \
+    } while (0)
+#endif
 
 static int load_gl(void) {
     SETO_GL_LOAD(PFNGLCREATESHADERPROC, glCreateShader);
@@ -1479,6 +1515,7 @@ static int ge_is_full_clear(const ge_cmd *c, const ge_gpu_fbo *f) {
     return area2 >= 2LL * (int64_t)(bx1 - bx0) * (int64_t)(by1 - by0);
 }
 
+#ifdef _WIN32
 static int ge_gdiplus_start_once(void) {
     if (g_gdiplus_ready) return 1;
     GdiplusStartupInput in = {0};
@@ -1494,7 +1531,7 @@ static void ge_dump_tex_png(uint64_t hash, const uint32_t *rgba, int w, int h) {
     for (int i = 0; i < g_dumped_count; i++) {
         if (g_dumped_hashes[i] == hash) return;
     }
-    CreateDirectoryA(dir, NULL);
+    seto_mkdir(dir);
     char path[320];
     snprintf(path, sizeof path, "%s/%016llx.png", dir, (unsigned long long)hash);
     WCHAR wpath[320];
@@ -1522,6 +1559,97 @@ static void ge_dump_tex_png(uint64_t hash, const uint32_t *rgba, int w, int h) {
     free(bgra);
     if (g_dumped_count < 2048) g_dumped_hashes[g_dumped_count++] = hash;
 }
+#else
+static int ge_hd_resolve_ci_path(const char *path, char *out, size_t out_cap) {
+    struct stat st;
+    if (!path || !path[0] || !out || out_cap == 0) return 0;
+    if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
+        snprintf(out, out_cap, "%s", path);
+        return 1;
+    }
+    /* Case-insensitive component resolution for packs authored on Windows. */
+    char cur[640];
+    const char *rel = path;
+    cur[0] = '\0';
+    if (path[0] == '/') {
+        snprintf(cur, sizeof cur, "/");
+        rel = path + 1;
+    }
+    char copy[640];
+    snprintf(copy, sizeof copy, "%s", rel);
+    char *savep = NULL;
+    char *tok = strtok_r(copy, "/", &savep);
+    while (tok) {
+        char next[640];
+        if (!tok[0]) { tok = strtok_r(NULL, "/", &savep); continue; }
+        if (cur[0] && cur[strlen(cur) - 1] != '/')
+            snprintf(next, sizeof next, "%s/%s", cur, tok);
+        else
+            snprintf(next, sizeof next, "%s%s", cur, tok);
+        if (stat(next, &st) == 0) {
+            snprintf(cur, sizeof cur, "%s", next);
+        } else {
+            const char *dirp = cur[0] ? cur : ".";
+            DIR *d = opendir(dirp);
+            if (!d) return 0;
+            int found = 0;
+            struct dirent *de;
+            while ((de = readdir(d)) != NULL) {
+                if (strcasecmp(de->d_name, tok) == 0) {
+                    if (cur[0] && cur[strlen(cur) - 1] != '/')
+                        snprintf(next, sizeof next, "%s/%s", cur, de->d_name);
+                    else
+                        snprintf(next, sizeof next, "%s%s", cur, de->d_name);
+                    snprintf(cur, sizeof cur, "%s", next);
+                    found = 1;
+                    break;
+                }
+            }
+            closedir(d);
+            if (!found) return 0;
+        }
+        tok = strtok_r(NULL, "/", &savep);
+    }
+    if (stat(cur, &st) == 0 && S_ISREG(st.st_mode)) {
+        snprintf(out, out_cap, "%s", cur);
+        return 1;
+    }
+    return 0;
+}
+
+static void ge_dump_tex_png(uint64_t hash, const uint32_t *rgba, int w, int h) {
+    const char *dir = ge_dump_tex_dir_env();
+    if (!dir || !dir[0] || !hash || !rgba || w <= 0 || h <= 0) return;
+    for (int i = 0; i < g_dumped_count; i++) {
+        if (g_dumped_hashes[i] == hash) return;
+    }
+    seto_mkdir(dir);
+    char path[320];
+    snprintf(path, sizeof path, "%s/%016llx.png", dir, (unsigned long long)hash);
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        if (g_dumped_count < 2048) g_dumped_hashes[g_dumped_count++] = hash;
+        return;
+    }
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return;
+    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    png_infop info = png ? png_create_info_struct(png) : NULL;
+    if (png && info && setjmp(png_jmpbuf(png)) == 0) {
+        png_init_io(png, fp);
+        png_set_IHDR(png, info, (png_uint_32)w, (png_uint_32)h, 8,
+                     PNG_COLOR_TYPE_RGBA, PNG_INTERLACE_NONE,
+                     PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+        png_write_info(png, info);
+        for (int y = 0; y < h; y++)
+            png_write_row(png, (png_const_bytep)(rgba + (size_t)y * (size_t)w));
+        png_write_end(png, NULL);
+    }
+    if (png) png_destroy_write_struct(&png, info ? &info : NULL);
+    fclose(fp);
+    if (g_dumped_count < 2048) g_dumped_hashes[g_dumped_count++] = hash;
+}
+#endif
 
 static int ge_load_ppm_rgba(const char *path, uint32_t **out_px, int *out_w, int *out_h) {
     FILE *f = fopen(path, "rb");
@@ -1561,6 +1689,7 @@ static int ge_load_ppm_rgba(const char *path, uint32_t **out_px, int *out_w, int
     return 1;
 }
 
+#ifdef _WIN32
 static int ge_load_png_rgba(const char *path, uint32_t **out_px, int *out_w, int *out_h) {
     WCHAR wpath[520];
     if (!path || !path[0] || !out_px || !out_w || !out_h) return 0;
@@ -1604,6 +1733,67 @@ static int ge_load_png_rgba(const char *path, uint32_t **out_px, int *out_w, int
     GdipDisposeImage((GpImage *)bmp);
     return 0;
 }
+#else
+static int ge_load_png_rgba(const char *path, uint32_t **out_px, int *out_w, int *out_h) {
+    char resolved[640];
+    if (!path || !path[0] || !out_px || !out_w || !out_h) return 0;
+    if (!ge_hd_resolve_ci_path(path, resolved, sizeof resolved)) return 0;
+    FILE *fp = fopen(resolved, "rb");
+    if (!fp) return 0;
+    uint8_t sig[8];
+    if (fread(sig, 1, 8, fp) != 8 || png_sig_cmp(sig, 0, 8) != 0) {
+        fclose(fp);
+        return 0;
+    }
+    png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    png_infop info = png ? png_create_info_struct(png) : NULL;
+    uint32_t *px = NULL;
+    png_bytep *rows = NULL;
+    int w = 0, h = 0, ok = 0;
+    if (png && info && setjmp(png_jmpbuf(png)) == 0) {
+        png_init_io(png, fp);
+        png_set_sig_bytes(png, 8);
+        png_read_info(png, info);
+        png_uint_32 uw = png_get_image_width(png, info);
+        png_uint_32 uh = png_get_image_height(png, info);
+        int bit_depth = png_get_bit_depth(png, info);
+        int color_type = png_get_color_type(png, info);
+        if (uw > 0 && uh > 0 && (int)uw <= g_ge_max_dim && (int)uh <= g_ge_max_dim) {
+            if (color_type == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png);
+            if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8)
+                png_set_expand_gray_1_2_4_to_8(png);
+            if (png_get_valid(png, info, PNG_INFO_tRNS)) png_set_tRNS_to_alpha(png);
+            if (bit_depth == 16) png_set_strip_16(png);
+            if (color_type == PNG_COLOR_TYPE_GRAY || color_type == PNG_COLOR_TYPE_GRAY_ALPHA)
+                png_set_gray_to_rgb(png);
+            if (!(color_type & PNG_COLOR_MASK_ALPHA))
+                png_set_filler(png, 0xFF, PNG_FILLER_AFTER);
+            png_read_update_info(png, info);
+            w = (int)uw;
+            h = (int)uh;
+            px = (uint32_t *)malloc((size_t)w * (size_t)h * 4u);
+            rows = (png_bytep *)malloc((size_t)h * sizeof(png_bytep));
+            if (px && rows) {
+                for (int y = 0; y < h; y++)
+                    rows[y] = (png_bytep)(px + (size_t)y * (size_t)w);
+                png_read_image(png, rows);
+                ok = 1;
+            }
+        }
+    }
+    free(rows);
+    if (png) png_destroy_read_struct(&png, info ? &info : NULL, NULL);
+    fclose(fp);
+    if (ok) {
+        *out_px = px;
+        *out_w = w;
+        *out_h = h;
+        return 1;
+    }
+    free(px);
+    return 0;
+}
+#endif
 
 /* ---- PPSSPP textures.ini / 24-hex hash pack support --------------------- */
 
@@ -1638,7 +1828,7 @@ typedef struct {
 
 #define GE_HD_FNV_CACHE_CAP 4096u
 
-static CRITICAL_SECTION g_hd_ini_lock;
+static seto_mutex_t g_hd_ini_lock;
 static int              g_hd_ini_lock_ready;
 static int              g_hd_ini_parsed;
 static int              g_hd_ini_active;
@@ -2011,9 +2201,28 @@ static void ge_hd_ini_load_once(const char *env_dir) {
     char ini_path[440];
     snprintf(ini_path, sizeof ini_path, "%s/textures.ini", g_hd_base_dir);
     FILE *f = fopen(ini_path, "rb");
+#ifndef _WIN32
+    if (!f) {
+        char ci_ini[640];
+        if (ge_hd_resolve_ci_path(ini_path, ci_ini, sizeof ci_ini))
+            f = fopen(ci_ini, "rb");
+    }
+#endif
     if (!f) {
         snprintf(ini_path, sizeof ini_path, "%s/ULUS10136/textures.ini", env_dir);
         f = fopen(ini_path, "rb");
+#ifndef _WIN32
+        if (!f) {
+            char ci_ini[640];
+            if (ge_hd_resolve_ci_path(ini_path, ci_ini, sizeof ci_ini)) {
+                f = fopen(ci_ini, "rb");
+                if (f) {
+                    char *sl = strrchr(ci_ini, '/');
+                    if (sl) { *sl = '\0'; snprintf(g_hd_base_dir, sizeof g_hd_base_dir, "%s", ci_ini); }
+                }
+            }
+        } else
+#endif
         if (f)
             snprintf(g_hd_base_dir, sizeof g_hd_base_dir, "%s/ULUS10136", env_dir);
     }
@@ -2118,6 +2327,7 @@ static void ge_hd_ini_load_once(const char *env_dir) {
     }
 
     /* Also scan g_hd_base_dir for direct <24-hex>.png filenames. */
+#ifdef _WIN32
     char pattern[440];
     snprintf(pattern, sizeof pattern, "%s/*.png", g_hd_base_dir);
     WIN32_FIND_DATAA fd;
@@ -2140,6 +2350,27 @@ static void ge_hd_ini_load_once(const char *env_dir) {
         } while (FindNextFileA(hfind, &fd));
         FindClose(hfind);
     }
+#else
+    DIR *dh_dir = opendir(g_hd_base_dir);
+    if (dh_dir) {
+        struct dirent *de;
+        while ((de = readdir(dh_dir)) != NULL) {
+            size_t flen = strlen(de->d_name);
+            if (flen == 28u && _stricmp(de->d_name + 24, ".png") == 0) {
+                char hex24[25];
+                memcpy(hex24, de->d_name, 24);
+                hex24[24] = '\0';
+                uint64_t ck = 0;
+                uint32_t dh = 0;
+                if (ge_parse_hex24(hex24, &ck, &dh) && ge_hd_table_get(ck, dh) == -1) {
+                    int32_t poff = ge_hd_pool_append(de->d_name);
+                    if (poff >= 0) ge_hd_table_put(ck, dh, poff);
+                }
+            }
+        }
+        closedir(dh_dir);
+    }
+#endif
 
     if (g_hd_ini_count > 0u) {
         g_hd_ini_active = 1;
@@ -2312,7 +2543,7 @@ static int32_t ge_hd_resolve_texture(uint64_t fnv_hash, const psp_draw_state *st
     if (!dir || !dir[0] || !fnv_hash || !st || !g_hd_ini_lock_ready) return -1;
 
     int32_t path_off = -1;
-    EnterCriticalSection(&g_hd_ini_lock);
+    seto_mutex_lock(&g_hd_ini_lock);
     ge_hd_ini_load_once(dir);
     if (g_hd_ini_active) {
         const uint32_t slot = (uint32_t)(fnv_hash ^ (fnv_hash >> 32)) & (GE_HD_FNV_CACHE_CAP - 1u);
@@ -2323,7 +2554,7 @@ static int32_t ge_hd_resolve_texture(uint64_t fnv_hash, const psp_draw_state *st
         }
         path_off = g_hd_fnv_cache[slot].path_off;
     }
-    LeaveCriticalSection(&g_hd_ini_lock);
+    seto_mutex_unlock(&g_hd_ini_lock);
     seto_perf_add(&g_seto_perf.p_hd_us, seto_perf_now_us() - t0);
     return path_off;
 }
@@ -2333,7 +2564,7 @@ int32_t seto_ge_card_front_path(uint32_t texture_addr) {
         return -1;
 
     int32_t path = -1;
-    EnterCriticalSection(&g_hd_ini_lock);
+    seto_mutex_lock(&g_hd_ini_lock);
     ge_hd_ini_load_once(ge_hd_tex_dir_env());
     if (g_hd_has_card_fronts) {
         const size_t bytes = 4096 - 128;
@@ -2342,7 +2573,7 @@ int32_t seto_ge_card_front_path(uint32_t texture_addr) {
             path = ge_hd_table_get(GE_HD_CARD_FRONT_KEY,
                                    (uint32_t)ge_xxh64(data, bytes, 0xBACD7814u));
     }
-    LeaveCriticalSection(&g_hd_ini_lock);
+    seto_mutex_unlock(&g_hd_ini_lock);
     return path;
 }
 
@@ -2365,18 +2596,19 @@ typedef struct {
 
 static ge_hd_async_job g_hd_async_jobs[GE_HD_ASYNC_JOBS];
 static uint64_t g_hd_async_seq;
-static CRITICAL_SECTION g_hd_async_lock;
-static CONDITION_VARIABLE g_hd_async_cv;
-static HANDLE g_hd_worker_thread;
+static seto_mutex_t g_hd_async_lock;
+static seto_cond_t g_hd_async_cv;
+static seto_thread_t g_hd_worker_thread;
+static int g_hd_async_worker_ok;
 static int g_hd_async_init;
 static int g_hd_async_stop;
 
-static DWORD WINAPI ge_hd_worker_proc(LPVOID arg) {
+static seto_thread_ret_t SETO_THREAD_CALL ge_hd_worker_proc(seto_thread_arg_t arg) {
     (void)arg;
     for (;;) {
         char path[640];
         int job_idx = -1;
-        EnterCriticalSection(&g_hd_async_lock);
+        seto_mutex_lock(&g_hd_async_lock);
         while (!g_hd_async_stop) {
             for (int i = 0; i < GE_HD_ASYNC_JOBS; i++) {
                 if (g_hd_async_jobs[i].state == GE_HD_JOB_PENDING) {
@@ -2387,20 +2619,20 @@ static DWORD WINAPI ge_hd_worker_proc(LPVOID arg) {
                 }
             }
             if (job_idx >= 0) break;
-            SleepConditionVariableCS(&g_hd_async_cv, &g_hd_async_lock, INFINITE);
+            seto_cond_wait(&g_hd_async_cv, &g_hd_async_lock);
         }
         if (g_hd_async_stop) {
-            LeaveCriticalSection(&g_hd_async_lock);
+            seto_mutex_unlock(&g_hd_async_lock);
             return 0;
         }
-        LeaveCriticalSection(&g_hd_async_lock);
+        seto_mutex_unlock(&g_hd_async_lock);
 
         uint32_t *pixels = NULL;
         int w = 0, h = 0;
         const int ok = ge_load_png_rgba(path, &pixels, &w, &h) ||
                        ge_load_ppm_rgba(path, &pixels, &w, &h);
 
-        EnterCriticalSection(&g_hd_async_lock);
+        seto_mutex_lock(&g_hd_async_lock);
         if (g_hd_async_stop) {
             free(pixels);
             g_hd_async_jobs[job_idx].pixels = NULL;
@@ -2415,38 +2647,40 @@ static DWORD WINAPI ge_hd_worker_proc(LPVOID arg) {
             g_hd_async_jobs[job_idx].pixels = NULL;
             g_hd_async_jobs[job_idx].state = GE_HD_JOB_FAILED;
         }
-        LeaveCriticalSection(&g_hd_async_lock);
+        seto_mutex_unlock(&g_hd_async_lock);
     }
 }
 
 static void ge_hd_async_ensure_started(void) {
     if (g_hd_async_init) return;
+#ifdef _WIN32
     ge_gdiplus_start_once();
-    InitializeCriticalSection(&g_hd_async_lock);
-    InitializeConditionVariable(&g_hd_async_cv);
+#endif
+    seto_mutex_init(&g_hd_async_lock);
+    seto_cond_init(&g_hd_async_cv);
     memset(g_hd_async_jobs, 0, sizeof g_hd_async_jobs);
     g_hd_async_stop = 0;
-    g_hd_worker_thread = CreateThread(NULL, 0, ge_hd_worker_proc, NULL, 0, NULL);
+    g_hd_async_worker_ok = (seto_thread_create(&g_hd_worker_thread, ge_hd_worker_proc, NULL) == 0);
     g_hd_async_init = 1;
 }
 
 static void ge_hd_async_shutdown(void) {
     if (!g_hd_async_init) return;
-    EnterCriticalSection(&g_hd_async_lock);
+    seto_mutex_lock(&g_hd_async_lock);
     g_hd_async_stop = 1;
-    WakeAllConditionVariable(&g_hd_async_cv);
-    LeaveCriticalSection(&g_hd_async_lock);
-    if (g_hd_worker_thread) {
-        WaitForSingleObject(g_hd_worker_thread, 5000);
-        CloseHandle(g_hd_worker_thread);
-        g_hd_worker_thread = NULL;
+    seto_cond_broadcast(&g_hd_async_cv);
+    seto_mutex_unlock(&g_hd_async_lock);
+    if (g_hd_async_worker_ok) {
+        seto_thread_join(&g_hd_worker_thread, 5000);
+        g_hd_async_worker_ok = 0;
     }
     for (int i = 0; i < GE_HD_ASYNC_JOBS; i++) {
         free(g_hd_async_jobs[i].pixels);
         g_hd_async_jobs[i].pixels = NULL;
         g_hd_async_jobs[i].state = GE_HD_JOB_EMPTY;
     }
-    DeleteCriticalSection(&g_hd_async_lock);
+    seto_cond_destroy(&g_hd_async_cv);
+    seto_mutex_destroy(&g_hd_async_lock);
     g_hd_async_init = 0;
 }
 
@@ -2459,6 +2693,7 @@ static void ge_release_hd_texture(ge_hd_texture *hd) {
 }
 
 static int ge_hd_file_exists(const char *path) {
+#ifdef _WIN32
     WCHAR wpath[520];
     if (!path || !path[0]) return 0;
     if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 520) <= 0 &&
@@ -2466,6 +2701,10 @@ static int ge_hd_file_exists(const char *path) {
         return 0;
     const DWORD attr = GetFileAttributesW(wpath);
     return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) == 0;
+#else
+    char resolved[640];
+    return ge_hd_resolve_ci_path(path, resolved, sizeof resolved);
+#endif
 }
 
 static ge_hd_texture *ge_get_hd_texture_file(const char *path, int allow_async, int *out_pending) {
@@ -2492,8 +2731,8 @@ static ge_hd_texture *ge_get_hd_texture_file(const char *path, int allow_async, 
     if (allow_async) {
         ge_hd_async_ensure_started();
     }
-    if (allow_async && g_hd_worker_thread) {
-        EnterCriticalSection(&g_hd_async_lock);
+    if (allow_async && g_hd_async_worker_ok) {
+        seto_mutex_lock(&g_hd_async_lock);
         int found = -1;
         int empty = -1;
         int evict_failed = -1;
@@ -2520,12 +2759,12 @@ static ge_hd_texture *ge_get_hd_texture_file(const char *path, int allow_async, 
             ge_hd_async_job *job = &g_hd_async_jobs[found];
             if (job->state == GE_HD_JOB_PENDING || job->state == GE_HD_JOB_DECODING) {
                 if (out_pending) *out_pending = 1;
-                LeaveCriticalSection(&g_hd_async_lock);
+                seto_mutex_unlock(&g_hd_async_lock);
                 return NULL;
             }
             if (job->state == GE_HD_JOB_FAILED) {
                 job->state = GE_HD_JOB_EMPTY;
-                LeaveCriticalSection(&g_hd_async_lock);
+                seto_mutex_unlock(&g_hd_async_lock);
                 seto_perf_add(&g_seto_perf.hd_miss_io, 1);
                 seto_perf_add(&g_seto_perf.hd_miss_us, seto_perf_now_us() - t0);
                 return NULL;
@@ -2536,19 +2775,19 @@ static ge_hd_texture *ge_get_hd_texture_file(const char *path, int allow_async, 
                 h = job->h;
                 job->pixels = NULL;
                 job->state = GE_HD_JOB_EMPTY;
-                LeaveCriticalSection(&g_hd_async_lock);
+                seto_mutex_unlock(&g_hd_async_lock);
             } else {
-                LeaveCriticalSection(&g_hd_async_lock);
+                seto_mutex_unlock(&g_hd_async_lock);
                 return NULL;
             }
         } else {
-            LeaveCriticalSection(&g_hd_async_lock);
+            seto_mutex_unlock(&g_hd_async_lock);
             if (!ge_hd_file_exists(path)) {
                 seto_perf_add(&g_seto_perf.hd_miss_io, 1);
                 seto_perf_add(&g_seto_perf.hd_miss_us, seto_perf_now_us() - t0);
                 return NULL;
             }
-            EnterCriticalSection(&g_hd_async_lock);
+            seto_mutex_lock(&g_hd_async_lock);
             /* Re-scan empty/evict slot in case another state changed while unlocked. */
             empty = -1;
             evict_failed = -1;
@@ -2572,12 +2811,12 @@ static ge_hd_texture *ge_get_hd_texture_file(const char *path, int allow_async, 
                 g_hd_async_jobs[dst].pixels = NULL;
                 g_hd_async_jobs[dst].seq = ++g_hd_async_seq;
                 g_hd_async_jobs[dst].state = GE_HD_JOB_PENDING;
-                WakeConditionVariable(&g_hd_async_cv);
+                seto_cond_signal(&g_hd_async_cv);
                 if (out_pending) *out_pending = 1;
-                LeaveCriticalSection(&g_hd_async_lock);
+                seto_mutex_unlock(&g_hd_async_lock);
                 return NULL;
             }
-            LeaveCriticalSection(&g_hd_async_lock);
+            seto_mutex_unlock(&g_hd_async_lock);
             /* Fallback to synchronous load if all 64 worker slots are actively decoding. */
             if (!ge_load_png_rgba(path, &pixels, &w, &h) &&
                 !ge_load_ppm_rgba(path, &pixels, &w, &h)) {
@@ -2631,12 +2870,12 @@ static ge_hd_texture *ge_get_hd_texture(uint64_t hash, int32_t path_off,
     char ini_rel[260] = "";
     char base_dir[384] = "";
     if (g_hd_ini_lock_ready) {
-        EnterCriticalSection(&g_hd_ini_lock);
+        seto_mutex_lock(&g_hd_ini_lock);
         ge_hd_ini_load_once(dir);
         snprintf(base_dir, sizeof base_dir, "%s", g_hd_base_dir[0] ? g_hd_base_dir : dir);
         if (path_off >= 0 && (size_t)path_off < g_hd_path_len)
             snprintf(ini_rel, sizeof ini_rel, "%s", g_hd_path_pool + path_off);
-        LeaveCriticalSection(&g_hd_ini_lock);
+        seto_mutex_unlock(&g_hd_ini_lock);
     } else {
         snprintf(base_dir, sizeof base_dir, "%s", dir);
     }
@@ -3478,7 +3717,7 @@ static int ge_make_target(int w, int h) {
 }
 
 static void ge_free_gl(void) {
-    EnterCriticalSection(&g_ge_lock);
+    seto_mutex_lock(&g_ge_lock);
     if (p_glDeleteSync) {
         if (g_ge_front_sync) { p_glDeleteSync(g_ge_front_sync); g_ge_front_sync = NULL; }
         if (g_present_read_sync) { p_glDeleteSync(g_present_read_sync); g_present_read_sync = NULL; }
@@ -3486,7 +3725,7 @@ static void ge_free_gl(void) {
     atomic_store_explicit(&g_ge_gpu_frame_ready, 0, memory_order_release);
     atomic_store_explicit(&g_ge_front_seq, 0u, memory_order_release);
     atomic_store_explicit(&g_present_force_redraw, 1, memory_order_release);
-    LeaveCriticalSection(&g_ge_lock);
+    seto_mutex_unlock(&g_ge_lock);
 
     for (int i = 0; i < GE_MAX_FBOS; i++)
         ge_destroy_fbo(&g_ge_fbos[i]);
@@ -3637,12 +3876,12 @@ static void ge_capture_hires_ppm(uint32_t capture_id) {
     const size_t npx = (size_t)g_ge_front_w * (size_t)g_ge_front_h;
     uint32_t *px = (uint32_t *)malloc(npx * sizeof(uint32_t));
     if (!px) return;
-    EnterCriticalSection(&g_ge_lock);
+    seto_mutex_lock(&g_ge_lock);
     p_glBindFramebuffer(GL_FRAMEBUFFER, g_ge_front_fbo);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
     glReadPixels(0, 0, g_ge_front_w, g_ge_front_h, GL_RGBA, GL_UNSIGNED_BYTE, px);
     p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    LeaveCriticalSection(&g_ge_lock);
+    seto_mutex_unlock(&g_ge_lock);
     g_ge_cur_fbo_slot = -1;
     g_ge_cur_is_msaa = 0;
     char path[260];
@@ -3661,7 +3900,7 @@ static void ge_publish_fbo_slot(int slot) {
     const int ch = df->h < GL_SCREEN_H ? df->h : GL_SCREEN_H;
     int fs = g_ge_front_w / GL_SCREEN_W;
     if (fs < 1) fs = 1;
-    EnterCriticalSection(&g_ge_lock);
+    seto_mutex_lock(&g_ge_lock);
     ge_wait_present_read_sync();
     ge_gl_state_invalidate();
     glDisable(GL_SCISSOR_TEST);
@@ -3682,7 +3921,7 @@ static void ge_publish_fbo_slot(int slot) {
     g_ge_have_front = 1;
     g_ge_passthrough_sw = 0;
     ge_record_front_sync();
-    LeaveCriticalSection(&g_ge_lock);
+    seto_mutex_unlock(&g_ge_lock);
     g_ge_cur_fbo_slot = -1;
     g_ge_cur_is_msaa = 0;
 }
@@ -3750,7 +3989,7 @@ static void ge_apply_resize(int new_scale) {
     if (!ge_alloc_front_target(new_scale, &nfbo, &ntex, &fw, &fh))
         return;
 
-    EnterCriticalSection(&g_ge_lock);
+    seto_mutex_lock(&g_ge_lock);
     ge_wait_present_read_sync();
     ge_gl_state_invalidate();
     if (g_ge_have_front && g_ge_front_fbo) {
@@ -3773,7 +4012,7 @@ static void ge_apply_resize(int new_scale) {
     g_ge_w = fw;
     g_ge_h = fh;
     ge_record_front_sync();
-    LeaveCriticalSection(&g_ge_lock);
+    seto_mutex_unlock(&g_ge_lock);
 
     g_ge_scale = new_scale;
     for (int i = 0; i < GE_MAX_FBOS; i++) {
@@ -3978,7 +4217,7 @@ static void ge_readback_cmd(const ge_cmd *c) {
             g_ge_cur_is_msaa = 0;
         }
     }
-    if (g_ge_rb_done) SetEvent(g_ge_rb_done);
+    if (g_ge_rb_done_ok) seto_event_set(&g_ge_rb_done);
 }
 
 static void ge_service_front_readback(void) {
@@ -3986,7 +4225,7 @@ static void ge_service_front_readback(void) {
         return;
     int ok = 0;
     uint32_t tmp[GL_SCREEN_W * GL_SCREEN_H];
-    EnterCriticalSection(&g_ge_lock);
+    seto_mutex_lock(&g_ge_lock);
     if (g_ge_have_front && !g_ge_passthrough_sw && g_ge_front_fbo) {
         if (g_ge_front_w == GL_SCREEN_W && g_ge_front_h == GL_SCREEN_H) {
             p_glBindFramebuffer(GL_FRAMEBUFFER, g_ge_front_fbo);
@@ -4008,7 +4247,7 @@ static void ge_service_front_readback(void) {
         }
         p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
-    LeaveCriticalSection(&g_ge_lock);
+    seto_mutex_unlock(&g_ge_lock);
     g_ge_cur_fbo_slot = -1;
     g_ge_cur_is_msaa = 0;
     if (ok) {
@@ -4020,18 +4259,46 @@ static void ge_service_front_readback(void) {
         }
     }
     g_ge_front_rb_ok = ok;
-    if (g_ge_rb_done) SetEvent(g_ge_rb_done);
+    if (g_ge_rb_done_ok) seto_event_set(&g_ge_rb_done);
 }
 
-static DWORD WINAPI ge_thread(LPVOID unused) {
+static void gl_get_window_size(int *out_w, int *out_h) {
+#ifdef _WIN32
     RECT rc;
+    GetClientRect(g_hwnd, &rc);
+    *out_w = rc.right - rc.left;
+    *out_h = rc.bottom - rc.top;
+#else
+    SDL_GL_GetDrawableSize((SDL_Window *)g_hwnd, out_w, out_h);
+#endif
+}
+
+static void gl_swap_buffers_win(void) {
+#ifdef _WIN32
+    SwapBuffers(g_dc);
+#else
+    SDL_GL_SwapWindow((SDL_Window *)g_hwnd);
+#endif
+}
+
+static int gl_make_ctx_current(int is_ge_ctx) {
+#ifdef _WIN32
+    if (is_ge_ctx < 0) return wglMakeCurrent(NULL, NULL);
+    return wglMakeCurrent(g_dc, is_ge_ctx ? g_ge_ctx : g_ctx);
+#else
+    if (is_ge_ctx < 0) return SDL_GL_MakeCurrent((SDL_Window *)g_hwnd, NULL) == 0;
+    return SDL_GL_MakeCurrent((SDL_Window *)g_hwnd, is_ge_ctx ? g_ge_ctx : g_ctx) == 0;
+#endif
+}
+
+static seto_thread_ret_t SETO_THREAD_CALL ge_thread(seto_thread_arg_t unused) {
     int w, h;
     (void)unused;
 
-    if (!wglMakeCurrent(g_dc, g_ge_ctx)) {
+    if (!gl_make_ctx_current(1)) {
         fprintf(stderr, "gl: GE render context make-current failed\n");
-        SetEvent(g_ge_ready);
-        return 1;
+        seto_event_set(&g_ge_ready);
+        return 0;
     }
 
     if (g_ge_draw_mode) {
@@ -4065,8 +4332,8 @@ static DWORD WINAPI ge_thread(LPVOID unused) {
                 (rs[2] == 't' || rs[2] == 'T') && (rs[3] == 'o' || rs[3] == 'O') &&
                 rs[4] == '\0') {
                 g_ge_auto_scale = 1;
-                GetClientRect(g_hwnd, &rc);
-                g_ge_scale = ge_auto_scale_for_client(rc.right - rc.left, rc.bottom - rc.top);
+                gl_get_window_size(&w, &h);
+                g_ge_scale = ge_auto_scale_for_client(w, h);
             } else {
                 g_ge_scale = ge_clamp_scale(atoi(rs));
             }
@@ -4088,28 +4355,26 @@ static DWORD WINAPI ge_thread(LPVOID unused) {
         if (!ge_make_geo_program() || !ge_make_geo_vao() ||
             !ge_make_front_target(g_ge_scale)) {
             ge_free_gl();
-            wglMakeCurrent(NULL, NULL);
-            SetEvent(g_ge_ready);
-            return 1;
+            gl_make_ctx_current(-1);
+            seto_event_set(&g_ge_ready);
+            return 0;
         }
     } else {
-        GetClientRect(g_hwnd, &rc);
-        w = rc.right - rc.left;
-        h = rc.bottom - rc.top;
+        gl_get_window_size(&w, &h);
         if (w <= 0 || h <= 0) { w = 960; h = 544; }
         if (!ge_make_program() || !ge_make_vao() || !ge_make_target(w, h)) {
             ge_free_gl();
-            wglMakeCurrent(NULL, NULL);
-            SetEvent(g_ge_ready);
-            return 1;
+            gl_make_ctx_current(-1);
+            seto_event_set(&g_ge_ready);
+            return 0;
         }
     }
     g_ge_ok = 1;
-    SetEvent(g_ge_ready);
+    seto_event_set(&g_ge_ready);
 
-    DWORD last_pub = GetTickCount();
+    uint64_t last_pub = seto_ticks_ms();
     int draws_since_present = 0;
-    while (!g_ge_quit) {
+    while (!atomic_load_explicit(&g_ge_quit, memory_order_acquire)) {
         ge_cmd cmd;
         if (g_ge_draw_mode) {
             ge_service_front_readback();
@@ -4194,7 +4459,7 @@ static DWORD WINAPI ge_thread(LPVOID unused) {
                                               GL_SCREEN_W, GL_SCREEN_H);
                         }
                         if (g_ge_front_w == GL_SCREEN_W && g_ge_front_h == GL_SCREEN_H) {
-                            EnterCriticalSection(&g_ge_lock);
+                            seto_mutex_lock(&g_ge_lock);
                             ge_wait_present_read_sync();
                             glBindTexture(GL_TEXTURE_2D, g_ge_front_tex);
                             glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
@@ -4203,7 +4468,7 @@ static DWORD WINAPI ge_thread(LPVOID unused) {
                             g_ge_have_front = 1;
                             g_ge_passthrough_sw = 0;
                             ge_record_front_sync();
-                            LeaveCriticalSection(&g_ge_lock);
+                            seto_mutex_unlock(&g_ge_lock);
                             glBindTexture(GL_TEXTURE_2D, 0);
                         } else if (ge_ensure_stage(GL_SCREEN_W, GL_SCREEN_H)) {
                             glBindTexture(GL_TEXTURE_2D, g_ge_stage_tex);
@@ -4211,7 +4476,7 @@ static DWORD WINAPI ge_thread(LPVOID unused) {
                             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, GL_SCREEN_W, GL_SCREEN_H,
                                             GL_RGBA, GL_UNSIGNED_BYTE, cmd.tex);
                             glBindTexture(GL_TEXTURE_2D, 0);
-                            EnterCriticalSection(&g_ge_lock);
+                            seto_mutex_lock(&g_ge_lock);
                             ge_wait_present_read_sync();
                             glDisable(GL_SCISSOR_TEST);
                             glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
@@ -4224,21 +4489,21 @@ static DWORD WINAPI ge_thread(LPVOID unused) {
                             g_ge_have_front = 1;
                             g_ge_passthrough_sw = 0;
                             ge_record_front_sync();
-                            LeaveCriticalSection(&g_ge_lock);
+                            seto_mutex_unlock(&g_ge_lock);
                             g_ge_cur_fbo_slot = -1;
                             g_ge_cur_is_msaa = 0;
                         }
                         if (cmd.color) ge_capture_hires_ppm(cmd.color);
                         free(cmd.tex);
                     } else {
-                        EnterCriticalSection(&g_ge_lock);
+                        seto_mutex_lock(&g_ge_lock);
                         g_ge_passthrough_sw = 1;
                         atomic_store_explicit(&g_ge_gpu_frame_ready, 0, memory_order_release);
-                        LeaveCriticalSection(&g_ge_lock);
+                        seto_mutex_unlock(&g_ge_lock);
                     }
                     ge_service_front_readback();
                     draws_since_present = 0;
-                    last_pub = GetTickCount();
+                    last_pub = seto_ticks_ms();
                     seto_perf_add(&g_seto_perf.g_pres_us, seto_perf_now_us() - t_p0);
                 } else if (cmd.type == GE_CMD_TEST_COLOR) {
                     g_ge_rgb = cmd.color;
@@ -4256,25 +4521,23 @@ static DWORD WINAPI ge_thread(LPVOID unused) {
             }
             if (draws_since_present > 0 && !g_ge_have_front &&
                 g_ge_cur_fbo_slot >= 0 && g_ge_fbos[g_ge_cur_fbo_slot].used &&
-                GetTickCount() - last_pub >= 250u) {
+                seto_ticks_ms() - last_pub >= 250u) {
                 ge_publish_fbo_slot(g_ge_cur_fbo_slot);
                 draws_since_present = 0;
-                last_pub = GetTickCount();
+                last_pub = seto_ticks_ms();
             }
             ge_service_front_readback();
-            if (g_ge_wake) WaitForSingleObject(g_ge_wake, 4);
-            else Sleep(4);
+            if (g_ge_wake_ok) seto_event_wait_ms(&g_ge_wake, 4);
+            else seto_sleep_ms(4);
             continue;
         }
 
         while (ge_queue_pop(&g_ge_q, &cmd)) {
             if (cmd.type == GE_CMD_TEST_COLOR) g_ge_rgb = cmd.color;
         }
-        GetClientRect(g_hwnd, &rc);
-        w = rc.right - rc.left;
-        h = rc.bottom - rc.top;
+        gl_get_window_size(&w, &h);
         if (w > 0 && h > 0) {
-            EnterCriticalSection(&g_ge_lock);
+            seto_mutex_lock(&g_ge_lock);
             if (w != g_ge_w || h != g_ge_h) ge_make_target(w, h);
             if (g_ge_fbo && g_ge_tex) {
                 p_glBindFramebuffer(GL_FRAMEBUFFER, g_ge_fbo);
@@ -4291,50 +4554,49 @@ static DWORD WINAPI ge_thread(LPVOID unused) {
                 p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
                 glFinish();
             }
-            LeaveCriticalSection(&g_ge_lock);
+            seto_mutex_unlock(&g_ge_lock);
         }
-        Sleep(16);
+        seto_sleep_ms(16);
     }
 
-    if (g_ge_rb_done) SetEvent(g_ge_rb_done);
+    if (g_ge_rb_done_ok) seto_event_set(&g_ge_rb_done);
     ge_free_gl();
-    wglMakeCurrent(NULL, NULL);
+    gl_make_ctx_current(-1);
     return 0;
 }
 
 static void ge_stop(void) {
-    if (g_ge_thread) {
-        InterlockedExchange(&g_ge_quit, 1);
-        if (g_ge_wake) SetEvent(g_ge_wake);
-        WaitForSingleObject(g_ge_thread, 2000);
-        CloseHandle(g_ge_thread);
-        g_ge_thread = NULL;
+    if (g_ge_thread_ok) {
+        atomic_store_explicit(&g_ge_quit, 1, memory_order_release);
+        if (g_ge_wake_ok) seto_event_set(&g_ge_wake);
+        seto_thread_join(&g_ge_thread, 2000);
+        g_ge_thread_ok = 0;
     }
-    if (g_ge_rb_done) {
-        CloseHandle(g_ge_rb_done);
-        g_ge_rb_done = NULL;
+    if (g_ge_rb_done_ok) {
+        seto_event_destroy(&g_ge_rb_done);
+        g_ge_rb_done_ok = 0;
     }
-    if (g_ge_wake) {
-        CloseHandle(g_ge_wake);
-        g_ge_wake = NULL;
+    if (g_ge_wake_ok) {
+        seto_event_destroy(&g_ge_wake);
+        g_ge_wake_ok = 0;
     }
-    if (g_ge_ready) {
-        CloseHandle(g_ge_ready);
-        g_ge_ready = NULL;
+    if (g_ge_ready_ok) {
+        seto_event_destroy(&g_ge_ready);
+        g_ge_ready_ok = 0;
     }
     if (g_ge_rb_lock_ready) {
-        DeleteCriticalSection(&g_ge_rb_lock);
+        seto_mutex_destroy(&g_ge_rb_lock);
         g_ge_rb_lock_ready = 0;
     }
     if (g_hd_ini_lock_ready) {
-        EnterCriticalSection(&g_hd_ini_lock);
+        seto_mutex_lock(&g_hd_ini_lock);
         ge_hd_ini_reset();
-        LeaveCriticalSection(&g_hd_ini_lock);
-        DeleteCriticalSection(&g_hd_ini_lock);
+        seto_mutex_unlock(&g_hd_ini_lock);
+        seto_mutex_destroy(&g_hd_ini_lock);
         g_hd_ini_lock_ready = 0;
     }
     if (g_ge_lock_ready) {
-        DeleteCriticalSection(&g_ge_lock);
+        seto_mutex_destroy(&g_ge_lock);
         g_ge_lock_ready = 0;
     }
     if (g_ge_queue_ready) {
@@ -4342,13 +4604,18 @@ static void ge_stop(void) {
         g_ge_queue_ready = 0;
     }
     if (g_ge_ctx) {
+#ifdef _WIN32
         wglDeleteContext(g_ge_ctx);
+#else
+        SDL_GL_DeleteContext(g_ge_ctx);
+#endif
         g_ge_ctx = NULL;
     }
     g_ge_active = 0;
     g_ge_ok = 0;
 }
 
+#ifdef _WIN32
 static int ge_start(PFNWGLCREATECONTEXTATTRIBSARBPROC create_ctx) {
     const int attribs[] = {
         WGL_CONTEXT_MAJOR_VERSION_ARB, 3,
@@ -4357,16 +4624,24 @@ static int ge_start(PFNWGLCREATECONTEXTATTRIBSARBPROC create_ctx) {
         0
     };
 
-    g_ge_ctx = create_ctx(g_dc, g_ctx, attribs);
+    g_ge_ctx = create_ctx ? create_ctx(g_dc, g_ctx, attribs) : NULL;
+#else
+static int ge_start(void *unused_create_ctx) {
+    (void)unused_create_ctx;
+    SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
+    g_ge_ctx = SDL_GL_CreateContext((SDL_Window *)g_hwnd);
+    if (g_ge_ctx) SDL_GL_MakeCurrent((SDL_Window *)g_hwnd, g_ctx);
+    SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0);
+#endif
     if (!g_ge_ctx) {
         fprintf(stderr, "gl: GE render context unavailable\n");
         return 0;
     }
-    InitializeCriticalSection(&g_ge_lock);
+    seto_mutex_init(&g_ge_lock);
     g_ge_lock_ready = 1;
-    InitializeCriticalSection(&g_ge_rb_lock);
+    seto_mutex_init(&g_ge_rb_lock);
     g_ge_rb_lock_ready = 1;
-    InitializeCriticalSection(&g_hd_ini_lock);
+    seto_mutex_init(&g_hd_ini_lock);
     g_hd_ini_lock_ready = 1;
     if (ge_queue_init(&g_ge_q, 2048) != 0) {
         fprintf(stderr, "gl: GE queue init failed\n");
@@ -4374,34 +4649,34 @@ static int ge_start(PFNWGLCREATECONTEXTATTRIBSARBPROC create_ctx) {
         return 0;
     }
     g_ge_queue_ready = 1;
-    g_ge_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
-    if (!g_ge_wake) {
+    if (seto_event_init(&g_ge_wake, 0) != 0) {
         fprintf(stderr, "gl: GE wake event failed\n");
         ge_stop();
         return 0;
     }
-    g_ge_rb_done = CreateEventW(NULL, FALSE, FALSE, NULL);
-    if (!g_ge_rb_done) {
+    g_ge_wake_ok = 1;
+    if (seto_event_init(&g_ge_rb_done, 0) != 0) {
         fprintf(stderr, "gl: GE readback event failed\n");
         ge_stop();
         return 0;
     }
-    g_ge_ready = CreateEventW(NULL, TRUE, FALSE, NULL);
-    if (!g_ge_ready) {
+    g_ge_rb_done_ok = 1;
+    if (seto_event_init(&g_ge_ready, 1) != 0) {
         fprintf(stderr, "gl: GE ready event failed\n");
         ge_stop();
         return 0;
     }
-    g_ge_quit = 0;
-    g_ge_thread = CreateThread(NULL, 0, ge_thread, NULL, 0, NULL);
-    if (!g_ge_thread) {
+    g_ge_ready_ok = 1;
+    atomic_store_explicit(&g_ge_quit, 0, memory_order_release);
+    if (seto_thread_create(&g_ge_thread, ge_thread, NULL) != 0) {
         fprintf(stderr, "gl: GE thread failed\n");
         ge_stop();
         return 0;
     }
-    WaitForSingleObject(g_ge_ready, 3000);
-    CloseHandle(g_ge_ready);
-    g_ge_ready = NULL;
+    g_ge_thread_ok = 1;
+    seto_event_wait_ms(&g_ge_ready, 3000);
+    seto_event_destroy(&g_ge_ready);
+    g_ge_ready_ok = 0;
     if (!g_ge_ok) {
         fprintf(stderr, "gl: GE thread init failed\n");
         ge_stop();
@@ -4423,11 +4698,15 @@ static void gl_cleanup(void) {
         if (g_vao && p_glDeleteVertexArrays) p_glDeleteVertexArrays(1, &g_vao);
         if (g_vbo && p_glDeleteBuffers) p_glDeleteBuffers(1, &g_vbo);
         if (g_tex) glDeleteTextures(1, &g_tex);
-        wglMakeCurrent(NULL, NULL);
+        gl_make_ctx_current(-1);
+#ifdef _WIN32
         wglDeleteContext(g_ctx);
+#else
+        SDL_GL_DeleteContext(g_ctx);
+#endif
     }
     if (g_ovl_lock_ready) {
-        DeleteCriticalSection(&g_ovl_lock);
+        seto_mutex_destroy(&g_ovl_lock);
         g_ovl_lock_ready = 0;
     }
     free(g_ovl_px);
@@ -4441,15 +4720,17 @@ static void gl_cleanup(void) {
     atomic_store_explicit(&g_present_force_redraw, 0, memory_order_release);
     atomic_store_explicit(&g_ovl_pending_redraw, 0, memory_order_release);
     ge_hd_async_shutdown();
+#ifdef _WIN32
     if (g_gdiplus_ready) {
         GdiplusShutdown(g_gdiplus_token);
         g_gdiplus_ready = 0;
         g_gdiplus_token = 0;
     }
     if (g_dc && g_hwnd) ReleaseDC(g_hwnd, g_dc);
+    g_dc = NULL;
+#endif
     g_prog = g_vao = g_vbo = g_tex = 0;
     g_ctx = NULL;
-    g_dc = NULL;
     g_active = 0;
 }
 
@@ -4462,12 +4743,16 @@ static int parse_post_filter(const char *s) {
     return (v >= 0 && v <= 3) ? v : 0;
 }
 
-int seto_gl_present_init(HWND hwnd) {
+int seto_gl_present_init(seto_native_window hwnd) {
     const char *present = getenv("SETO_PRESENT");
     const char *f;
+#ifdef _WIN32
     PIXELFORMATDESCRIPTOR pfd;
     HGLRC dummy;
     PFNWGLCREATECONTEXTATTRIBSARBPROC create_ctx;
+#else
+    void *create_ctx = NULL;
+#endif
 
     if (!present || strcmp(present, "gl") != 0) return 0;
     g_seto_perf_enabled = getenv("SETO_PERF_LOG") != NULL ? 1 : 0;
@@ -4477,6 +4762,7 @@ int seto_gl_present_init(HWND hwnd) {
     g_post_filter = parse_post_filter(getenv("SETO_POST_FILTER"));
 
     g_hwnd = hwnd;
+#ifdef _WIN32
     g_dc = GetDC(hwnd);
     if (!g_dc) {
         fprintf(stderr, "gl: GetDC failed; using GDI\n");
@@ -4538,6 +4824,19 @@ int seto_gl_present_init(HWND hwnd) {
 
     g_swap_interval = (PFNWGLSWAPINTERVALEXTPROC)wglGetProcAddress("wglSwapIntervalEXT");
     if (g_swap_interval) g_swap_interval(1);
+#else
+    g_ctx = SDL_GL_CreateContext((SDL_Window *)g_hwnd);
+    if (!g_ctx || SDL_GL_MakeCurrent((SDL_Window *)g_hwnd, g_ctx) != 0) {
+        fprintf(stderr, "gl: SDL_GL_CreateContext failed (%s)\n", SDL_GetError());
+        gl_cleanup();
+        return 0;
+    }
+    if (!load_gl() || !make_program()) {
+        gl_cleanup();
+        return 0;
+    }
+    SDL_GL_SetSwapInterval(1);
+#endif
 
     p_glGenVertexArrays(1, &g_vao);
     p_glBindVertexArray(g_vao);
@@ -4563,7 +4862,7 @@ int seto_gl_present_init(HWND hwnd) {
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_BLEND);
     glDisable(GL_SCISSOR_TEST);
-    InitializeCriticalSection(&g_ovl_lock);
+    seto_mutex_init(&g_ovl_lock);
     g_ovl_lock_ready = 1;
     g_active = 1;
     {
@@ -4589,7 +4888,7 @@ int seto_gl_present_init(HWND hwnd) {
 static void ge_draw_overlay(int cw, int ch) {
     if (!g_ovl_lock_ready || cw <= 0 || ch <= 0) return;
     int ox = 0, oy = 0, ow = 0, oh = 0;
-    EnterCriticalSection(&g_ovl_lock);
+    seto_mutex_lock(&g_ovl_lock);
     if (g_ovl_w > 0 && g_ovl_h > 0 && g_ovl_px) {
         if (!g_ovl_tex) glGenTextures(1, &g_ovl_tex);
         glBindTexture(GL_TEXTURE_2D, g_ovl_tex);
@@ -4610,7 +4909,7 @@ static void ge_draw_overlay(int cw, int ch) {
         ow = g_ovl_w;
         oh = g_ovl_h;
     }
-    LeaveCriticalSection(&g_ovl_lock);
+    seto_mutex_unlock(&g_ovl_lock);
     if (ow <= 0 || oh <= 0 || !g_ovl_tex) return;
 
     glViewport(ox, ch - (oy + oh), ow, oh);
@@ -4649,8 +4948,7 @@ static void ge_capture_present_ppm(int cw, int ch) {
     free(px);
 }
 
-void seto_gl_present_frame(HWND hwnd, const uint32_t *rgba) {
-    RECT rc;
+void seto_gl_present_frame(seto_native_window hwnd, const uint32_t *rgba) {
     int cw, ch, dw, dh;
     GLint filter;
 
@@ -4663,12 +4961,10 @@ void seto_gl_present_frame(HWND hwnd, const uint32_t *rgba) {
             const uint64_t t_sw0 = seto_perf_now_us();
             int use_ge = 0;
             cw = 0; ch = 0;
-            EnterCriticalSection(&g_ge_lock);
+            seto_mutex_lock(&g_ge_lock);
             use_ge = (g_ge_front_tex && g_ge_have_front && !g_ge_passthrough_sw);
             if (use_ge) {
-                GetClientRect(g_hwnd, &rc);
-                cw = rc.right - rc.left;
-                ch = rc.bottom - rc.top;
+                gl_get_window_size(&cw, &ch);
                 if (cw > 0 && ch > 0) {
                     const uint32_t cur_seq = atomic_load_explicit(&g_ge_front_seq, memory_order_acquire);
                     const int force = atomic_load_explicit(&g_present_force_redraw, memory_order_acquire);
@@ -4676,7 +4972,7 @@ void seto_gl_present_frame(HWND hwnd, const uint32_t *rgba) {
                     const char *pdir = ge_present_shot_dir_env();
                     if ((!pdir || !pdir[0]) && !force && !ovl_ch && cur_seq != 0u &&
                         cur_seq == g_last_pres_seq && cw == g_last_pres_cw && ch == g_last_pres_ch) {
-                        LeaveCriticalSection(&g_ge_lock);
+                        seto_mutex_unlock(&g_ge_lock);
                         return;
                     }
                     atomic_store_explicit(&g_present_force_redraw, 0, memory_order_release);
@@ -4725,12 +5021,12 @@ void seto_gl_present_frame(HWND hwnd, const uint32_t *rgba) {
                     glFlush();
                 }
             }
-            LeaveCriticalSection(&g_ge_lock);
+            seto_mutex_unlock(&g_ge_lock);
             if (use_ge) {
                 if (cw > 0 && ch > 0) {
                     ge_draw_overlay(cw, ch);
                     ge_capture_present_ppm(cw, ch);
-                    SwapBuffers(g_dc);
+                    gl_swap_buffers_win();
                     const uint64_t t_sw1 = seto_perf_now_us();
                     seto_perf_add(&g_seto_perf.swap_us, t_sw1 - t_sw0);
                     seto_perf_add(&g_seto_perf.pres_frames, 1);
@@ -4746,12 +5042,10 @@ void seto_gl_present_frame(HWND hwnd, const uint32_t *rgba) {
 
         ge_cmd c;
         c.type = GE_CMD_TEST_COLOR;
-        c.color = (uint32_t)GetTickCount();
-        if (ge_queue_push(&g_ge_q, c) && g_ge_wake) SetEvent(g_ge_wake);
+        c.color = (uint32_t)seto_ticks_ms();
+        if (ge_queue_push(&g_ge_q, c) && g_ge_wake_ok) seto_event_set(&g_ge_wake);
 
-        GetClientRect(g_hwnd, &rc);
-        cw = rc.right - rc.left;
-        ch = rc.bottom - rc.top;
+        gl_get_window_size(&cw, &ch);
         if (cw <= 0 || ch <= 0) return;
         if ((int64_t)cw * 17 > (int64_t)ch * 30) {
             dh = ch;
@@ -4760,7 +5054,7 @@ void seto_gl_present_frame(HWND hwnd, const uint32_t *rgba) {
             dw = cw;
             dh = (int)((int64_t)cw * 17 / 30);
         }
-        EnterCriticalSection(&g_ge_lock);
+        seto_mutex_lock(&g_ge_lock);
         if (g_ge_tex) {
             glBindTexture(GL_TEXTURE_2D, g_ge_tex);
             glViewport((cw - dw) / 2, (ch - dh) / 2, dw, dh);
@@ -4776,9 +5070,9 @@ void seto_gl_present_frame(HWND hwnd, const uint32_t *rgba) {
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
             glFlush();
         }
-        LeaveCriticalSection(&g_ge_lock);
+        seto_mutex_unlock(&g_ge_lock);
         ge_draw_overlay(cw, ch);
-        SwapBuffers(g_dc);
+        gl_swap_buffers_win();
         return;
     }
 
@@ -4789,9 +5083,7 @@ void seto_gl_present_frame(HWND hwnd, const uint32_t *rgba) {
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, GL_SCREEN_W, GL_SCREEN_H,
                     GL_RGBA, GL_UNSIGNED_BYTE, rgba);
 
-    GetClientRect(g_hwnd, &rc);
-    cw = rc.right - rc.left;
-    ch = rc.bottom - rc.top;
+    gl_get_window_size(&cw, &ch);
     if (cw <= 0 || ch <= 0) return;
     if ((int64_t)cw * 17 > (int64_t)ch * 30) {
         dh = ch;
@@ -4818,7 +5110,7 @@ void seto_gl_present_frame(HWND hwnd, const uint32_t *rgba) {
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     ge_draw_overlay(cw, ch);
     ge_capture_present_ppm(cw, ch);
-    SwapBuffers(g_dc);
+    gl_swap_buffers_win();
 }
 
 int seto_ge_gpu_draw_mode(void) { return g_ge_draw_mode; }
@@ -4827,18 +5119,18 @@ static int ge_enqueue_wait(const ge_cmd *c, int max_ms) {
     if (!g_ge_active || !g_ge_draw_mode || !g_ge_queue_ready) return 0;
     uint64_t wait_t0 = 0;
     for (int i = 0; i < max_ms; i++) {
-        if (g_ge_quit) return 0;
+        if (atomic_load_explicit(&g_ge_quit, memory_order_acquire)) return 0;
         if (ge_queue_push_ptr(&g_ge_q, c)) {
             const uint32_t d = atomic_load_explicit(&g_ge_q.head, memory_order_relaxed) -
                                atomic_load_explicit(&g_ge_q.tail, memory_order_relaxed);
             seto_perf_max(&g_seto_perf.q_max, (uint64_t)d);
             if (i > 0 && wait_t0)
                 seto_perf_add(&g_seto_perf.p_qwait_us, seto_perf_now_us() - wait_t0);
-            if (g_ge_wake) SetEvent(g_ge_wake);
+            if (g_ge_wake_ok) seto_event_set(&g_ge_wake);
             return 1;
         }
         if (i == 0) wait_t0 = seto_perf_now_us();
-        Sleep(1);
+        seto_sleep_ms(1);
     }
     if (wait_t0)
         seto_perf_add(&g_seto_perf.p_qwait_us, seto_perf_now_us() - wait_t0);
@@ -4929,8 +5221,8 @@ int seto_ge_gpu_readback(int fbo_slot, int w, int h,
         return -1;
     if (fbo_slot < 0 || fbo_slot >= GE_MAX_FBOS || w <= 0 || h <= 0)
         return -1;
-    EnterCriticalSection(&g_ge_rb_lock);
-    ResetEvent(g_ge_rb_done);
+    seto_mutex_lock(&g_ge_rb_lock);
+    seto_event_reset(&g_ge_rb_done);
     memset(&c, 0, offsetof(ge_cmd, verts));
     c.type = GE_CMD_READBACK;
     c.fbo_slot = fbo_slot;
@@ -4941,9 +5233,9 @@ int seto_ge_gpu_readback(int fbo_slot, int w, int h,
     c.tex_slot = -1;
     c.fbo_tex_slot = -1;
     int pushed = ge_enqueue_wait(&c, 1000);
-    DWORD wr = pushed ? WaitForSingleObject(g_ge_rb_done, 3000) : WAIT_FAILED;
-    LeaveCriticalSection(&g_ge_rb_lock);
-    return (pushed && wr == WAIT_OBJECT_0 && !g_ge_quit) ? 0 : -1;
+    int wr = pushed ? seto_event_wait_ms(&g_ge_rb_done, 3000) : 0;
+    seto_mutex_unlock(&g_ge_rb_lock);
+    return (pushed && wr && !atomic_load_explicit(&g_ge_quit, memory_order_acquire)) ? 0 : -1;
 }
 
 void seto_ge_gpu_present(int disp_slot, uint32_t *ram_rgba, uint32_t capture_id) {
@@ -4970,17 +5262,24 @@ int seto_ge_gpu_current_msaa(void) {
 void seto_perf_tick(double fps, double vps, int scale, int msaa) {
     if (!g_seto_perf_enabled) return;
 
-    static ULONGLONG last_flush;
+    static uint64_t last_flush;
     static FILE *perf_fp;
     static int perf_init;
-    const ULONGLONG now = GetTickCount64();
+    const uint64_t now = seto_ticks_ms();
     if (last_flush && (now - last_flush) < 1000u) return;
     last_flush = now;
 
     if (!perf_init) {
+#ifdef _WIN32
         char log_path[MAX_PATH];
         DWORD n = GetModuleFileNameA(NULL, log_path, MAX_PATH);
         if (n > 0 && n < MAX_PATH) {
+#else
+        char log_path[512];
+        ssize_t n = readlink("/proc/self/exe", log_path, sizeof(log_path) - 10);
+        if (n > 0 && (size_t)n < sizeof(log_path) - 10) {
+            log_path[n] = '\0';
+#endif
             char *sep = strrchr(log_path, '\\');
             char *sep2 = strrchr(log_path, '/');
             if (sep2 && (!sep || sep2 > sep)) sep = sep2;
@@ -5027,13 +5326,25 @@ void seto_perf_tick(double fps, double vps, int scale, int msaa) {
     const uint64_t pres_max_gap_us = atomic_exchange_explicit(&g_seto_perf.pres_max_gap_us, 0, memory_order_relaxed);
 
     if (!perf_fp) return;
+    unsigned hh = 0, mm = 0, ss = 0;
+#ifdef _WIN32
     SYSTEMTIME st;
     GetLocalTime(&st);
+    hh = st.wHour; mm = st.wMinute; ss = st.wSecond;
+#else
+    time_t tv = time(NULL);
+    struct tm tmv;
+    if (localtime_r(&tv, &tmv)) {
+        hh = (unsigned)tmv.tm_hour;
+        mm = (unsigned)tmv.tm_min;
+        ss = (unsigned)tmv.tm_sec;
+    }
+#endif
     fprintf(perf_fp,
             "[%02u:%02u:%02u] fps=%.1f vps=%.1f pres=%llu gapMax=%.1fms swap=%.1fms scale=%dx msaa=%dx | "
             "PROD draws=%llu gen=%llu raw=%llu dec=%llu sw=%llu rb=%llu draw=%.1fms hash=%.1fms dec=%.1fms hdRes=%.1fms qWait=%.1fms rb=%.1fms qMax=%llu | "
             "GPU draws=%llu texUp=%llu hdHit=%llu hdLoad=%llu(%.1fms) hdMiss=%llu(%.1fms) draw=%.1fms pres=%.1fms rb=%.1fms\n",
-            st.wHour, st.wMinute, st.wSecond, fps, vps,
+            hh, mm, ss, fps, vps,
             (unsigned long long)pres_frames, (double)pres_max_gap_us / 1000.0,
             (double)swap_us / 1000.0, scale, msaa,
             (unsigned long long)p_draws, (unsigned long long)p_gen_hits,
@@ -5055,7 +5366,7 @@ int seto_ge_gpu_set_scale(int scale) {
     if (!g_active || !g_ge_active || !g_ge_draw_mode) return 0;
     atomic_store_explicit(&g_ge_pending_scale, ge_clamp_scale(scale),
                           memory_order_release);
-    if (g_ge_wake) SetEvent(g_ge_wake);
+    if (g_ge_wake_ok) seto_event_set(&g_ge_wake);
     return 1;
 }
 
@@ -5068,7 +5379,7 @@ void seto_gl_present_resize(int client_w, int client_h) {
         seto_ge_gpu_set_scale(want);
 }
 
-void seto_gl_present_shutdown(HWND hwnd) {
+void seto_gl_present_shutdown(seto_native_window hwnd) {
     (void)hwnd;
     gl_cleanup();
 }
@@ -5084,26 +5395,26 @@ int seto_gl_present_has_gpu_frame(void) {
 
 int seto_ge_gpu_read_front(uint32_t *out_top_down) {
     if (!out_top_down || !g_ge_active || !g_ge_draw_mode ||
-        !g_ge_rb_lock_ready || !g_ge_rb_done ||
+        !g_ge_rb_lock_ready || !g_ge_rb_done_ok ||
         !atomic_load_explicit(&g_ge_gpu_frame_ready, memory_order_acquire))
         return -1;
-    EnterCriticalSection(&g_ge_rb_lock);
-    ResetEvent(g_ge_rb_done);
+    seto_mutex_lock(&g_ge_rb_lock);
+    seto_event_reset(&g_ge_rb_done);
     g_ge_front_rb_ok = 0;
     atomic_store_explicit(&g_ge_front_rb_req, 1, memory_order_release);
-    if (g_ge_wake) SetEvent(g_ge_wake);
-    DWORD wr = WaitForSingleObject(g_ge_rb_done, 3000);
-    int ok = (wr == WAIT_OBJECT_0 && !g_ge_quit && g_ge_front_rb_ok);
+    if (g_ge_wake_ok) seto_event_set(&g_ge_wake);
+    int wr = seto_event_wait_ms(&g_ge_rb_done, 3000);
+    int ok = (wr && !atomic_load_explicit(&g_ge_quit, memory_order_acquire) && g_ge_front_rb_ok);
     if (ok)
         memcpy(out_top_down, g_ge_front_rb_buf, sizeof g_ge_front_rb_buf);
-    LeaveCriticalSection(&g_ge_rb_lock);
+    seto_mutex_unlock(&g_ge_rb_lock);
     return ok ? 0 : -1;
 }
 
 void seto_gl_present_set_overlay(const uint32_t *rgba_top_down, int x, int y,
                                  int w, int h) {
     if (!g_active || !g_ovl_lock_ready) return;
-    EnterCriticalSection(&g_ovl_lock);
+    seto_mutex_lock(&g_ovl_lock);
     if (!rgba_top_down || w <= 0 || h <= 0) {
         g_ovl_w = 0;
         g_ovl_h = 0;
@@ -5113,7 +5424,7 @@ void seto_gl_present_set_overlay(const uint32_t *rgba_top_down, int x, int y,
         if (npx > g_ovl_cap) {
             uint32_t *p = (uint32_t *)realloc(g_ovl_px, npx * 4u);
             if (!p) {
-                LeaveCriticalSection(&g_ovl_lock);
+                seto_mutex_unlock(&g_ovl_lock);
                 return;
             }
             g_ovl_px = p;
@@ -5126,7 +5437,7 @@ void seto_gl_present_set_overlay(const uint32_t *rgba_top_down, int x, int y,
         g_ovl_h = h;
         g_ovl_dirty = 1;
     }
-    LeaveCriticalSection(&g_ovl_lock);
+    seto_mutex_unlock(&g_ovl_lock);
     atomic_store_explicit(&g_ovl_pending_redraw, 1, memory_order_release);
 }
 
