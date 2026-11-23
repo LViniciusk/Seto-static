@@ -14,7 +14,7 @@ endif()
 # while compile times and object sizes explode; keep -O1 on corpora and -O3 on src/ & psprecomp.
 function(seto_corpus_target_opts tgt)
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options(${tgt} PRIVATE -O1)
+        target_compile_options(${tgt} PRIVATE -O1 -foptimize-sibling-calls)
         if(WIN32)
             get_target_property(_srcs ${tgt} SOURCES)
             foreach(_f IN LISTS _srcs)
