@@ -30,9 +30,61 @@ typedef struct { uint32_t nid, addr; } deck_export_t;
 static deck_export_t g_exports[MAX_EXPORTS];
 static int g_nexports;
 static uint32_t g_eboot_gp, g_deck_gp;
+static uint32_t g_deck_image_end, g_deck_bss_end;
 static int g_deck_loaded;
 static char g_deck_path[512];
 static uint32_t g_eboot_info;
+
+#ifdef HAVE_TF3ENG_CORPUS
+static int extra_deck_check_on_open;
+static int extra_deck_open_dialog;
+static const char extra_deck_limit_message[] =
+    "The Fusion Deck holds up to 15 cards. Remove cards before confirming.";
+
+int psp_deck_card_is_token(uint32_t kid) {
+    /* The EBOOT reads the kind from CARD_Prop. The converted TF3 records
+       retain their own kind numbers, including Gemini (9) and Token (10). */
+    psp_cpu.r[PSP_REG_A0] = kid;
+    psp_call_from_host(0x08049B20u);
+    return psp_cpu.r[PSP_REG_V0] == (kid < 6958u ? 9u : 10u);
+}
+
+int psp_deck_warn_extra_on_open(void) {
+    if (!extra_deck_check_on_open) return 0;
+    extra_deck_check_on_open = 0;
+    if (psp_read32(0x021CE35Cu) <= 15u) return 0;
+
+    /* Reason 0 keeps the native dialog from queueing a second error on Cancel. */
+    extra_deck_open_dialog = 1;
+    psp_cpu.r[PSP_REG_A0] = 4u;
+    psp_cpu.r[PSP_REG_A1] = 0u;
+    psp_call_from_host(0x014068BCu);
+    extra_deck_open_dialog = 0;
+    return 1;
+}
+
+uint32_t psp_deck_all_ehp_size(uint32_t iso_size) {
+    const char *env = getenv("SETO_GX_DATA_DIR");
+    char buf[3][1024];
+    int n = 0;
+    if (env && env[0]) snprintf(buf[n++], sizeof buf[0], "%s/deck_all_e.ehp", env);
+    snprintf(buf[n++], sizeof buf[0], "build/gx_data/deck_all_e.ehp");
+    snprintf(buf[n++], sizeof buf[0], "gx_data/deck_all_e.ehp");
+    for (int i = 0; i < n; i++) {
+        FILE *f = fopen(buf[i], "rb");
+        if (f) {
+            if (fseek(f, 0, SEEK_END) == 0) {
+                long sz = ftell(f);
+                fclose(f);
+                if (sz > 0 && (uint32_t)sz > iso_size) return (uint32_t)sz;
+                return iso_size;
+            }
+            fclose(f);
+        }
+    }
+    return iso_size;
+}
+#endif
 
 /* Loaded on the first ModuleMgr request: by then the game has already stopped
  * and unloaded libtitle, so its low-window mapping can be reused. */
@@ -129,6 +181,14 @@ uint32_t psp_extra_export(uint32_t nid, uint32_t *gp_out);
 #endif
 
 void deck_import_forward(uint32_t nid) {
+#ifdef HAVE_TF3ENG_CORPUS
+    /* Both entry points show the TF3 limit in the native dialog. */
+    if (nid == 0xE58C0FDCu && psp_cpu.r[PSP_REG_RA] == 0x01406A1Cu &&
+        (psp_arg(1) == 0x6Fu || (extra_deck_open_dialog && psp_arg(1) == 0u))) {
+        psp_ret(g_deck_bss_end);
+        return;
+    }
+#endif
     uint32_t gp = g_eboot_gp;
     uint32_t addr = deck_export(nid);
 #ifdef HAVE_EXTRA_CORPUS
@@ -192,11 +252,15 @@ int psp_deck_image_load(const char *path, uint32_t eboot_info) {
         fprintf(stderr, "deck PRX: image is not one segment at 0x%08X\n", DECK_BASE);
         return -1;
     }
+    uint32_t text_bytes = 0;
+#ifdef HAVE_TF3ENG_CORPUS
+    text_bytes = sizeof extra_deck_limit_message * 2u;
+#endif
     if (filesz > memsz || (uint64_t)off + filesz > (uint64_t)n ||
-        (uint64_t)vaddr + memsz > DECK_END_MAX) {
+        (uint64_t)vaddr + memsz + text_bytes > DECK_END_MAX) {
         free(d); fprintf(stderr, "deck PRX: segment outside the window\n"); return -1;
     }
-    if (psp_mem_map_extra(vaddr, memsz) != 0 ||
+    if (psp_mem_map_extra(vaddr, memsz + text_bytes) != 0 ||
         psp_mem_write_block(vaddr, d + off, filesz) != 0) {
         free(d); fprintf(stderr, "deck PRX: cannot place the image\n"); return -1;
     }
@@ -217,6 +281,14 @@ int psp_deck_image_load(const char *path, uint32_t eboot_info) {
         return -1;
     }
     g_deck_gp = psp_read32(info + 0x20);
+    g_deck_image_end = vaddr + filesz;
+    g_deck_bss_end = vaddr + memsz;
+#ifdef HAVE_TF3ENG_CORPUS
+    for (uint32_t i = 0; i < sizeof extra_deck_limit_message; ++i)
+        psp_write16(g_deck_bss_end + i * 2u, (uint8_t)extra_deck_limit_message[i]);
+    if (psp_read16(0x0141EA1Eu) == 2451u)
+        psp_write16(0x0141EA1Eu, 3480u);
+#endif
     deck_psp_recomp_register();
     if (!psp_lookup(DECK_ENTRY)) {
         free(d); fprintf(stderr, "deck PRX: dispatch entry missing\n"); return -1;
@@ -248,6 +320,15 @@ int psp_deck_load_uid(const char *path, uint32_t *uid) {
 
 int psp_deck_start(uint32_t uid, uint32_t status_ptr) {
     if (uid != DECK_UID || !g_deck_loaded) return 0;
+#ifdef HAVE_TF3ENG_CORPUS
+    extra_deck_check_on_open = 1;
+#endif
+    if (g_deck_bss_end > g_deck_image_end) {
+        const uint32_t n = g_deck_bss_end - g_deck_image_end;
+        uint8_t *bss = psp_mem_unwatched_ptr(g_deck_image_end, n);
+        if (bss) memset(bss, 0, n);
+        else for (uint32_t i = 0; i < n; i++) psp_write8(g_deck_image_end + i, 0);
+    }
     uint32_t caller_gp = psp_cpu.r[PSP_REG_GP];
     psp_cpu.r[PSP_REG_A0] = psp_arg(1);
     psp_cpu.r[PSP_REG_A1] = psp_arg(2);

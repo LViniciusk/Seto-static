@@ -8,6 +8,8 @@
 #include <psprecomp/mem.h>
 #include <psprecomp/recomp_rt.h>
 
+#include "gl_present.h"
+
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
@@ -1178,6 +1180,7 @@ static void write_rgba_to_guest(uint32_t dst_addr, uint32_t frame_w, AVFrame *sr
                                 row_bytes);
         }
     }
+    seto_ge_invalidate_vram(dst_addr, stride_bytes * (uint32_t)src->height);
 }
 
 static int ensure_video_decoder(void) {

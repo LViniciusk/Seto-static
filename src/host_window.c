@@ -7,6 +7,9 @@
 
 #include <psprecomp/hle.h>
 
+#include "gl_present.h"
+#include "perf_mon.h"
+
 #include <windows.h>
 #include <gdiplus.h>
 #include <stdint.h>
@@ -32,8 +35,17 @@ static HDC g_memdc;
 static HBITMAP g_membmp, g_memold;
 static int g_memw, g_memh;
 static char g_fps_text[64] = "FPS --.- | VPS --.-";
+static int g_hud_visible = -1;
 static ULONG_PTR g_gdiplus_token;
 static int g_gdiplus_ready;
+
+static int hud_is_visible(void) {
+    if (g_hud_visible < 0) {
+        const char *hud = getenv("SETO_GL_HUD");
+        g_hud_visible = (!hud || !hud[0] || hud[0] != '0') ? 1 : 0;
+    }
+    return g_hud_visible;
+}
 
 static int gdiplus_start_once(void) {
     if (g_gdiplus_ready) return 1;
@@ -44,18 +56,16 @@ static int gdiplus_start_once(void) {
     return 1;
 }
 
+static void gl_sync_overlay(HWND hwnd);
+static void gl_free_overlay(void);
+
 static void update_frame(HWND hwnd) {
     if (IsIconic(hwnd)) return;
-    if (psp_display_read_present(g_read) != 0) return;
-    /* 0xAABBGGRR from psp_display_read; a 32-bit BI_RGB DIB wants B,G,R,X
-     * in memory, i.e. 0x00RRGGBB in the word. */
-    for (int i = 0; i < SCREEN_W * SCREEN_H; i++) {
-        const uint32_t c = g_read[i];
-        g_dib[i] = ((c & 0x000000FFu) << 16) |
-                   (c & 0x0000FF00u) |
-                   ((c & 0x00FF0000u) >> 16);
-    }
-    g_have_frame = 1;
+    const int gl_on = seto_gl_present_active();
+    const int gpu_ready = gl_on && seto_gl_present_has_gpu_frame();
+    if (!gpu_ready && psp_display_read_present(g_read) != 0)
+        return;
+
     {
         static DWORD last_ms;
         static uint64_t last_frames, last_vblanks;
@@ -71,17 +81,36 @@ static void update_frame(HWND hwnd) {
             double fps = (double)(cur_frames - last_frames) / dt;
             double vps = (double)(cur_vblanks - last_vblanks) / dt;
             snprintf(g_fps_text, sizeof g_fps_text, "FPS %.1f | VPS %.1f", fps, vps);
-            char title[96];
-            snprintf(title, sizeof title, "Seto-static | %s", g_fps_text);
-            SetWindowTextA(hwnd, title);
+            seto_perf_tick(fps, vps, seto_ge_gpu_current_scale(), seto_ge_gpu_current_msaa());
+            if (hud_is_visible()) {
+                char title[96];
+                snprintf(title, sizeof title, "Seto-static | %s", g_fps_text);
+                SetWindowTextA(hwnd, title);
+            } else {
+                SetWindowTextW(hwnd, L"Seto-static \u2014 Yu-Gi-Oh! GX Tag Force");
+            }
             last_ms = now;
             last_frames = cur_frames;
             last_vblanks = cur_vblanks;
         }
     }
-    InvalidateRect(hwnd, NULL, FALSE);
-}
 
+    if (gl_on) {
+        gl_sync_overlay(hwnd);
+        seto_gl_present_frame(hwnd, gpu_ready ? NULL : g_read);
+    } else {
+        /* 0xAABBGGRR from psp_display_read; a 32-bit BI_RGB DIB wants B,G,R,X
+         * in memory, i.e. 0x00RRGGBB in the word. */
+        for (int i = 0; i < SCREEN_W * SCREEN_H; i++) {
+            const uint32_t c = g_read[i];
+            g_dib[i] = ((c & 0x000000FFu) << 16) |
+                       (c & 0x0000FF00u) |
+                       ((c & 0x00FF0000u) >> 16);
+        }
+        g_have_frame = 1;
+        InvalidateRect(hwnd, NULL, FALSE);
+    }
+}
 #include <psprecomp/cpu.h>
 #include <psprecomp/hle.h>
 #include <psprecomp/mem.h>
@@ -221,6 +250,168 @@ static void osk_paint_overlay(HDC memdc, int cw, int ch) {
     if (f_title) DeleteObject(f_title);
     if (f_input) DeleteObject(f_input);
     if (f_hint) DeleteObject(f_hint);
+}
+
+static HDC g_ovl_dc;
+static HBITMAP g_ovl_bmp;
+static HGDIOBJ g_ovl_old;
+static uint32_t *g_ovl_bits;
+static int g_ovl_bw, g_ovl_bh;
+static uint32_t *g_ovl_rgba;
+static size_t g_ovl_rgba_cap;
+static char g_ovl_last_fps[64];
+static int g_ovl_was_osk;
+static int g_ovl_active_badge;
+
+static void gl_free_overlay(void) {
+    if (g_ovl_dc) {
+        SelectObject(g_ovl_dc, g_ovl_old);
+        DeleteObject(g_ovl_bmp);
+        DeleteDC(g_ovl_dc);
+        g_ovl_dc = NULL;
+        g_ovl_bmp = NULL;
+        g_ovl_old = NULL;
+        g_ovl_bits = NULL;
+        g_ovl_bw = g_ovl_bh = 0;
+    }
+    free(g_ovl_rgba);
+    g_ovl_rgba = NULL;
+    g_ovl_rgba_cap = 0;
+    g_ovl_last_fps[0] = '\0';
+    g_ovl_was_osk = 0;
+    g_ovl_active_badge = 0;
+}
+
+static int gl_ensure_ovl_dib(HDC ref_dc, int w, int h) {
+    if (w <= 0 || h <= 0) return 0;
+    if (g_ovl_dc && g_ovl_bw == w && g_ovl_bh == h && g_ovl_bits)
+        return 1;
+    if (g_ovl_dc) {
+        SelectObject(g_ovl_dc, g_ovl_old);
+        DeleteObject(g_ovl_bmp);
+        DeleteDC(g_ovl_dc);
+        g_ovl_dc = NULL;
+        g_ovl_bmp = NULL;
+        g_ovl_old = NULL;
+        g_ovl_bits = NULL;
+    }
+    BITMAPINFO bi;
+    memset(&bi, 0, sizeof bi);
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    g_ovl_dc = CreateCompatibleDC(ref_dc);
+    if (!g_ovl_dc) return 0;
+    void *bits = NULL;
+    g_ovl_bmp = CreateDIBSection(g_ovl_dc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (!g_ovl_bmp || !bits) {
+        if (g_ovl_bmp) DeleteObject(g_ovl_bmp);
+        DeleteDC(g_ovl_dc);
+        g_ovl_dc = NULL;
+        g_ovl_bmp = NULL;
+        return 0;
+    }
+    g_ovl_old = SelectObject(g_ovl_dc, g_ovl_bmp);
+    g_ovl_bits = (uint32_t *)bits;
+    g_ovl_bw = w;
+    g_ovl_bh = h;
+    const size_t npx = (size_t)w * (size_t)h;
+    if (npx > g_ovl_rgba_cap) {
+        uint32_t *p = (uint32_t *)realloc(g_ovl_rgba, npx * 4u);
+        if (!p) return 0;
+        g_ovl_rgba = p;
+        g_ovl_rgba_cap = npx;
+    }
+    return 1;
+}
+
+static void gl_sync_overlay(HWND hwnd) {
+    int osk_on = 0;
+    if (g_osk.inited) {
+        EnterCriticalSection(&g_osk_cs);
+        osk_on = g_osk.active;
+        LeaveCriticalSection(&g_osk_cs);
+    }
+
+    if (osk_on) {
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        const int cw = rc.right - rc.left;
+        const int ch = rc.bottom - rc.top;
+        HDC wdc = GetDC(hwnd);
+        if (wdc && gl_ensure_ovl_dib(wdc, cw, ch)) {
+            const uint32_t key = 0x00010203u;
+            const size_t npx = (size_t)cw * (size_t)ch;
+            for (size_t i = 0; i < npx; i++) g_ovl_bits[i] = key;
+            osk_paint_overlay(g_ovl_dc, cw, ch);
+            GdiFlush();
+            for (size_t i = 0; i < npx; i++) {
+                const uint32_t c = g_ovl_bits[i];
+                if ((c & 0x00FFFFFFu) == key) {
+                    g_ovl_rgba[i] = 0u;
+                } else {
+                    g_ovl_rgba[i] = ((c & 0x000000FFu) << 16) |
+                                    (c & 0x0000FF00u) |
+                                    ((c & 0x00FF0000u) >> 16) |
+                                    0xEE000000u;
+                }
+            }
+            seto_gl_present_set_overlay(g_ovl_rgba, 0, 0, cw, ch);
+            g_ovl_was_osk = 1;
+            g_ovl_active_badge = 1;
+        }
+        if (wdc) ReleaseDC(hwnd, wdc);
+        return;
+    }
+
+    const int hud_on = hud_is_visible();
+    if (!hud_on || !g_fps_text[0]) {
+        if (g_ovl_active_badge || g_ovl_was_osk) {
+            seto_gl_present_set_overlay(NULL, 0, 0, 0, 0);
+            g_ovl_active_badge = 0;
+            g_ovl_was_osk = 0;
+            g_ovl_last_fps[0] = '\0';
+        }
+        return;
+    }
+
+    if (strcmp(g_ovl_last_fps, g_fps_text) == 0 && !g_ovl_was_osk)
+        return;
+
+    const int bw = 220, bh = 24;
+    HDC wdc = GetDC(hwnd);
+    if (wdc && gl_ensure_ovl_dib(wdc, bw, bh)) {
+        RECT r = { 0, 0, bw, bh };
+        HBRUSH br_bg = CreateSolidBrush(RGB(12, 16, 20));
+        FillRect(g_ovl_dc, &r, br_bg);
+        DeleteObject(br_bg);
+        HFONT old_font = (HFONT)SelectObject(g_ovl_dc, GetStockObject(DEFAULT_GUI_FONT));
+        COLORREF old_fg = SetTextColor(g_ovl_dc, RGB(80, 255, 120));
+        int old_mode = SetBkMode(g_ovl_dc, TRANSPARENT);
+        RECT rt = { 6, 0, bw - 6, bh };
+        DrawTextA(g_ovl_dc, g_fps_text, -1, &rt,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SetBkMode(g_ovl_dc, old_mode);
+        SetTextColor(g_ovl_dc, old_fg);
+        SelectObject(g_ovl_dc, old_font);
+        GdiFlush();
+        const size_t npx = (size_t)bw * (size_t)bh;
+        for (size_t i = 0; i < npx; i++) {
+            const uint32_t c = g_ovl_bits[i];
+            g_ovl_rgba[i] = ((c & 0x000000FFu) << 16) |
+                            (c & 0x0000FF00u) |
+                            ((c & 0x00FF0000u) >> 16) |
+                            0xD8000000u;
+        }
+        seto_gl_present_set_overlay(g_ovl_rgba, 8, 6, bw, bh);
+        snprintf(g_ovl_last_fps, sizeof g_ovl_last_fps, "%s", g_fps_text);
+        g_ovl_was_osk = 0;
+        g_ovl_active_badge = 1;
+    }
+    if (wdc) ReleaseDC(hwnd, wdc);
 }
 
 static void hle_osk_init_start(void) {
@@ -390,6 +581,10 @@ int seto_window_osk_active(void) {
 }
 
 static void paint(HWND hwnd, HDC hdc) {
+    if (seto_gl_present_active()) {
+        seto_gl_present_invalidate();
+        return;
+    }
     RECT rc;
     GetClientRect(hwnd, &rc);
     const int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
@@ -447,7 +642,7 @@ static void paint(HWND hwnd, HDC hdc) {
             }
         }
     }
-    if (g_fps_text[0]) {
+    if (hud_is_visible() && g_fps_text[0]) {
         HFONT old_font = (HFONT)SelectObject(g_memdc, GetStockObject(DEFAULT_GUI_FONT));
         COLORREF old_fg = SetTextColor(g_memdc, RGB(80, 255, 120));
         COLORREF old_bg = SetBkColor(g_memdc, RGB(12, 16, 20));
@@ -479,7 +674,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_SIZE:
-        if (wp != SIZE_MINIMIZED) InvalidateRect(hwnd, NULL, FALSE);
+        if (wp != SIZE_MINIMIZED) {
+            if (seto_gl_present_active())
+                seto_gl_present_resize(LOWORD(lp), HIWORD(lp));
+            else
+                InvalidateRect(hwnd, NULL, FALSE);
+        }
         return 0;
     case WM_ERASEBKGND:
         return 1;                   /* paint() fills the client area */
@@ -513,6 +713,19 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
             }
+        }
+        if (wp == VK_F5 && ((lp >> 30) & 1) == 0) {
+            g_hud_visible = !hud_is_visible();
+            if (g_hud_visible && g_fps_text[0]) {
+                char title[96];
+                snprintf(title, sizeof title, "Seto-static | %s", g_fps_text);
+                SetWindowTextA(hwnd, title);
+            } else {
+                SetWindowTextW(hwnd, L"Seto-static \u2014 Yu-Gi-Oh! GX Tag Force");
+            }
+            if (seto_gl_present_active()) gl_sync_overlay(hwnd);
+            else InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
         }
         if (wp == VK_RETURN) return 0;   /* input thread samples the keyboard */
         return DefWindowProcW(hwnd, msg, wp, lp);
@@ -555,6 +768,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_ID);
+        gl_free_overlay();
+        seto_gl_present_shutdown(hwnd);
         if (g_memdc) {
             SelectObject(g_memdc, g_memold);
             DeleteObject(g_membmp);
@@ -592,7 +807,7 @@ static DWORD WINAPI window_thread(LPVOID unused) {
     WNDCLASSEXW wc;
     memset(&wc, 0, sizeof wc);
     wc.cbSize = sizeof wc;
-    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.style = CS_HREDRAW | CS_VREDRAW | CS_OWNDC;
     wc.lpfnWndProc = wnd_proc;
     wc.hInstance = GetModuleHandleW(NULL);
     wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
@@ -623,6 +838,8 @@ static DWORD WINAPI window_thread(LPVOID unused) {
         return 1;
     }
 
+    seto_gl_present_init(g_hwnd);
+
     ShowWindow(g_hwnd, SW_SHOW);
     ShowWindow(g_hwnd, SW_SHOWNORMAL);
     UpdateWindow(g_hwnd);
@@ -642,6 +859,9 @@ static DWORD WINAPI window_thread(LPVOID unused) {
 }
 
 int seto_window_start(void) {
+    /* Headless test runs: no window and no GL context. The GE backend still
+     * fills the framebuffer, so the game loop and every log keep working. */
+    if (getenv("SETO_HEADLESS")) return -1;
     g_ready = CreateEventW(NULL, TRUE, FALSE, NULL);
     if (!g_ready) return -1;
     g_thread = CreateThread(NULL, 0, window_thread, NULL, 0, NULL);

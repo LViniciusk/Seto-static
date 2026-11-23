@@ -1,0 +1,144 @@
+--- a/include/psprecomp/cpu.h
++++ b/include/psprecomp/cpu.h
+@@ -44,6 +44,7 @@
+  * see psp_ra_is_jump() in dispatch.h. `ret` is 0 for a call made by the host. */
+ typedef struct psp_frame {
+     uint32_t ret;
++    uint32_t sp;              /* guest $sp after the call's delay slot */
+     struct psp_frame *prev;
+ } psp_frame;
+ 
+--- a/include/psprecomp/dispatch.h
++++ b/include/psprecomp/dispatch.h
+@@ -78,7 +78,8 @@
+ void psp_trace_watch(uint32_t addr, void (*fn)(uint32_t));
+ void psp_trace_loop(uint32_t addr);
+ void psp_trace_mark(uint32_t addr);
+-void psp_trace_sp(uint32_t fn, uint32_t sp_in, uint32_t sp_out);
++/* Check a guest return against the start of that call, including split bodies. */
++void psp_trace_sp(uint32_t site, uint32_t body_sp, uint32_t sp_out);
+ /* The same observation at a transfer that ends a body, where the expected
+  * direction is inverted: the body hands over mid-frame. */
+ void psp_trace_sp_leave(uint32_t fn, uint32_t sp_in, uint32_t sp_out);
+--- a/src/dispatch.c
++++ b/src/dispatch.c
+@@ -194,7 +194,7 @@
+ uint64_t psp_dispatch_calls(void) { return g_calls; }
+ 
+ void psp_call_from_host(uint32_t addr) {
+-    psp_frame f = { 0, psp_cpu.frame };
++    psp_frame f = { .ret = 0, .sp = psp_cpu.r[PSP_REG_SP], .prev = psp_cpu.frame };
+     psp_cpu.frame = &f;
+     psp_dispatch(addr);
+     psp_cpu.frame = f.prev;
+@@ -430,14 +430,15 @@
+ static uint32_t g_sp_first;
+ static int32_t  g_sp_delta;
+ 
+-void psp_trace_sp(uint32_t fn, uint32_t sp_in, uint32_t sp_out) {
++void psp_trace_sp(uint32_t fn, uint32_t body_sp, uint32_t sp_out) {
++    const psp_frame *frame = psp_cpu.frame;
++    if (psp_cpu.unwind) {
++        while (frame && frame->ret && frame->ret != psp_cpu.unwind)
++            frame = frame->prev;
++    }
++    const uint32_t sp_in = frame ? frame->sp : body_sp;
+     if (sp_in == sp_out) return;
+     sp_record(&g_sp_tbl, fn, (int32_t)(sp_out - sp_in), sp_in, sp_out, psp_trace_last());
+-    /* Print them all. A *positive* delta usually means a split continuation
+-     * that contains an epilogue but not its matching prologue -- discovery
+-     * makes those separate bodies, so the invariant does not hold for them and
+-     * they are noise. A *negative* delta is the dangerous case: stack consumed
+-     * and never returned. */
+     if (g_sp_bad < 24)
+         fprintf(stderr, "sp UNBALANCED in 0x%08X: %+d%s\n", fn,
+                 (int)(sp_out - sp_in),
+--- a/tests/test_emit.c
++++ b/tests/test_emit.c
+@@ -858,6 +858,12 @@
+     uint32_t seed = BASE;
+     char *src = emit_synthetic("t_bal", BAL_CALL, 7, &seed, 1, NULL);
+     if (src) {
++        char *hdr = emit_case_header("t_bal");
++        if (hdr) {
++            expect_contains(hdr, "_f.sp = r_sp;",
++                            "the guest call frame snapshots the incoming stack");
++            free(hdr);
++        }
+         expect_contains(src, "r_ra = 0x08804008u;", "bal links $ra");
+         expect_contains(src, "PSP_CALL_BEGIN(0x08804008u);", "bal calls, expecting to return after its slot");
+         expect_absent(src, "08804014(); return;", "the taken path is not a tail transfer");
+--- a/tests/test_runtime.c
++++ b/tests/test_runtime.c
+@@ -283,6 +283,48 @@
+     CHECK(psp_sp_violations() == v + 1, "a balanced return is not a violation");
+ }
+ 
++static void split_stack_epilogue(void) {
++    const uint32_t body_sp = psp_cpu.r[PSP_REG_SP];
++    psp_cpu.r[PSP_REG_SP] += psp_cpu.r[PSP_REG_A0];
++    if (!psp_ra_is_jump(psp_cpu.r[PSP_REG_RA]))
++        psp_trace_sp(0x08804010u, body_sp, psp_cpu.r[PSP_REG_SP]);
++}
++
++static void split_stack_prologue(void) {
++    psp_cpu.r[PSP_REG_SP] -= 16u;
++    split_stack_epilogue();
++}
++
++static void test_split_stack_return(void) {
++    const uint32_t sp = 0x09FFF000u;
++    const uint64_t violations = psp_sp_violations();
++    psp_register(0x08804000u, split_stack_prologue);
++    psp_cpu.r[PSP_REG_SP] = sp;
++    psp_cpu.r[PSP_REG_A0] = 16u;
++    psp_call_from_host(0x08804000u);
++    CHECK_EQ(psp_cpu.r[PSP_REG_SP], sp, "the epilogue restored the guest stack");
++    CHECK(psp_sp_violations() == violations, "a split epilogue restores the original call frame");
++
++    psp_cpu.r[PSP_REG_A0] = 0;
++    psp_call_from_host(0x08804000u);
++    CHECK_EQ(psp_cpu.r[PSP_REG_SP], sp - 16u, "the second epilogue left the frame allocated");
++    CHECK(psp_sp_violations() == violations + 1, "the stack checker detects a real leak");
++
++    psp_cpu.r[PSP_REG_SP] = sp;
++    psp_cpu.r[PSP_REG_A0] = 20u;
++    psp_call_from_host(0x08804000u);
++    CHECK(psp_sp_violations() == violations + 2, "the stack checker detects over-release");
++
++    psp_frame caller = { .ret = 0x08804100u, .sp = sp };
++    psp_frame helper = { .ret = 0x08804200u, .sp = sp - 16u, .prev = &caller };
++    psp_cpu.frame = &helper;
++    CHECK(!psp_ra_is_jump(caller.ret), "jr $ra unwinds through the helper");
++    psp_trace_sp(0x08804010u, helper.sp, caller.sp);
++    CHECK(psp_sp_violations() == violations + 2, "a nonlocal return uses the destination frame");
++    psp_cpu.frame = NULL;
++    psp_cpu.unwind = 0;
++}
++
+ int main(void) {
+     test_zero_register();
+     test_division();
+@@ -294,6 +336,7 @@
+     test_sp_histogram();
+     test_sp_call_histogram();
+     test_stack_handover();
++    test_split_stack_return();
+ 
+     if (failures) {
+         printf("\n%d check(s) failed\n", failures);
+--- a/tools/allegrexrecomp/emit.c
++++ b/tools/allegrexrecomp/emit.c
+@@ -1194,9 +1194,10 @@
+         "#ifdef __cplusplus\nextern \"C\" {\n#endif\n"
+         "\n"
+         "/* A guest call: push the return site it expects, and after it returns,\n"
+-        " * stop an unwind aimed here or pass on one aimed further out. */\n"
++        " * stop an unwind aimed here or pass on one aimed further out. Save\n"
++        " * the guest stack after the delay slot, before any callee body runs. */\n"
+         "#define PSP_CALL_BEGIN(r) { psp_frame _f; _f.ret = (r); _f.prev = psp_cpu.frame;"
+-        " psp_cpu.frame = &_f;\n"
++        " _f.sp = r_sp; psp_cpu.frame = &_f;\n"
+         "#define PSP_CALL_END(r) psp_cpu.frame = _f.prev; if (psp_cpu.unwind) {"
+         " if (psp_cpu.unwind == (r)) psp_cpu.unwind = 0; else return; } }\n"
+         "\n"

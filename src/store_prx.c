@@ -16,6 +16,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef HAVE_TF3_SHOP_PACK
+#include "build/gx_data/gx_id_map.h"
+#include "gx_shop.h"
+#endif
+
 #define EBOOT_BASE      0x08000000u
 #define EBOOT_SIZE      0x00640000u
 #define EBOOT_INFO      (EBOOT_BASE + 0x0006B81Cu)
@@ -31,10 +36,11 @@ typedef struct {
     const char *name;
     const char *lbn;
     const char *prx;
-    uint32_t base, end_max, uid, entry, gp;
+    uint32_t base, end_max, uid, entry, gp, filesz, memsz;
     int map_extra;
     void (*reg)(void);
     int loaded;
+    uint8_t *image;
 } store_mod_t;
 
 #ifdef HAVE_CHARALIST_CORPUS
@@ -50,9 +56,9 @@ static void shop_psp_recomp_register(void) { }
 
 static store_mod_t g_store[] = {
     { "modcharalist", "sce_lbn0x56b0", "libcharalist.prx",
-      0x09410000u, 0x09700000u, 0x00080005u, 0, 0, 0, charalist_psp_recomp_register, 0 },
+      0x09410000u, 0x09700000u, 0x00080005u, 0, 0, 0, 0, 0, charalist_psp_recomp_register, 0, NULL },
     { "modshop",      "sce_lbn0x5dd0", "libshop.prx",
-      0x03600000u, 0x04000000u, 0x00080006u, 0, 0, 1, shop_psp_recomp_register,      0 },
+      0x03600000u, 0x04000000u, 0x00080006u, 0, 0, 0, 0, 1, shop_psp_recomp_register,      0, NULL },
 };
 #define NSTORE ((int)(sizeof g_store / sizeof g_store[0]))
 
@@ -213,6 +219,8 @@ static int load_mod(store_mod_t *m, const char *path) {
     }
     m->gp = psp_read32(info + 0x20);
     m->entry = rd32(d + 24);
+    if (m->base == 0x03600000u)
+        psp_dispatch_clear_range(0x03600000u, 0x04000000u);
     m->reg();
     psp_dispatch_module_gp(m->base, m->base + memsz, m->gp);
     int mod_exp_start = g_mod_nexports;
@@ -242,12 +250,41 @@ static int load_mod(store_mod_t *m, const char *path) {
         }
         e += stride;
     }
+    m->filesz = filesz;
+    m->memsz = memsz;
+    free(m->image);
+    m->image = (uint8_t *)malloc(filesz ? filesz : 1u);
+    if (m->image && filesz) memcpy(m->image, d + off, filesz);
     m->loaded = 1;
     free(d);
     fprintf(stderr, "store PRX %s 0x%08X..0x%08X (%u bytes .bss), gp 0x%08X, entry 0x%08X, %d exports\n",
             m->name, m->base, m->base + memsz, memsz - filesz, m->gp, m->entry,
             g_mod_nexports - mod_exp_start);
     return 0;
+}
+
+static void restore_mod_image(store_mod_t *m) {
+    if (!m->loaded || !m->image || !m->memsz) return;
+    if (m->map_extra) {
+        psp_mem_map_extra(m->base, m->memsz);
+        psp_mem_write_block(m->base, m->image, m->filesz);
+    } else {
+        psp_mem_write_block(m->base, m->image, m->filesz);
+        if (m->memsz > m->filesz) {
+            uint32_t n = m->memsz - m->filesz;
+            uint8_t *bss = psp_mem_unwatched_ptr(m->base + m->filesz, n);
+            if (bss) memset(bss, 0, n);
+            else for (uint32_t i = 0; i < n; i++) psp_write8(m->base + m->filesz + i, 0);
+        }
+    }
+    if (m->base == 0x03600000u) {
+        psp_dispatch_clear_range(0x03600000u, 0x04000000u);
+#ifdef HAVE_TF3_SHOP_PACK
+        install_tf3_shop_pack();
+#endif
+    }
+    m->reg();
+    psp_dispatch_module_gp(m->base, m->base + m->memsz, m->gp);
 }
 
 int psp_store_images_load(const char *charalist_path, const char *shop_path, uint32_t eboot_info) {
@@ -270,6 +307,7 @@ int psp_store_load_uid(const char *path, uint32_t *uid) {
         store_mod_t *m = &g_store[i];
         if (!m->loaded) continue;
         if (strstr(path, m->lbn) || strcmp(base, m->prx) == 0) {
+            restore_mod_image(m);
             *uid = m->uid;
             return 1;
         }
@@ -312,6 +350,21 @@ uint32_t psp_store_export(uint32_t nid, uint32_t *gp_out) {
 }
 
 void store_import_forward(uint32_t nid) {
+#ifdef HAVE_TF3_SHOP_PACK
+    const uint32_t ret_pc = psp_cpu.r[PSP_REG_RA];
+    if (g_shop_tab && nid == 0xF1181D60u && ret_pc == 0x03606A18u) {
+        psp_ret(0);
+        return;
+    }
+    if (!g_shop_tab && g_shop_tf3_count && nid == 0xA8805FD2u &&
+        ret_pc == 0x03606994u && psp_arg(0) == 37u) {
+        psp_ret(2u);
+        return;
+    }
+    const int draw_tab = g_shop_tf3_count && nid == 0xB89D38DCu && ret_pc == 0x03608810u;
+    const uint32_t text_x = draw_tab ? psp_arg(0) + psp_arg(2) : 0;
+    const uint32_t text_y = draw_tab ? psp_arg(1) : 0;
+#endif
     uint32_t gp = g_eboot_gp;
     uint32_t addr = eboot_export(nid);
     if (!addr) addr = psp_store_export(nid, &gp);
@@ -325,5 +378,27 @@ void store_import_forward(uint32_t nid) {
     uint32_t caller_gp = psp_cpu.r[PSP_REG_GP];
     psp_cpu.r[PSP_REG_GP] = gp;
     psp_call_from_host(addr);
+#ifdef HAVE_TF3_SHOP_PACK
+    if (!g_shop_tab && g_shop_tf3_count && nid == 0xD4DE5DD8u) {
+        uint32_t roll = psp_cpu.r[PSP_REG_V0];
+        if (ret_pc == 0x036073D8u)
+            psp_ret(gx_shop_reweight(psp_cpu.r[PSP_REG_S3], psp_cpu.r[PSP_REG_S4], roll));
+        if (ret_pc == 0x03607508u)
+            psp_ret(gx_shop_reweight(psp_cpu.r[PSP_REG_S0], psp_cpu.r[PSP_REG_S2], roll));
+    }
+    if (nid == 0xF5E3080Cu && ret_pc == 0x0360220Cu)
+        gx_shop_handle_tabs(psp_cpu.r[PSP_REG_V0]);
+    if (draw_tab && text_x >= 24u * 64u) {
+        const uint32_t label = GX_SHOP_END - 8u;
+        uint32_t result = psp_cpu.r[PSP_REG_V0];
+        psp_write32(label, '1' + g_shop_tab);
+        psp_cpu.r[PSP_REG_A0] = text_x - 20u * 64u;
+        psp_cpu.r[PSP_REG_A1] = text_y;
+        psp_cpu.r[PSP_REG_A2] = 18u * 64u;
+        psp_cpu.r[PSP_REG_A3] = label;
+        psp_call_from_host(addr);
+        psp_ret(result);
+    }
+#endif
     psp_cpu.r[PSP_REG_GP] = caller_gp;
 }

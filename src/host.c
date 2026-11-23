@@ -11,11 +11,21 @@
 #include <psprecomp/module.h>
 #include <psprecomp/dispatch.h>
 #include <psprecomp/recomp_rt.h>
+#include <psprecomp/render.h>
+
+#include "gl_present.h"
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <windows.h>
 #include <mmsystem.h>
+
+/* Request discrete GPU on NVIDIA Optimus / AMD Switchable Graphics laptops. */
+__declspec(dllexport) DWORD NvOptimusEnablement = 0x00000001;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+
+extern const psp_render_backend seto_ge_backend;
 
 void psp_recomp_register(void);   /* generated tagforce_register.c */
 int  seto_window_start(void);
@@ -27,7 +37,42 @@ void psp_umd_set_iso(const char *path);
 void psp_fpl_register(void);
 void seto_multimedia_register(void);
 void seto_multimedia_shutdown(void);
+
+#include <time.h>
+/* The game seeds its RNG from the PSP RTC tick (BOOT/main.c:183):
+ *   sceRtcGetCurrentTick(&tick); srand((unsigned)tick);
+ * That makes every run's shuffle and AI choices different. Pinning the tick
+ * with SETO_RTC_TICK (decimal or 0x hex, PSP microseconds) makes a duel
+ * reproducible: same seed + same inputs = same duel. Unset = host clock. */
+static void hle_rtc_tick_pinned(void) {
+    const uint32_t out = psp_arg(0);
+    const char *e = getenv("SETO_RTC_TICK");
+    uint64_t tick;
+    if (!out) { psp_ret(0x80000103u); return; }
+    if (e && *e) {
+        tick = strtoull(e, NULL, 0);
+    } else {
+        struct timespec ts;
+        uint64_t unix_us;
+        if (timespec_get(&ts, TIME_UTC) == TIME_UTC)
+            unix_us = (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+        else
+            unix_us = (uint64_t)time(NULL) * 1000000ull;
+        tick = 0x00DCDDB30F2F8000ULL + unix_us;
+    }
+    psp_write32(out, (uint32_t)tick);
+    psp_write32(out + 4, (uint32_t)(tick >> 32));
+    psp_ret(0);
+}
+static void seto_rtc_register(void) {
+    psp_hle_register(0x3F7AD767u, "sceRtc", "sceRtcGetCurrentTick", hle_rtc_tick_pinned);
+    const char *e = getenv("SETO_RTC_TICK");
+    if (e && *e) fprintf(stderr, "rtc: pinned tick=%s\n", e);
+}
 #include "seto_net.h"
+#ifdef HAVE_TF3ENG_CORPUS
+#include "tf3_bridge.h"
+#endif
 int  psp_font_image_load(const char *path);
 int  psp_font_bind(void);
 #ifdef HAVE_FONT_CORPUS
@@ -128,6 +173,9 @@ static void report(const char *why) {
 
 static void on_miss(uint32_t addr) {
     fprintf(stderr, "DISPATCH MISS: indirect call to 0x%08X\n", addr);
+    fprintf(stderr, "  ra=0x%08X sp=0x%08X args=[0x%X,0x%X,0x%X,0x%X]\n",
+            psp_cpu.r[PSP_REG_RA], psp_cpu.r[PSP_REG_SP], psp_arg(0), psp_arg(1),
+            psp_arg(2), psp_arg(3));
     report("stopped at the first dispatch miss");
     exit(2);
 }
@@ -180,7 +228,7 @@ static SHORT host_key_state(int vk) {
     return GetAsyncKeyState(vk);
 }
 
-static uint32_t poll_host_pad(void) {
+static uint32_t poll_host_pad(uint8_t *out_ax, uint8_t *out_ay) {
     uint32_t fm = 0;
     if (host_key_state(VK_LEFT) & 0x8000)   fm |= PSP_CTRL_LEFT;
     if (host_key_state(VK_RIGHT) & 0x8000)  fm |= PSP_CTRL_RIGHT;
@@ -189,14 +237,20 @@ static uint32_t poll_host_pad(void) {
     if (host_key_state('Z') & 0x8000)       fm |= PSP_CTRL_CROSS;
     if (host_key_state('X') & 0x8000)       fm |= PSP_CTRL_CIRCLE;
     if (host_key_state('C') & 0x8000)       fm |= PSP_CTRL_TRIANGLE;
-    if (host_key_state('A') & 0x8000)       fm |= PSP_CTRL_SQUARE;
     if (host_key_state('V') & 0x8000)       fm |= PSP_CTRL_SQUARE;
     if (host_key_state('Q') & 0x8000)       fm |= PSP_CTRL_LTRIGGER;
-    if (host_key_state('W') & 0x8000)       fm |= PSP_CTRL_RTRIGGER;
     if (host_key_state('E') & 0x8000)       fm |= PSP_CTRL_RTRIGGER;
     if (host_key_state(VK_RETURN) & 0x8000) fm |= PSP_CTRL_START;
     if (host_key_state(VK_BACK) & 0x8000)   fm |= PSP_CTRL_SELECT;
     if (host_key_state(VK_SPACE) & 0x8000)  fm |= PSP_CTRL_SELECT;
+    if (out_ax && out_ay) {
+        int dx = ((host_key_state('D') & 0x8000) ? 1 : 0) -
+                 ((host_key_state('A') & 0x8000) ? 1 : 0);
+        int dy = ((host_key_state('S') & 0x8000) ? 1 : 0) -
+                 ((host_key_state('W') & 0x8000) ? 1 : 0);
+        *out_ax = dx < 0 ? 0u : (dx > 0 ? 255u : 128u);
+        *out_ay = dy < 0 ? 0u : (dy > 0 ? 255u : 128u);
+    }
     return fm;
 }
 
@@ -404,8 +458,16 @@ static void dump_field_state(const char *tag) {
 static void hold_field_input(void) {
     fprintf(stderr, "window: holding; arrows/Z/X/C/Enter control the field\n");
     int t_down = 0;
+    uint32_t last_h0 = 0;
+    int detail_dumps = 0;
     for (;;) {
-        psp_ctrl_set(seto_window_osk_active() ? 0u : poll_host_pad(), 128, 128);
+        if (seto_window_osk_active()) {
+            psp_ctrl_set(0u, 128, 128);
+        } else {
+            uint8_t ax = 128, ay = 128;
+            uint32_t fm = poll_host_pad(&ax, &ay);
+            psp_ctrl_set(fm, ax, ay);
+        }
         /* T: log every GE primitive of the next frame to stderr. */
         const int t = (host_key_state('T') & 0x8000) != 0;
         if (t && !t_down) {
@@ -413,6 +475,28 @@ static void hold_field_input(void) {
             fprintf(stderr, "input: manual GE trace requested\n");
         }
         t_down = t;
+        if (getenv("SETO_TRACE_POST_DECK")) {
+            const uint32_t h0 = psp_read32(0x083E5F2Cu);
+            if (h0 && h0 != last_h0 && detail_dumps < 8) {
+                uint32_t h[9];
+                last_h0 = h0;
+                detail_dumps++;
+                fprintf(stderr, "[DETAIL] set=%d", detail_dumps);
+                for (int i = 0; i < 9; i++) {
+                    h[i] = psp_read32(0x083E5F2Cu + (uint32_t)i * 4u);
+                    fprintf(stderr, " h%d=0x%X", i, h[i]);
+                }
+                fprintf(stderr, "\n");
+                for (int i = 0; i < 9; i++) {
+                    if (h[i] < 0x00100000u || h[i] >= 0x0A000000u) continue;
+                    fprintf(stderr, "[DETAIL] h%d @0x%X:", i, h[i]);
+                    for (int j = 0; j < 32; j++)
+                        fprintf(stderr, " %08X", psp_read32(h[i] + (uint32_t)j * 4u));
+                    fprintf(stderr, "\n");
+                }
+                fflush(stderr);
+            }
+        }
         Sleep(10);
     }
 }
@@ -762,16 +846,20 @@ static int main_menu_row(void) {
 static int map_list_row(void) {
     static uint32_t px[480 * 272];
     if (psp_display_read(px) != 0) return -1;
+    const int world_map = (psp_read32(0x093CDAFCu) == 0u);
     int y0 = -1, y1 = -1;
-    for (int y = 45; y < 180; y++) {
-        int c = 0;
-        for (int x = 70; x < 155; x++) {
+    for (int y = 40; y < 180; y++) {
+        int c = 0, cn = 0;
+        for (int x = 6; x < 155; x++) {
             const uint32_t v = px[y * 480 + x];
             const int r = (int)(v & 0xFF), g = (int)((v >> 8) & 0xFF),
                       b = (int)((v >> 16) & 0xFF);
-            if (r > 220 && g > 140 && g < 200 && b < 110) c++;
+            if (r > 220 && g > 140 && g < 200 && b < 110) {
+                if (x >= 70) c++;
+                else if (world_map && x < 25) cn++;
+            }
         }
-        if (c > 60) { if (y0 < 0) y0 = y; y1 = y; }
+        if (c > 60 || cn >= 6) { if (y0 < 0) y0 = y; y1 = y; }
     }
     if (y0 < 0) return -1;
     const int row = ((y0 + y1) / 2 - 54 + 12) / 24;
@@ -968,16 +1056,41 @@ static void enter_free_duel(void) {
         fprintf(stderr, "input: free duel play start=%d\n",
                 psp_duel_manager_start_requested());
         if (psp_duel_manager_start_requested()) {
-            for (int i = 0; i < 20 && !psp_exit_requested(); i++) {
+            const int total_i = getenv("SETO_DUEL_PLAY") ? 40 : 24;
+            for (int i = 0; i < total_i && !psp_exit_requested(); i++) {
                 Sleep(2500);
-                if (getenv("SETO_DUEL_ADVANCE") && (i == 2 || i == 4 || i == 6 || i == 8)) {
+                if (getenv("SETO_DUEL_ADVANCE") && (i >= 2 && i <= 14 && (i % 2) == 0)) {
                     psp_ctrl_set(PSP_CTRL_CROSS, 128, 128);
-                    Sleep(60);
+                    Sleep(140);
                     psp_ctrl_set(0, 128, 128);
                 }
-                if (getenv("SETO_DUEL_ADVANCE") && i == 13) {
-                    psp_ctrl_set(PSP_CTRL_TRIANGLE, 128, 128);
-                    Sleep(60);
+                if (getenv("SETO_DUEL_ADVANCE") && i == 16) {
+                    psp_ctrl_set(PSP_CTRL_DOWN, 128, 128);
+                    Sleep(140);
+                    psp_ctrl_set(0, 128, 128);
+                }
+                if (getenv("SETO_DUEL_ADVANCE") && (i == 18 || i == 20 || i == 22)) {
+                    psp_ctrl_set(PSP_CTRL_CROSS, 128, 128);
+                    Sleep(140);
+                    psp_ctrl_set(0, 128, 128);
+                }
+                if (getenv("SETO_DUEL_PLAY") && (i == 24 || i == 32 || i == 34 || i == 36)) {
+                    /* Advance phase (SP -> M1, M1 -> EP) / confirm prompt */
+                    psp_ctrl_set((i == 24 || i == 32) ? PSP_CTRL_START : PSP_CTRL_CROSS, 128, 128);
+                    Sleep(140);
+                    psp_ctrl_set(0, 128, 128);
+                }
+                if (getenv("SETO_DUEL_PLAY") && !getenv("SETO_DUEL_PASSIVE") &&
+                    (i == 26 || i == 27)) {
+                    psp_ctrl_set(PSP_CTRL_LEFT, 128, 128);
+                    Sleep(140);
+                    psp_ctrl_set(0, 128, 128);
+                }
+                if (getenv("SETO_DUEL_PLAY") && !getenv("SETO_DUEL_PASSIVE") &&
+                    (i == 28 || i == 30)) {
+                    /* Activate selected card (e.g. Pot of Greed / Summon) */
+                    psp_ctrl_set(PSP_CTRL_CROSS, 128, 128);
+                    Sleep(140);
                     psp_ctrl_set(0, 128, 128);
                 }
                 if (getenv("SETO_TRACE_DUEL") && (i == 3 || i == 7 || i == 11 || i == 14 || i == 16))
@@ -1003,6 +1116,34 @@ static DWORD WINAPI field_state_monitor(LPVOID unused) {
             last = s;
         }
         Sleep(50);
+    }
+    return 0;
+}
+
+/* Deck/card metadata pointers: EBOOT card data base (0x08262B98), EHP buffer
+ * global (0x083E4E88) and the parsed EHP table struct (0x080EAE88). */
+static DWORD WINAPI trunk_monitor(LPVOID unused) {
+    (void)unused;
+    while (!psp_exit_requested()) {
+        const uint32_t st = psp_read32(0x080EAE88u);
+        const uint32_t ehp = psp_read32(0x083E4E88u);
+        const uint32_t p48 = st ? psp_read32(st + 48u) : 0u;
+        const uint32_t p1lo = p48 ? psp_read32(p48 + 8u) : 0u;
+        const uint32_t p1hi = p48 ? psp_read32(p48 + 12u) : 0u;
+        const uint32_t pnlo = p48 ? psp_read32(p48 + 2480u * 8u) : 0u;
+        const uint32_t pnhi = p48 ? psp_read32(p48 + 2480u * 8u + 4u) : 0u;
+        fprintf(stderr, "trunk: ehp=%08X st=%08X t36=%08X t52=%08X t56=%08X p48=%08X\n",
+                ehp, st,
+                st ? psp_read32(st + 36u) : 0u,
+                st ? psp_read32(st + 52u) : 0u,
+                st ? psp_read32(st + 56u) : 0u, p48);
+        fprintf(stderr, "trunk: save1=%08X save2=%08X save2479=%08X wave=%08X "
+                "p1=%08X%08X pn=%08X%08X\n",
+                psp_read32(0x08262B98u + 5464u),
+                psp_read32(0x08262B98u + 5468u),
+                psp_read32(0x08262B98u + 5464u + 2479u * 4u),
+                psp_read32(0x06600000u), p1hi, p1lo, pnhi, pnlo);
+        Sleep(1000);
     }
     return 0;
 }
@@ -1118,11 +1259,11 @@ static DWORD WINAPI input_thread(LPVOID unused) {
 #ifdef HAVE_TITLE_CORPUS
         if (auto_start) {
             if (!sent) {
-                if (getenv("SETO_SKIP_MOVIE") && !psp_title_menu_ready()) {
+                if (getenv("SETO_SKIP_MOVIE") && !psp_title_menu_ready() &&
+                    psp_display_vblanks() >= 250ull) {
                     static DWORD last_skip = 0;
                     DWORD now = GetTickCount();
-                    if (last_skip == 0) last_skip = now;
-                    else if (now - last_skip > 6000) {
+                    if (last_skip == 0 || now - last_skip > 1200) {
                         last_skip = now;
                         psp_ctrl_set(0x0008u /* START */, 128, 128);
                         Sleep(80);
@@ -1240,7 +1381,57 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                                 return 0;
                             }
                             if (!getenv("SETO_CONTINUE_STORY")) {
-                                if (getenv("SETO_FREE_DUEL") && psp_title_scene_state() == 3)
+                                const char *mr_env = getenv("SETO_TEST_MENU_ROW");
+                                if (mr_env && psp_title_scene_state() == 3) {
+                                    int target_row = atoi(mr_env);
+                                    int r = -1;
+                                    for (int w = 0; w < 80 && r < 0; w++) {
+                                        Sleep(100);
+                                        if (psp_title_scene_state() == 3) r = main_menu_row();
+                                    }
+                                    for (int i = 0; i < 12 && r >= 0 && r != target_row; i++) {
+                                        auto_menu(r < target_row ? PSP_CTRL_DOWN : PSP_CTRL_UP, 1);
+                                        Sleep(180);
+                                        r = main_menu_row();
+                                    }
+                                    fprintf(stderr, "input: menu_test target=%d actual=%d\n", target_row, r);
+                                    auto_menu(PSP_CTRL_CROSS, 0);
+                                    const char *sub_downs_env = getenv("SETO_TEST_SUB_DOWNS");
+                                    if (sub_downs_env) {
+                                        int sd = atoi(sub_downs_env);
+                                        Sleep(900);
+                                        for (int d = 0; d < sd; d++) {
+                                            hold_pad_direct(PSP_CTRL_DOWN, 150);
+                                            Sleep(250);
+                                        }
+                                    }
+                                    for (int k = 0; k < 12; k++) {
+                                        Sleep(1200);
+                                        char p[64];
+                                        snprintf(p, sizeof p, "build/menu-test-%d.ppm", k);
+                                        psp_display_capture(p);
+                                        if (k == 1 || k == 4 || k == 7) {
+                                            hold_pad_direct(PSP_CTRL_CROSS, 150);
+                                        }
+                                        if (k == 3 || k == 6 || k == 9) {
+                                            hold_pad_direct(PSP_CTRL_RTRIGGER, 150);
+                                        }
+                                    }
+                                    /* The manual complaint: CIRCLE out of the Deck
+                                     * Editor loops instead of returning to the menu.
+                                     * Drive it from the guest and log the state. */
+                                    for (int e = 0; e < 6; e++) {
+                                        hold_pad_direct(PSP_CTRL_CIRCLE, 150);
+                                        Sleep(900);
+                                        char ep[64];
+                                        snprintf(ep, sizeof ep, "build/deck-exit-%d.ppm", e);
+                                        psp_display_capture(ep);
+                                        fprintf(stderr,
+                                                "input: deck exit=%d state=%d phase=%d row=%d\n",
+                                                e, psp_title_scene_state(),
+                                                psp_title_scene_phase(), main_menu_row());
+                                    }
+                                } else if (getenv("SETO_FREE_DUEL") && psp_title_scene_state() == 3)
                                     enter_free_duel();
                                 g_input_done = 1;
                                 return 0;
@@ -1446,6 +1637,7 @@ story_started:
                             fprintf(stderr, "input: auto advance guard=%d box=%d\n",
                                     guard, box_up());
                             if (getenv("SETO_CONTINUE") && getenv("SETO_TRAVEL_STORE") &&
+                                !getenv("SETO_CONTINUE_STORY") &&
                                 psp_read32(0x093CDAFCu) == 0u) {
                                 Sleep(500);
                                 for (int step = 0; step < 6 && map_list_row() < 0; step++) {
@@ -1535,8 +1727,12 @@ story_started:
                                     if (getenv("SETO_TRACE_FIELD")) psp_ge_trace_next_frame();
                                     psp_display_capture("build/s93-map-list.ppm");
                                     for (int wait_row = 0; wait_row < 24 && map_list_row() < 0; wait_row++) {
-                                        if (!screen_black()) auto_press(0x00004000u);
+                                        if (!screen_black() && (wait_row % 6) == 0)
+                                            auto_press(0x00004000u);
                                         Sleep(800);
+                                        if (wait_row == 0) psp_display_capture("build/s93-map-wait0.ppm");
+                                        if (wait_row == 1) psp_display_capture("build/s93-map-wait1.ppm");
+                                        if (wait_row == 2) psp_display_capture("build/s93-map-wait2.ppm");
                                         for (int w = 0; w < 20 && screen_black(); w++) Sleep(500);
                                     }
 map_list_open:
@@ -1845,21 +2041,41 @@ map_list_open:
                                             }
                                             if (getenv("SETO_TRAVEL_STORE") && !talk_done &&
                                                 st == 1u && k > 10) {
+                                                const int store_buy = getenv("SETO_STORE_BUY") != NULL;
                                                 talk_done = 1;
                                                 psp_title_walk(0, 128, 0);
                                                 psp_ctrl_set(0, 128, 0);
                                                 Sleep(2200);
+                                                if (store_buy) {
+                                                    psp_title_walk(0, 0, 128);
+                                                    psp_ctrl_set(0, 0, 128);
+                                                    Sleep(220);
+                                                    psp_title_walk(0, 0, 64);
+                                                    psp_ctrl_set(0, 0, 64);
+                                                    Sleep(80);
+                                                }
                                                 psp_title_walk(0, 128, 128);
                                                 psp_ctrl_set(0, 128, 128);
                                                 Sleep(400);
-                                                auto_press(PSP_CTRL_CROSS);
+                                                if (store_buy) field_one_shot(PSP_CTRL_CROSS);
+                                                else auto_press(PSP_CTRL_CROSS);
                                                 Sleep(1200);
                                                 psp_display_capture("build/s93-store-talk.ppm");
                                                 fprintf(stderr, "input: store talk state=%u box=%d\n",
                                                         psp_read32(0x093CDAFCu), box_up());
-                                                for (int s = 0; s < 10; s++) {
-                                                    if (box_up()) auto_press(PSP_CTRL_CROSS);
-                                                    Sleep(1500);
+                                                for (int s = 0; s < (store_buy ? 20 : 10); s++) {
+                                                    if (box_up() || (store_buy && (psp_read32(0x093CDAFCu) == 6u || s < 10)))
+                                                        auto_press(PSP_CTRL_CROSS);
+                                                    Sleep(1200);
+                                                    if (store_buy) {
+                                                        fprintf(stderr, "input: store buy step=%d state=%u box=%d\n",
+                                                                s, psp_read32(0x093CDAFCu), box_up());
+                                                        if (s == 0 || s == 2 || s == 4 || s == 6 || s == 10) {
+                                                            char cp[64];
+                                                            snprintf(cp, sizeof cp, "build/s93-shop-step%d.ppm", s);
+                                                            psp_display_capture(cp);
+                                                        }
+                                                    }
                                                     if (s == 2 || s == 5 || s == 9) {
                                                         char spath[64];
                                                         snprintf(spath, sizeof spath,
@@ -2146,7 +2362,13 @@ map_list_open:
         {
             /* Manual play: always forward focused host pad state directly across
              * all screens (title, menus, field, duel) without scene-state locks. */
-            psp_ctrl_set(seto_window_osk_active() ? 0u : poll_host_pad(), 128, 128);
+            if (seto_window_osk_active()) {
+                psp_ctrl_set(0u, 128, 128);
+            } else {
+                uint8_t ax = 128, ay = 128;
+                uint32_t fm = poll_host_pad(&ax, &ay);
+                psp_ctrl_set(fm, ax, ay);
+            }
         }
         Sleep(10);
     }
@@ -2190,6 +2412,9 @@ int main(int argc, char **argv) {
                           !getenv("SETO_FREE_DUEL_PLAY");
 
     if (psp_mem_init() != 0) { fprintf(stderr, "memory init failed\n"); return 1; }
+#ifdef HAVE_TF3ENG_CORPUS
+    gx_runtime_init();
+#endif
     timeBeginPeriod(1);
 
     psp_module m;
@@ -2206,6 +2431,7 @@ int main(int argc, char **argv) {
     psp_umd_register();
     psp_fpl_register();
     seto_osk_register();
+    seto_rtc_register();
     psp_recomp_register();
     seto_multimedia_register();
     seto_net_register_hle();
@@ -2229,7 +2455,7 @@ int main(int argc, char **argv) {
 #endif
 #else
     if (font) {
-        fprintf(stderr, "font PRX: this build has no font corpus (build/s5-font-reloc)\n");
+        fprintf(stderr, "font PRX: this build has no font corpus (build/reloc/font)\n");
         return 1;
     }
 #endif
@@ -2240,7 +2466,7 @@ int main(int argc, char **argv) {
     if (title && psp_title_image_load(title, m.info) != 0) return 1;
 #else
     if (title) {
-        fprintf(stderr, "title PRX: this build has no title corpus (build/s6-title-reloc)\n");
+        fprintf(stderr, "title PRX: this build has no title corpus (build/reloc/title)\n");
         return 1;
     }
 #endif
@@ -2251,7 +2477,7 @@ int main(int argc, char **argv) {
         if (story && psp_story_image_load(story, m.info) != 0) return 1;
 #else
         if (story) {
-            fprintf(stderr, "story PRX: this build has no story corpus (build/s93-story-reloc)\n");
+            fprintf(stderr, "story PRX: this build has no story corpus (build/reloc/story)\n");
             return 1;
         }
 #endif
@@ -2259,7 +2485,7 @@ int main(int argc, char **argv) {
         if (field && psp_field_image_load(field, m.info) != 0) return 1;
 #else
         if (field) {
-            fprintf(stderr, "field PRX: this build has no field corpus (build/s93-field-reloc)\n");
+            fprintf(stderr, "field PRX: this build has no field corpus (build/reloc/field)\n");
             return 1;
         }
 #endif
@@ -2271,7 +2497,7 @@ int main(int argc, char **argv) {
     if (deck) psp_deck_prepare(deck, m.info);
 #else
     if (deck) {
-        fprintf(stderr, "deck PRX: this build has no deck corpus (build/s93-deck-reloc)\n");
+        fprintf(stderr, "deck PRX: this build has no deck corpus (build/reloc/deck)\n");
         return 1;
     }
 #endif
@@ -2279,7 +2505,7 @@ int main(int argc, char **argv) {
     if (decktut && psp_decktut_image_load(decktut, m.info) != 0) return 1;
 #else
     if (decktut) {
-        fprintf(stderr, "decktut PRX: this build has no corpus (build/s93-decktut-reloc)\n");
+        fprintf(stderr, "decktut PRX: this build has no corpus (build/reloc/decktut)\n");
         return 1;
     }
 #endif
@@ -2287,7 +2513,7 @@ int main(int argc, char **argv) {
     if (psp_store_images_load(charalist, shop, m.info) != 0) return 1;
 #else
     if (charalist || shop) {
-        fprintf(stderr, "store PRX: this build has no store corpora (build/s9charalist-reloc, build/s9shop-reloc)\n");
+        fprintf(stderr, "store PRX: this build has no store corpora (build/reloc/charalist, build/reloc/shop)\n");
         return 1;
     }
 #endif
@@ -2299,7 +2525,7 @@ int main(int argc, char **argv) {
     }
 #else
     if (duel_mgr || duel_eng || duel_draw || duel_swap || duel_tut || duel_rec) {
-        fprintf(stderr, "duel PRX: this build has no duel corpora (build/s9duel-*-reloc)\n");
+        fprintf(stderr, "duel PRX: this build has no duel corpora (build/reloc/duel-*)\n");
         return 1;
     }
 #endif
@@ -2311,7 +2537,7 @@ int main(int argc, char **argv) {
 #else
     for (int i = 0; i < 9; i++) {
         if (extra_paths[i]) {
-            fprintf(stderr, "extra PRX: this build has no extra corpora (build/s13-*-reloc)\n");
+            fprintf(stderr, "extra PRX: this build has no extra corpora (build/reloc/*)\n");
             return 1;
         }
     }
@@ -2358,6 +2584,11 @@ int main(int argc, char **argv) {
     } else {
         fprintf(stderr, "window: disabled by SETO_NO_WINDOW\n");
     }
+    if (seto_ge_gpu_draw_mode() && getenv("SETO_RENDERER") &&
+        strcmp(getenv("SETO_RENDERER"), "gl") == 0) {
+        psp_render_set_backend(&seto_ge_backend);
+        fprintf(stderr, "render: GL GE frontend active\n");
+    }
     CreateThread(NULL, 0, input_thread, NULL, 0, NULL);
     if (getenv("SETO_SHOT_DIR"))
         CreateThread(NULL, 0, shot_thread, NULL, 0, NULL);
@@ -2367,6 +2598,8 @@ int main(int argc, char **argv) {
         CreateThread(NULL, 0, fps_log_thread, NULL, 0, NULL);
     if (getenv("SETO_TRACE_FIELD"))
         CreateThread(NULL, 0, field_state_monitor, NULL, 0, NULL);
+    if (getenv("SETO_TRACE_TRUNK"))
+        CreateThread(NULL, 0, trunk_monitor, NULL, 0, NULL);
     const char *cap = getenv("SETO_BRINGUP_CAP");
     if (cap && atoi(cap) > 0) {
         g_cap_seconds = (unsigned)atoi(cap);
