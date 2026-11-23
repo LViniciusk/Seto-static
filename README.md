@@ -1,6 +1,6 @@
 # Seto-static
 
-Native Windows static recompilation of **Yu-Gi-Oh! GX Tag Force** (PSP, `ULUS-10136`), upgraded with the **Yu-Gi-Oh! GX Tag Force 3** (`ULES-01183`) duel engine and expanded card pool, and a hardware-accelerated OpenGL 3.3 renderer.
+Native Windows static recompilation of **Yu-Gi-Oh! GX Tag Force** (PSP, `ULUS-10136`), upgraded with the **Yu-Gi-Oh! GX Tag Force 3** (`ULES-01183`) duel engine and expanded card pool.
 
 > **Legal Notice:** This repository contains no copyrighted game assets, binaries, or BIOS/firmware files. You must provide your own legally dumped `TF1.iso` (`ULUS-10136`) and `TF3.iso` (`ULES-01183`) images to build and play.
 
